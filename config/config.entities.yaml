@@ -2,20 +2,36 @@ entities:
   - id: 1
     role: Leader
     byzantine: false
-    peers: [1, 2, 3, 4]
+    peers: [1, 2, 3, 4, 5, 6, 7]
     cluster: 0
   - id: 2
     role: Replica
     byzantine: false
-    peers: [1, 2, 3, 4]
+    peers: [1, 2, 3, 4, 5, 6, 7]
     cluster: 0
   - id: 3
     role: Replica
     byzantine: false
-    peers: [1, 2, 3, 4]
+    peers: [1, 2, 3, 4, 5, 6, 7]
     cluster: 0
   - id: 4
     role: Replica
     byzantine: false
-    peers: [1, 2, 3, 4]
+    peers: [1, 2, 3, 4, 5, 6, 7]
     cluster: 0
+  - id: 5
+    role: Replica
+    byzantine: false
+    peers: [1, 2, 3, 4, 5, 6, 7]
+    cluster: 1
+  - id: 6
+    role: Replica
+    byzantine: false
+    peers: [1, 2, 3, 4, 5, 6, 7]
+    cluster: 1
+  - id: 7
+    role: Replica
+    byzantine: false
+    peers: [1, 2, 3, 4, 5, 6, 7]
+    cluster: 1
+delays:

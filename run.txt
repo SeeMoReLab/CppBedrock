@@ -1,0 +1,2 @@
+openssl genpkey -algorithm RSA -out build/client_private.pem -pkeyopt rsa_keygen_bits:2048                                                 
+openssl rsa -pubout -in build/client_private.pem -out keys/client_public.pem 

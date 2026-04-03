@@ -21,6 +21,7 @@ namespace {
 }
 
 OpenSSLCryptoProvider::OpenSSLCryptoProvider(const std::string& privateKeyPath) : pkey(nullptr) {
+    std::cout << privateKeyPath.c_str() << std::endl << std::endl;
     FILE* fp = fopen(privateKeyPath.c_str(), "r");
     if (!fp) throw std::runtime_error("Cannot open private key file");
     pkey = PEM_read_PrivateKey(fp, nullptr, nullptr, nullptr);

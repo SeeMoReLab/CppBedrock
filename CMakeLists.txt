@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Manually specify the include path for yaml-cpp
-include_directories("/opt/homebrew/Cellar/yaml-cpp/0.8.0/include")
+include_directories("/opt/homebrew/Cellar/yaml-cpp/0.9.0/include")
 # Find nlohmann json package
 find_package(nlohmann_json REQUIRED)
 find_package(OpenSSL REQUIRED)
@@ -30,7 +30,7 @@ find_package(gRPC CONFIG REQUIRED)
 find_package(Protobuf REQUIRED)
 
 # Manually specify the library path for yaml-cpp
-link_directories("/opt/homebrew/Cellar/yaml-cpp/0.8.0/lib")
+link_directories("/opt/homebrew/Cellar/yaml-cpp/0.9.0/lib")
 
 include_directories(include)
 

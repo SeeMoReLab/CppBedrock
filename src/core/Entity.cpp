@@ -144,7 +144,7 @@ Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, b
 {
     EventFactory::getInstance().initialize();
     // Load selected protocol from runtime.selection.yaml; fallback to Zyzzyva
-    std::string selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.pbft.yaml";
+    std::string selectedConfig = "../config/config.sbft.yaml";
     try {
         YAML::Node runtime = YAML::LoadFile("/Users/eswar/Downloads/CppBedrock/config/runtime.selection.yaml");
         if (runtime && runtime["protocol"]) {
@@ -153,12 +153,12 @@ Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, b
             else if (proto == "LinearPBFT")   selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.linearpbft.yaml";
             else if (proto == "Hotstuff")     selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.hotstuff.yaml";
             else if (proto == "Hotstuff2")    selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.hotstuff2.yaml";
-            else if (proto == "SBFT")         selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.sbft.yaml";
+            else if (proto == "SBFT")         selectedConfig = "/Users/prajwal/Projects//CppBedrock/config/config.sbft.yaml";
             else if (proto == "Zyzzyva")      selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.zyzzyva.yaml";
             else if (proto == "ChainedHotstuff") selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.chained_hotstuff.yaml";
         }
     } catch (...) {}
-    //selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.sbft.yaml";
+    selectedConfig = "/Users/prajwal/Projects/CppBedrock/config/config.sbft.yaml";
     loadProtocolConfig(selectedConfig);
     std::cout << "[Node " << nodeId << "] Loaded protocol config: " << selectedConfig << "\n";
     timeKeeper = std::make_unique<TimeKeeper>(8000, [this] {

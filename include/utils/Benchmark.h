@@ -51,9 +51,17 @@ public:
         os << "\n==== Benchmark " << _name << " ====\n";
         os << "Issued=" << s.issued << " Completed=" << s.completed
            << " Errors=" << s.errors << " InFlight=" << s.in_flight << "\n";
-        os << "Latency(us): avg=" << s.avg << "\n";
+        os << "Latency(us): avg=" << s.avg
+           << " p50=" << s.p50 << " p90=" << s.p90 << " p99=" << s.p99
+           << " min=" << s.min << " max=" << s.max << "\n";
         os << "Throughput=" << s.throughput << " ops/sec\n";
         os << "==============================\n";
+    }
+    void record(long latency_us) {
+        std::lock_guard<std::mutex> lg(_mtx);
+        _latencies.push_back(latency_us);
+        ++_issued;
+        ++_completed;
     }
     void exportCSV(const std::string& path) {
         std::lock_guard<std::mutex> lg(_mtx);
@@ -62,21 +70,11 @@ public:
         for (auto v : _latencies) out << v << "\n";
     }
 
-private:
-    using Clock = std::chrono::steady_clock;
     struct Stats {
         double avg=0; long p50=0,p90=0,p99=0,min=0,max=0;
         double throughput=0;
         size_t issued=0,completed=0,errors=0,in_flight=0;
     };
-    static long pct(const std::vector<long>& v,double p){
-        if (v.empty()) return 0;
-        double idx = p * (v.size()-1);
-        size_t lo = (size_t)idx;
-        size_t hi = std::min(v.size()-1, lo+1);
-        double f = idx - lo;
-        return (long)((1.0-f)*v[lo] + f*v[hi]);
-    }
     Stats stats() {
         std::lock_guard<std::mutex> lg(_mtx);
         Stats s;
@@ -93,6 +91,16 @@ private:
         return s;
     }
 
+private:
+    using Clock = std::chrono::steady_clock;
+    static long pct(const std::vector<long>& v,double p){
+        if (v.empty()) return 0;
+        double idx = p * (v.size()-1);
+        size_t lo = (size_t)idx;
+        size_t hi = std::min(v.size()-1, lo+1);
+        double f = idx - lo;
+        return (long)((1.0-f)*v[lo] + f*v[hi]);
+    }
     std::string _name;
     Clock::time_point _t0;
     Clock::time_point _t1{};

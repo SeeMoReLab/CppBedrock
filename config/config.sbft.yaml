@@ -1,4 +1,14 @@
 protocol: SBFT
+metrics:
+  window_size: 100
+timers:
+  view_change_ms: 8000
+  fast_path_wait_ms: 20
+agents:
+  1: 50100
+  2: 50101
+  3: 50102
+  4: 50103
 phases:
   Request:
     quorum: 1

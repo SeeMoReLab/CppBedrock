@@ -22,6 +22,7 @@
 #include "crypto/CryptoProvider.h"
 #include "crypto/OpenSSLCryptoProvider.h"
 #include "crypto/CryptoUtils.h"
+#include "utils/Benchmark.h"
 #include <string>
 #include <mutex>
 #include <iostream>
@@ -30,6 +31,8 @@
 #include <grpcpp/grpcpp.h>
 #include "proto/bedrock.grpc.pb.h"
 #include "proto/bedrock.pb.h"
+#include "proto/agent.grpc.pb.h"
+#include "proto/agent.pb.h"
 #include <functional> // For std::hash
 
 namespace grpc { class Server; }
@@ -240,6 +243,8 @@ public:
     nlohmann::json entityInfo;
     std::unique_ptr<CryptoProvider> cryptoProvider;
     YAML::Node protocolConfig;
+    int viewChangeTimeoutMs{8000};
+    int fastPathWaitMs{20};
     void onTimeout();
     void sendNewViewToNextLeader();
 
@@ -308,6 +313,43 @@ public:
     
     mutable std::mutex processedMtx;     // protects processedOperations
 
+    // ---- Byzantine fault-injection schedule ----
+    struct ByzantineNodeState {
+        int proposalDelayMs{0};
+        bool skipFastPath{false};
+        int fastPathExtraDelayMs{0};
+    };
+    struct ByzantineScheduleEntry {
+        int atSeconds{0};
+        std::unordered_map<int, ByzantineNodeState> nodes; // nodeId -> state
+    };
+    std::vector<ByzantineScheduleEntry> byzantineSchedule; // sorted ascending by atSeconds
+    std::chrono::steady_clock::time_point byzantineStartTime;
+
+    // Cached active state — updated lazily when the next entry's time has elapsed.
+    // Entries that list this node fully replace the cached state (omitted fields → default).
+    // Entries that don't mention this node leave the cached state unchanged.
+    mutable std::mutex byzantineMtx;
+    mutable size_t nextByzScheduleIdx{0};
+    mutable ByzantineNodeState activeByzantineState;
+
+    void loadByzantineSchedule(const std::string& configFile);
+    ByzantineNodeState getActiveByzantineState() const;
+
+    // Windowed metrics (also protected by processedMtx)
+    Benchmark nodeBench;
+    Benchmark phaseBench_preprepare{"preprepare_phase"};
+    Benchmark phaseBench_prepare{"prepare_phase"};
+    Benchmark phaseBench_commit{"commit_phase"};
+    int windowSize = 100;
+    int windowTxCount = 0;
+    int windowId = 1;
+
+    std::unordered_map<int, long long> phaseTs_preprepare; // seq → µs when PrePrepare stored
+    std::unordered_map<int, long long> phaseTs_prepare;    // seq → µs when prepare quorum first met
+    std::unordered_map<int, long long> phaseTs_commit;     // seq → µs when commit quorum first met
+    std::mutex phaseTsMtx;
+
 private:
     int nodeId;
     
@@ -347,6 +389,28 @@ private:
     std::unordered_map<int, std::unique_ptr<bedrock::Node::Stub>> grpcStubs_;
     void initGrpcStubs();             // create stubs for all peers and self
     bedrock::Node::Stub* getStub(int peerId);
+
+    // Learning agent connection (optional, per-node)
+    int agentPort{-1};
+    std::unique_ptr<LearningAgent::Stub> agentStub_;
+
+    // Agent episode / reward state
+    uint32_t agentEpisode{1};
+
+    std::mutex pendingTimeoutMtx;
+    bool pendingTimeoutReady{false};
+    SbftTimeout pendingTimeout;
+    std::atomic<bool> agentStopPolling{false};
+
+    SbftTimeout activeTimeoutSnapshot; // timeout active during current episode
+
+    struct SavedEpisodeReward {
+        uint32_t episode{0};
+        SbftReport report;
+        SbftTimeout timeoutUsed;
+    };
+    bool hasSavedReward{false};
+    SavedEpisodeReward savedReward;
 
 };
 

@@ -1,0 +1,20 @@
+# Byzantine fault-injection schedule for SBFT.
+# Behaviors activate at wall-clock offsets (seconds) from node start.
+# Each entry fully replaces the active state for listed nodes;
+# fields omitted from a node's block reset to their defaults (0 / false).
+# Nodes not listed in an entry keep their previous state.
+
+# Example:
+# schedule:
+#   - at: 10s
+#     nodes:
+#       1:
+#         proposal_delay: 10ms
+#         skip_fast_path: true
+#       2:
+#         delay_fast_path: 200ms
+#   - at: 30s
+#     nodes:
+#       1:
+#         skip_fast_path: false
+#         # proposal_delay omitted → resets to 0

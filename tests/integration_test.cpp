@@ -100,7 +100,10 @@ int main(int argc, char* argv[]) {
     int clientListenPort = 6000;
     int scenario = 1; // Default to 1=single
 
-    // Parse scenario from command line argument if provided
+    int s4NumRequests = 1000;
+    int s4MaxClients  = 128;
+
+    // Parse arguments: <scenario> [num_requests] [max_clients]
     if (argc > 1) {
         scenario = std::stoi(argv[1]);
         if (scenario < 1) {
@@ -108,6 +111,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
+    if (argc > 2) s4NumRequests = std::stoi(argv[2]);
+    if (argc > 3) s4MaxClients  = std::stoi(argv[3]);
 
     if (scenario == 4) {
         scenario4Bench.reset("scenario4"); // was: scenario4Bench = Benchmark("scenario4");
@@ -413,7 +418,7 @@ int main(int argc, char* argv[]) {
         }
     }
     else if (scenario == 4) {
-        NUM_REQUESTS = 100; // reduce burst size
+        NUM_REQUESTS = s4NumRequests;
 
         transactions.clear();
         for (int i = 0; i < NUM_REQUESTS; ++i) {
@@ -422,8 +427,10 @@ int main(int argc, char* argv[]) {
             int amount = 5 + (i % 5) * 5;
             transactions.push_back({from, to, amount});
         }
+        std::cout << "[Scenario 4] num_requests=" << NUM_REQUESTS
+                  << " max_clients=" << s4MaxClients << "\n";
         std::vector<std::thread> clientThreads;
-        const int maxConcurrent = 128; // cap concurrency
+        const int maxConcurrent = s4MaxClients;
         std::mutex gateMtx;
         std::condition_variable gateCv;
         int inFlight = 0;

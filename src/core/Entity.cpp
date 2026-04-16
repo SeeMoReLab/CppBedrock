@@ -7,6 +7,8 @@
 #include "coordination/grpc/NodeServiceImpl.h"
 #include "proto/bedrock.grpc.pb.h"
 #include "proto/bedrock.pb.h"
+#include "proto/agent.grpc.pb.h"
+#include "proto/agent.pb.h"
 #include <grpcpp/grpcpp.h>
 #include <iostream>
 #include <yaml-cpp/yaml.h>
@@ -32,6 +34,7 @@ namespace {
     void flushCsvBatchUnlocked(int nodeId) {
         auto it = s_csvBatches.find(nodeId);
         if (it == s_csvBatches.end() || it->second.empty()) return;
+        // std::filesystem::create_directories("logs");
         const std::string csvPath = "logs/node_" + std::to_string(nodeId) + "_ops.csv";
         const bool exists = std::filesystem::exists(csvPath);
         std::ofstream out(csvPath, std::ios::app);
@@ -142,6 +145,7 @@ Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, b
       f(peers.size()/3),
       prePrepareBroadcasted()
 {
+    nodeBench.reset("node_" + std::to_string(id) + "_w1");
     EventFactory::getInstance().initialize();
     // Load selected protocol from runtime.selection.yaml; fallback to Zyzzyva
     std::string selectedConfig = "../config/config.sbft.yaml";
@@ -161,7 +165,7 @@ Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, b
     selectedConfig = "/Users/prajwal/Projects/CppBedrock/config/config.sbft.yaml";
     loadProtocolConfig(selectedConfig);
     std::cout << "[Node " << nodeId << "] Loaded protocol config: " << selectedConfig << "\n";
-    timeKeeper = std::make_unique<TimeKeeper>(8000, [this] {
+    timeKeeper = std::make_unique<TimeKeeper>(viewChangeTimeoutMs, [this] {
         this->onTimeout();
     });
     entityInfo["server_name"] = getNodeId();
@@ -374,12 +378,37 @@ void Entity::start() {
     std::cout << "[Entity] Starting entity with role: " << _entityState.getRole() << "\n";
     running = true;
 
+    // Truncate metrics CSV at startup so each run starts fresh (ops CSV is preserved)
+    std::filesystem::create_directories("logs");
+    std::ofstream("logs/node_" + std::to_string(getNodeId()) + "_metrics.csv", std::ios::trunc);
+
     // No TCP listener
     // connection.startListening();
 
     // Start in-entity gRPC server and init client stubs
     startGrpcServer();
     initGrpcStubs();
+
+    // Initialise active timeout snapshot from config values
+    activeTimeoutSnapshot.set_election_timeout_milliseconds(viewChangeTimeoutMs);
+    activeTimeoutSnapshot.set_slow_path_timeout_milliseconds(fastPathWaitMs);
+
+    if (agentPort > 0) {
+        auto ch = grpc::CreateChannel("127.0.0.1:" + std::to_string(agentPort),
+                                      grpc::InsecureChannelCredentials());
+        agentStub_ = LearningAgent::NewStub(ch);
+        std::cout << "[Node " << getNodeId() << "] Agent stub created on port " << agentPort << "\n";
+        try {
+            grpc::ClientContext ctx;
+            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
+            google::protobuf::Empty req, resp;
+            auto st = agentStub_->Reset(&ctx, req, &resp);
+            if (st.ok())
+                std::cout << "[Node " << getNodeId() << "] Agent reset OK\n";
+            else
+                std::cout << "[Node " << getNodeId() << "] Agent reset failed (agent may not be running): " << st.error_message() << "\n";
+        } catch (...) {}
+    }
 
     processingThread = std::thread(&Entity::processMessages, this);
     //std::this_thread::sleep_for(std::chrono::milliseconds(0)); 
@@ -415,6 +444,18 @@ void Entity::processMessages() {
 void Entity::loadProtocolConfig(const std::string& configFile) {
     try {
         protocolConfig = YAML::LoadFile(configFile);
+        if (protocolConfig["timers"]) {
+            const YAML::Node& timers = protocolConfig["timers"];
+            if (timers["view_change_ms"]) viewChangeTimeoutMs = timers["view_change_ms"].as<int>();
+            if (timers["fast_path_wait_ms"]) fastPathWaitMs = timers["fast_path_wait_ms"].as<int>();
+        }
+        if (protocolConfig["metrics"]) {
+            const YAML::Node& metrics = protocolConfig["metrics"];
+            if (metrics["window_size"]) windowSize = metrics["window_size"].as<int>();
+        }
+        if (protocolConfig["agents"] && protocolConfig["agents"][nodeId]) {
+            agentPort = protocolConfig["agents"][nodeId].as<int>();
+        }
         const YAML::Node& phases = protocolConfig["phases"];
         if (!phases.IsMap()) {
             std::cerr << "Error: 'phases' should be a map in YAML file" << std::endl;
@@ -783,16 +824,12 @@ void Entity::markOperationProcessed(int seq) {
                   << "\n";
 
         // Store every operation; flush to CSV when (seq % 99) == 0
+        std::string opStr;
+        if (commitOperations.count(seq)) opStr = commitOperations.at(seq);
         try {
             const auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    std::chrono::system_clock::now().time_since_epoch()).count();
-            std::string opStr;
-            // If you track committed operation per-seq, include it
-            if (commitOperations.count(seq)) {
-                opStr = commitOperations.at(seq);
-            }
-            {
-                std::lock_guard<std::mutex> lk(s_csvBatchMtx);
+            {   std::lock_guard<std::mutex> lk(s_csvBatchMtx);
                 s_csvBatches[getNodeId()].emplace_back(seq, ts_ms, opStr);
                 if (seq % 99 == 0) {
                     flushCsvBatchUnlocked(getNodeId());
@@ -800,6 +837,229 @@ void Entity::markOperationProcessed(int seq) {
             }
         } catch (const std::exception& e) {
             std::cerr << "[Node " << getNodeId() << "] CSV batch error: " << e.what() << "\n";
+        }
+
+        // Windowed throughput & latency metrics
+        try {
+            long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
+            // Compute end-to-end latency from client-embedded timestamp (format: "ms_idx")
+            // reuse opStr already read above
+            if (!opStr.empty()) {
+                auto sep = opStr.find('_');
+                if (sep != std::string::npos) {
+                    long long clientMs = std::stoll(opStr.substr(0, sep));
+                    long long latUs = nowUs - clientMs * 1000LL;
+                    if (latUs > 0) {
+                        nodeBench.record(latUs);
+                        ++windowTxCount; // only count txns with valid latency
+                    }
+                }
+            }
+
+            // Phase-wise latencies
+            {
+                std::lock_guard<std::mutex> lk(phaseTsMtx);
+                auto it_pp = phaseTs_preprepare.find(seq);
+                auto it_pr = phaseTs_prepare.find(seq);
+                auto it_co = phaseTs_commit.find(seq);
+                if (it_pp != phaseTs_preprepare.end() && it_pr != phaseTs_prepare.end()) {
+                    long long ppUs = it_pr->second - it_pp->second;
+                    if (ppUs > 0) phaseBench_preprepare.record(ppUs);
+                }
+                if (it_pr != phaseTs_prepare.end() && it_co != phaseTs_commit.end()) {
+                    long long prUs = it_co->second - it_pr->second;
+                    if (prUs > 0) phaseBench_prepare.record(prUs);
+                }
+                if (it_co != phaseTs_commit.end()) {
+                    long long coUs = nowUs - it_co->second;
+                    if (coUs > 0) phaseBench_commit.record(coUs);
+                }
+                phaseTs_preprepare.erase(seq);
+                phaseTs_prepare.erase(seq);
+                phaseTs_commit.erase(seq);
+
+                // Purge stale entries for sequences that never completed (TTL = 30s)
+                constexpr long long kStaleTtlUs = 30'000'000LL;
+                for (auto it = phaseTs_preprepare.begin(); it != phaseTs_preprepare.end(); )
+                    it = (nowUs - it->second > kStaleTtlUs) ? phaseTs_preprepare.erase(it) : std::next(it);
+                for (auto it = phaseTs_prepare.begin(); it != phaseTs_prepare.end(); )
+                    it = (nowUs - it->second > kStaleTtlUs) ? phaseTs_prepare.erase(it) : std::next(it);
+                for (auto it = phaseTs_commit.begin(); it != phaseTs_commit.end(); )
+                    it = (nowUs - it->second > kStaleTtlUs) ? phaseTs_commit.erase(it) : std::next(it);
+            }
+
+            int half   = windowSize / 2;
+            int eighty = windowSize * 4 / 5;
+
+            auto logWindowMetrics = [&](const std::string& checkpoint) {
+                auto s   = nodeBench.stats();
+                auto spp = phaseBench_preprepare.stats();
+                auto spr = phaseBench_prepare.stats();
+                auto sco = phaseBench_commit.stats();
+                // Use bench-tracked count (reflects slice size after any mid-window reset)
+                const size_t sliceTxCount = s.completed;
+                std::cout << "[Node " << getNodeId() << "] Window " << windowId
+                          << " @" << checkpoint
+                          << " txns=" << sliceTxCount
+                          << " throughput=" << s.throughput << " ops/sec"
+                          << " avg=" << s.avg << "us"
+                          << " preprepare_avg=" << spp.avg << "us"
+                          << " prepare_avg=" << spr.avg << "us"
+                          << " commit_avg=" << sco.avg << "us\n";
+
+                std::filesystem::create_directories("logs");
+                const std::string csvPath = "logs/node_" + std::to_string(getNodeId()) + "_metrics.csv";
+                const bool needsHeader = !std::filesystem::exists(csvPath) ||
+                                         std::filesystem::file_size(csvPath) == 0;
+                std::ofstream out(csvPath, std::ios::app);
+                if (needsHeader) out << "window_id,checkpoint,tx_count,throughput_ops_sec,avg_latency_us,"
+                                        "avg_preprepare_phase_us,avg_prepare_phase_us,avg_commit_phase_us\n";
+                out << windowId << "," << checkpoint << "," << sliceTxCount << ","
+                    << s.throughput << "," << s.avg << ","
+                    << spp.avg << "," << spr.avg << "," << sco.avg << "\n";
+            };
+
+            // Helper: snapshot current bench stats into an SbftReport
+            auto buildSbftReport = [&]() -> SbftReport {
+                auto s_   = nodeBench.stats();
+                auto spp_ = phaseBench_preprepare.stats();
+                auto spr_ = phaseBench_prepare.stats();
+                auto sco_ = phaseBench_commit.stats();
+                SbftReport rep;
+                rep.set_total_transactions(static_cast<uint32_t>(s_.completed));
+                rep.set_total_consensus_instances(static_cast<uint32_t>(s_.completed));
+                rep.set_avg_consensus_latency_ms(s_.avg / 1000.0f);
+                rep.set_throughput_tps(s_.throughput);
+                rep.set_pre_prepare_latency_ms(spp_.avg / 1000.0f);
+                rep.set_prepare_latency_ms(spr_.avg / 1000.0f);
+                rep.set_commit_latency_ms(sco_.avg / 1000.0f);
+                return rep;
+            };
+
+            if (windowTxCount == half) {
+                logWindowMetrics("50pct");
+
+                if (agentStub_) {
+                    // Reset pending state for this episode
+                    { std::lock_guard<std::mutex> lk(pendingTimeoutMtx); pendingTimeoutReady = false; }
+                    agentStopPolling = false;
+
+                    // Build report and optionally attach prior episode reward
+                    ReportLocal rpt;
+                    rpt.set_node_id(getNodeId());
+                    rpt.set_episode(agentEpisode);
+                    rpt.set_protocol(PROTOCOL_SBFT);
+                    rpt.set_start_tick((agentEpisode - 1) * static_cast<uint32_t>(windowSize));
+                    rpt.set_report_seq(agentEpisode * static_cast<uint32_t>(windowSize / 2));
+                    *rpt.mutable_sbft_state() = buildSbftReport();
+
+                    if (hasSavedReward) {
+                        auto* rwd = rpt.mutable_reward()->mutable_sbft();
+                        rwd->set_episode(savedReward.episode);
+                        *rwd->mutable_report() = savedReward.report;
+                        *rwd->mutable_timeout_used() = savedReward.timeoutUsed;
+                    }
+
+                    auto* stub = agentStub_.get();
+                    uint32_t ep = agentEpisode;
+                    std::thread([this, stub, ep, rpt = std::move(rpt)]() mutable {
+                        try {
+                            // Send report
+                            {
+                                grpc::ClientContext ctx;
+                                ctx.set_deadline(std::chrono::system_clock::now() +
+                                                 std::chrono::milliseconds(500));
+                                google::protobuf::Empty empty;
+                                stub->SendReport(&ctx, rpt, &empty);
+                            }
+                            // Poll GetTimeout until READY or stop signal
+                            while (!agentStopPolling.load()) {
+                                grpc::ClientContext ctx;
+                                ctx.set_deadline(std::chrono::system_clock::now() +
+                                                 std::chrono::milliseconds(100));
+                                TimeoutRequest treq;
+                                treq.set_episode(ep);
+                                treq.set_protocol(PROTOCOL_SBFT);
+                                TimeoutStatus ts;
+                                auto st = stub->GetTimeout(&ctx, treq, &ts);
+                                if (st.ok() &&
+                                    ts.status() == TimeoutStatus::READY &&
+                                    ts.has_timeout() && ts.timeout().has_sbft()) {
+                                    std::lock_guard<std::mutex> lk(pendingTimeoutMtx);
+                                    pendingTimeout = ts.timeout().sbft();
+                                    pendingTimeoutReady = true;
+                                    break;
+                                }
+                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                            }
+                        } catch (...) {}
+                    }).detach();
+                }
+
+            } else if (windowTxCount == eighty) {
+                logWindowMetrics("80pct");
+
+                if (agentStub_) {
+                    agentStopPolling = true; // stop poll thread
+
+                    std::lock_guard<std::mutex> lk(pendingTimeoutMtx);
+                    if (pendingTimeoutReady) {
+                        const int prevElection  = viewChangeTimeoutMs;
+                        const int prevSlowPath  = fastPathWaitMs;
+                        if (pendingTimeout.election_timeout_milliseconds() > 0) {
+                            viewChangeTimeoutMs = pendingTimeout.election_timeout_milliseconds();
+                            std::lock_guard<std::mutex> lk2(timerMtx);
+                            if (timeKeeper) {
+                                timeKeeper->stop();
+                                timeKeeper = std::make_unique<TimeKeeper>(
+                                    viewChangeTimeoutMs, [this] { onTimeout(); });
+                            }
+                        }
+                        if (pendingTimeout.slow_path_timeout_milliseconds() > 0)
+                            fastPathWaitMs = pendingTimeout.slow_path_timeout_milliseconds();
+                        std::cout << "[Node " << getNodeId()
+                                  << "] Timer update (episode=" << agentEpisode
+                                  << " window=" << windowId << "):"
+                                  << " election " << prevElection << "->" << viewChangeTimeoutMs << "ms"
+                                  << " slow_path " << prevSlowPath << "->" << fastPathWaitMs << "ms\n";
+                    } else {
+                        std::cout << "[Node " << getNodeId()
+                                  << "] No timeout received by 80%, skipping\n";
+                    }
+                    // Always snapshot the active timeout (applied or unchanged)
+                    activeTimeoutSnapshot.set_election_timeout_milliseconds(viewChangeTimeoutMs);
+                    activeTimeoutSnapshot.set_slow_path_timeout_milliseconds(fastPathWaitMs);
+                }
+
+                // Reset benchmarks so 80–100% is tracked as a clean reward window
+                nodeBench.reset("node_" + std::to_string(getNodeId()) + "_w" + std::to_string(windowId) + "_reward");
+                phaseBench_preprepare.reset("preprepare_phase_w" + std::to_string(windowId) + "_reward");
+                phaseBench_prepare.reset("prepare_phase_w"    + std::to_string(windowId) + "_reward");
+                phaseBench_commit.reset("commit_phase_w"      + std::to_string(windowId) + "_reward");
+
+            } else if (windowTxCount >= windowSize) {
+                logWindowMetrics("100pct");
+
+                if (agentStub_) {
+                    // Save this episode's final report + timeout for use as reward next episode
+                    savedReward.episode   = agentEpisode;
+                    savedReward.report    = buildSbftReport();
+                    savedReward.timeoutUsed = activeTimeoutSnapshot;
+                    hasSavedReward = true;
+                    ++agentEpisode;
+                }
+
+                ++windowId;
+                windowTxCount = 0;
+                nodeBench.reset("node_" + std::to_string(getNodeId()) + "_w" + std::to_string(windowId));
+                phaseBench_preprepare.reset("preprepare_phase_w" + std::to_string(windowId));
+                phaseBench_prepare.reset("prepare_phase_w" + std::to_string(windowId));
+                phaseBench_commit.reset("commit_phase_w" + std::to_string(windowId));
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[Node " << getNodeId() << "] Metrics error: " << e.what() << "\n";
         }
     }
 }
@@ -1068,6 +1328,77 @@ void Entity::sendProtocolTo(int peer, const bedrock::ProtocolEnvelope& env) {
                       << peer << ": " << e.what() << "\n";
         }
     }).detach();
+}
+
+// ---- Byzantine schedule helpers ----
+
+static int byzParseSeconds(const std::string& s) {
+    // "10s" -> 10
+    return std::stoi(s.substr(0, s.find('s')));
+}
+static int byzParseMs(const std::string& s) {
+    // "200ms" -> 200
+    return std::stoi(s.substr(0, s.find('m')));
+}
+
+void Entity::loadByzantineSchedule(const std::string& configFile) {
+    try {
+        if (!std::filesystem::exists(configFile)) return;
+        YAML::Node config = YAML::LoadFile(configFile);
+        if (!config["schedule"] || !config["schedule"].IsSequence()) return;
+        for (const auto& entry : config["schedule"]) {
+            ByzantineScheduleEntry e;
+            e.atSeconds = byzParseSeconds(entry["at"].as<std::string>());
+            for (const auto& nodePair : entry["nodes"]) {
+                int nid = nodePair.first.as<int>();
+                ByzantineNodeState st;
+                const auto& nb = nodePair.second;
+                if (nb["proposal_delay"])  st.proposalDelayMs      = byzParseMs(nb["proposal_delay"].as<std::string>());
+                if (nb["skip_fast_path"])  st.skipFastPath         = nb["skip_fast_path"].as<bool>();
+                if (nb["delay_fast_path"]) st.fastPathExtraDelayMs = byzParseMs(nb["delay_fast_path"].as<std::string>());
+                e.nodes[nid] = st;
+            }
+            byzantineSchedule.push_back(std::move(e));
+        }
+        std::sort(byzantineSchedule.begin(), byzantineSchedule.end(),
+                  [](const auto& a, const auto& b){ return a.atSeconds < b.atSeconds; });
+        byzantineStartTime = std::chrono::steady_clock::now();
+        std::cout << "[Node " << getNodeId() << "] Loaded byzantine schedule ("
+                  << byzantineSchedule.size() << " entries) from " << configFile << "\n";
+    } catch (const std::exception& ex) {
+        std::cerr << "[Node " << getNodeId() << "] byzantine schedule load error: " << ex.what() << "\n";
+    }
+}
+
+Entity::ByzantineNodeState Entity::getActiveByzantineState() const {
+    if (byzantineSchedule.empty()) return {};
+    ByzantineNodeState snapshot;
+    bool stateChanged = false;
+    int elapsed = 0;
+    {
+        std::lock_guard<std::mutex> lk(byzantineMtx);
+        elapsed = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - byzantineStartTime).count());
+        // Advance through any newly-elapsed entries; O(1) amortised.
+        while (nextByzScheduleIdx < byzantineSchedule.size() &&
+               byzantineSchedule[nextByzScheduleIdx].atSeconds <= elapsed) {
+            const auto& entry = byzantineSchedule[nextByzScheduleIdx];
+            auto it = entry.nodes.find(nodeId);
+            if (it != entry.nodes.end()) {
+                activeByzantineState = it->second;
+                stateChanged = true;
+            }
+            ++nextByzScheduleIdx;
+        }
+        snapshot = activeByzantineState;
+    } // lock released here
+    if (stateChanged)
+        std::cout << "[Node " << nodeId << "] Byzantine state updated at t+" << elapsed
+                  << "s: proposalDelay=" << snapshot.proposalDelayMs
+                  << "ms skipFastPath=" << snapshot.skipFastPath
+                  << " fastPathExtra=" << snapshot.fastPathExtraDelayMs << "ms\n";
+    return snapshot;
 }
 
 void Entity::loadDelaysFromConfig(const std::string& configFile) {

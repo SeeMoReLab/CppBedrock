@@ -97,16 +97,21 @@ public:
             }
 
             // Index PrePrepare minimal info
-            if (p->has_tx()) {
+            if (phase == "PrePrepare") {
+                {
+                    long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    std::lock_guard<std::mutex> lk(entity->phaseTsMtx);
+                    entity->phaseTs_preprepare.emplace(seq, nowUs);
+                }
+                if (p->has_tx()) {
                 Entity::PrePrepareInfo info;
                 info.timestamp   = p->timestamp();
                 info.operation   = p->operation();
                 info.client_port = p->client_listen_port();
-                if (p->has_tx()) {
-                    info.from   = p->tx_from();
-                    info.to     = p->tx_to();
-                    info.amount = p->tx_amount();
-                }
+                info.from   = p->tx_from();
+                info.to     = p->tx_to();
+                info.amount = p->tx_amount();
                 {
                     std::lock_guard<std::mutex> lk(entity->prePrepareMtx);
                     entity->prePrepareIndex[seq] = std::move(info);
@@ -132,6 +137,7 @@ public:
                 entity->dataset.update(
                     "PrePrepare_" + std::to_string(seq) + "_" + std::to_string(senderId),
                     toStore);
+                }
             }
 
             // Combined senders directly from protobuf (no JSON parse needed)
@@ -210,6 +216,12 @@ public:
                 {
                     std::lock_guard<std::mutex> lk(entity->prePrepareMtx);
                     entity->prePrepareIndex[seq] = std::move(info);
+                }
+                {
+                    long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    std::lock_guard<std::mutex> lk(entity->phaseTsMtx);
+                    entity->phaseTs_preprepare.emplace(seq, nowUs);
                 }
             }
         } catch (...) {
@@ -367,7 +379,17 @@ public:
                       << ": " << uniqueSendersSize-1 << " unique senders (excluding self), quorum is " << quorum
                       << ". Quorum met: " << (quorumMet ? "YES" : "NO") << std::endl;
             if (!quorumMet) return false;
-            // std::cout << "[Node " << entity->getNodeId() << "] CheckQuorumEventForSBFT received for phase " << phase << " seq " << seq << std::endl;
+            {
+                long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                std::lock_guard<std::mutex> lk(entity->phaseTsMtx);
+                std::string phaseLowerTmp = phase;
+                for (auto& c : phaseLowerTmp) c = (char)std::tolower(c);
+                if (phaseLowerTmp == "prepare")
+                    entity->phaseTs_prepare.emplace(seq, nowUs);
+                else if (phaseLowerTmp == "commit")
+                    entity->phaseTs_commit.emplace(seq, nowUs);
+            }
             // Timer logic for prepare phase (case-insensitive match to original "prepare")
             std::string phaseLower = phase;
             for (auto& c : phaseLower) c = (char)std::tolower(c);
@@ -376,11 +398,24 @@ public:
             if (phaseLower == "prepare" && (entity->entityInfo["view"].get<int>() + 1) % ((entity->getF()*3)+1) == entity->getNodeId()) {
                // std::cout << "[Node " << entity->getNodeId() << "] Quorum met for Prepare phase of seq " << seq << " with " << uniqueSendersSize << " unique senders. Checking timer logic..." << std::endl;
                 if (!entity->preparePhaseTimerRunning[seq].exchange(true) && uniqueSendersSize < (entity->getF() * 3)) {
-                    std::thread([entity, seq, phaseConfig, phase, state]() {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                    auto byzState = entity->getActiveByzantineState();
+                    int fastPathWait = entity->fastPathWaitMs + byzState.fastPathExtraDelayMs;
+                    bool skipFastPath = byzState.skipFastPath;
+                    if (byzState.fastPathExtraDelayMs > 0)
+                        std::cout << "[Node " << entity->getNodeId()
+                                  << "] Byzantine delay_fast_path +" << byzState.fastPathExtraDelayMs
+                                  << "ms seq=" << seq << " (total wait=" << fastPathWait << "ms)\n";
+                    std::thread([entity, seq, phaseConfig, phase, state, fastPathWait, skipFastPath]() {
+                        auto t0 = std::chrono::steady_clock::now();
+                        std::this_thread::sleep_for(std::chrono::milliseconds(fastPathWait));
+                        auto actualMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+                        std::cout << "[Node " << entity->getNodeId()
+                                  << "] fast_path_timer done seq=" << seq
+                                  << " slept=" << actualMs << "ms\n";
                         entity->preparePhaseTimerRunning[seq] = false;
 
-                        // Decide next state (same logic: only advance if exactly 3f+1 senders; keep parity)
+                        // Decide next state (only advance if exactly 3f+1 senders and not skipping fast path)
                         std::string aggKey = phase + "_" + std::to_string(seq);
                         size_t currentCount = 0;
                         {
@@ -391,13 +426,15 @@ public:
 
                         YAML::Node nextPhaseConfig = entity->getPhaseConfigInsensitive(phase);
                         std::string nextState;
-                        if (currentCount == (entity->getF() * 3) && nextPhaseConfig && nextPhaseConfig["next_state"]) {
+                        const bool wouldTakeFastPath = (currentCount == (entity->getF() * 3) && nextPhaseConfig && nextPhaseConfig["next_state"]);
+                        if (!skipFastPath && wouldTakeFastPath) {
                             nextState = nextPhaseConfig["next_state"].as<std::string>();
                             entity->sequenceStates[seq].setState(nextState);
                         } else {
-                            nextState = phase; // stay
-                            // std::cout << "[Node " << entity->getNodeId() << "] Timer expired for seq " << seq << " but sender count is " << currentCount << ". Staying in phase " << phase << ".\n";
-                            //destroy thread here
+                            if (skipFastPath && wouldTakeFastPath)
+                                std::cout << "[Node " << entity->getNodeId()
+                                          << "] Byzantine skip_fast_path seq=" << seq << "\n";
+                            nextState = phase; // stay (slow path)
                             return;
                         }
 
@@ -506,20 +543,42 @@ public:
         int uniqueSendersSize = entity->keyToSenderIds[key2].size();
         quorumMet = uniqueSendersSize >= quorum;
         if (!quorumMet) return false;
+        {
+            long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            std::lock_guard<std::mutex> lk(entity->phaseTsMtx);
+            std::string phaseLowerTmp = currentPhase;
+            for (auto& c : phaseLowerTmp) c = (char)std::tolower(c);
+            if (phaseLowerTmp == "prepare")
+                entity->phaseTs_prepare.emplace(seq, nowUs);
+            else if (phaseLowerTmp == "commit")
+                entity->phaseTs_commit.emplace(seq, nowUs);
+        }
 
         if (currentPhase == "prepare") {
             if (!entity->preparePhaseTimerRunning[seq].exchange(true) && uniqueSendersSize <= quorum) {
-                std::thread([entity, seq, phaseConfig, currentPhase, uniqueSendersSize, state, j]() {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+                auto byzState2 = entity->getActiveByzantineState();
+                int fastPathWait = entity->fastPathWaitMs + byzState2.fastPathExtraDelayMs;
+                bool skipFastPath2 = byzState2.skipFastPath;
+                if (byzState2.fastPathExtraDelayMs > 0)
+                    std::cout << "[Node " << entity->getNodeId()
+                              << "] Byzantine delay_fast_path +" << byzState2.fastPathExtraDelayMs
+                              << "ms (json path) seq=" << seq << "\n";
+                std::thread([entity, seq, phaseConfig, currentPhase, uniqueSendersSize, state, j, fastPathWait, skipFastPath2]() {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(fastPathWait));
                     entity->preparePhaseTimerRunning[seq] = false;
 
                     YAML::Node nextPhaseConfig = entity->getPhaseConfig(currentPhase);
                     std::string nextState;
                     std::string key = currentPhase + "_" + std::to_string(seq);
-                    if (entity->keyToSenderIds[key].size() == 7) {
+                    const bool wouldTakeFastPath2 = (entity->keyToSenderIds[key].size() == 7 && nextPhaseConfig && nextPhaseConfig["next_state"]);
+                    if (!skipFastPath2 && wouldTakeFastPath2) {
                         nextState = nextPhaseConfig["next_state"].as<std::string>();
                         entity->sequenceStates[seq].setState(nextState);
                     } else {
+                        if (skipFastPath2 && wouldTakeFastPath2)
+                            std::cout << "[Node " << entity->getNodeId()
+                                      << "] Byzantine skip_fast_path (json path) seq=" << seq << "\n";
                         nextState = currentPhase;
                     }
 
@@ -711,13 +770,24 @@ public:
 
             // std::cout << "[Node " << entity->getNodeId() << "] Retrieving PrePrepare Info for sequence " << seq << std::endl;
             // O(1) lookup from prePrepareIndex (set by StoreMessageEvent on PrePrepare)
+            // Fall through even if not found (e.g. leader) so markOperationProcessed always runs
             Entity::PrePrepareInfo info;
+            info.operation   = p->operation();
+            info.client_port = p->client_listen_port();
+            info.timestamp   = p->timestamp();
             {
                 std::lock_guard<std::mutex> lk(entity->prePrepareMtx);
                 auto it = entity->prePrepareIndex.find(seq);
-                if (it == entity->prePrepareIndex.end()) return true;
-                info = it->second;                 // copy out
-                entity->prePrepareIndex.erase(it); // erase while locked
+                if (it != entity->prePrepareIndex.end()) {
+                    const auto& stored = it->second;
+                    if (info.timestamp.empty())  info.timestamp   = stored.timestamp;
+                    if (info.operation.empty())  info.operation   = stored.operation;
+                    if (info.client_port < 0)    info.client_port = stored.client_port;
+                    info.from   = stored.from;
+                    info.to     = stored.to;
+                    info.amount = stored.amount;
+                    entity->prePrepareIndex.erase(it);
+                }
             }
             // print info
             // std::cout << "Retrieved PrePrepare Info - Timestamp: " << info.timestamp
@@ -739,6 +809,7 @@ public:
                 }
             }
 
+            entity->commitOperations[seq] = info.operation;
             entity->markOperationProcessed(seq);
 
             // Reply once to client
@@ -813,6 +884,7 @@ public:
             }
         }
 
+        entity->commitOperations[seq] = info.operation;
         entity->markOperationProcessed(seq);
 
         // Reply once to client
@@ -951,6 +1023,10 @@ public:
                     m->set_message_sender_id(entity->getNodeId());
                     m->set_qc(qcStr);
                     fillCombined(m);
+                    entity->sendProtocolToAll(env);
+                    // Leader processes commit locally (sendProtocolToAll skips self)
+                    entity->processProtocolEnvelope(env);
+                    return true;
                 } else {
                     auto* m = env.mutable_prepare();
                     m->set_type(next);
@@ -1392,7 +1468,6 @@ class HandleClientRequestAsLeaderEvent : public BaseEvent {
 public:
     HandleClientRequestAsLeaderEvent(const nlohmann::json& params = {}) : BaseEvent(params) {}
     bool execute(Entity* entity, const Message* message, EntityState* state) override {
-        //std::cout << "[Node " << entity->getNodeId() << "] Handling client request as leader\n";
         auto now = std::chrono::system_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % std::chrono::seconds(1);
         std::time_t tt = std::chrono::system_clock::to_time_t(now);
@@ -1434,7 +1509,7 @@ public:
 
                 // Leader gRPC port is reachable: start / arm timeout watchdog
                 if (!entity->timeKeeper) {
-                    entity->timeKeeper = std::make_unique<TimeKeeper>(5000, [entity] {
+                    entity->timeKeeper = std::make_unique<TimeKeeper>(entity->viewChangeTimeoutMs, [entity] {
                         entity->onTimeout();
                     });
                 }
@@ -1455,6 +1530,14 @@ public:
         if(entity->isByzantine){
             //std::cout << "[Node " << entity->getNodeId() << "] I am Byzantine, skipping broadcast.\n";
             return false;
+        }
+        {
+            auto byzState = entity->getActiveByzantineState();
+            if (byzState.proposalDelayMs > 0) {
+                std::cout << "[Node " << entity->getNodeId()
+                          << "] Byzantine proposal_delay " << byzState.proposalDelayMs << "ms\n";
+                std::this_thread::sleep_for(std::chrono::milliseconds(byzState.proposalDelayMs));
+            }
         }
         if (!operation.empty() && !entity->hasProcessedOperation(std::stoi(operation.substr(9)))) {
 

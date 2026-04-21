@@ -16,11 +16,13 @@ public:
     void stop() override;
     void initializeEntities();
     void receiveMessage();
+    void setAgentEnabled(bool enabled) { agentEnabled_ = enabled; }
 
     std::vector<std::unique_ptr<Entity>> entities;
     bool entitiesStarted = false;
 
 private:
+    bool agentEnabled_{false};
     TcpConnection server;
     StateMachine stateMachine;
     EntityState entityState;

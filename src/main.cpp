@@ -5,8 +5,14 @@
 #include <cstdlib>   // NEW for std::getenv
 
 int main(int argc, char** argv) {
+    bool agentEnabled = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--agent") agentEnabled = true;
+    }
+
     CoordinationServer server;
     CoordinationUnit unit;
+    unit.setAgentEnabled(agentEnabled);
 
     //change path in entity.cpp to change protocol
     server.loadConfig("config.pbft.yaml");

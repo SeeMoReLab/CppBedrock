@@ -393,7 +393,7 @@ void Entity::start() {
     activeTimeoutSnapshot.set_election_timeout_milliseconds(viewChangeTimeoutMs);
     activeTimeoutSnapshot.set_slow_path_timeout_milliseconds(fastPathWaitMs);
 
-    if (agentPort > 0) {
+    if (agentEnabled_ && agentPort > 0) {
         auto ch = grpc::CreateChannel("127.0.0.1:" + std::to_string(agentPort),
                                       grpc::InsecureChannelCredentials());
         agentStub_ = LearningAgent::NewStub(ch);

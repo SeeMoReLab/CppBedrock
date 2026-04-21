@@ -57,6 +57,10 @@ void CoordinationUnit::receiveMessage() {
             bool byzantine = entityNode["byzantine"].as<bool>(); // default to false if missing
             tempEntities.push_back(std::make_unique<Entity>(role, id, peers, byzantine));
         }
+        // Propagate agent-enabled flag
+        for (auto& entity : tempEntities) {
+            entity->setAgentEnabled(agentEnabled_);
+        }
         // Load byzantine schedule (SBFT-specific; silently no-ops if file absent)
         for (auto& entity : tempEntities) {
             entity->loadByzantineSchedule("../config/config.sbft.byzantine.yaml");

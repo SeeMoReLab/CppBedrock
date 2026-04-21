@@ -297,6 +297,7 @@ public:
     void sendProtocolToAll(const bedrock::ProtocolEnvelope& env);
     void sendProtocolTo(int peer, const bedrock::ProtocolEnvelope& env);
     void loadDelaysFromConfig(const std::string& configFile);
+    void setAgentEnabled(bool enabled) { agentEnabled_ = enabled; }
 
     struct PrePrepareInfo {
         std::string timestamp;
@@ -392,6 +393,7 @@ private:
 
     // Learning agent connection (optional, per-node)
     int agentPort{-1};
+    bool agentEnabled_{false};
     std::unique_ptr<LearningAgent::Stub> agentStub_;
 
     // Agent episode / reward state

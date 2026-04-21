@@ -34,7 +34,9 @@
 
 - Run Bedrock SBFT
 
-    `./CppBedrock`
+    Agents disabled `./CppBedrock`
+
+    Agents enabled `./CppBedrock --agent`
 
 - Run clients in another terminal
 

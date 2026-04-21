@@ -157,12 +157,12 @@ Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, b
             else if (proto == "LinearPBFT")   selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.linearpbft.yaml";
             else if (proto == "Hotstuff")     selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.hotstuff.yaml";
             else if (proto == "Hotstuff2")    selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.hotstuff2.yaml";
-            else if (proto == "SBFT")         selectedConfig = "/Users/prajwal/Projects//CppBedrock/config/config.sbft.yaml";
+            else if (proto == "SBFT")         selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.sbft.yaml";
             else if (proto == "Zyzzyva")      selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.zyzzyva.yaml";
             else if (proto == "ChainedHotstuff") selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.chained_hotstuff.yaml";
         }
     } catch (...) {}
-    selectedConfig = "/Users/prajwal/Projects/CppBedrock/config/config.sbft.yaml";
+    selectedConfig = "../config/config.sbft.yaml";
     loadProtocolConfig(selectedConfig);
     std::cout << "[Node " << nodeId << "] Loaded protocol config: " << selectedConfig << "\n";
     timeKeeper = std::make_unique<TimeKeeper>(viewChangeTimeoutMs, [this] {
@@ -181,7 +181,7 @@ Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, b
         if (event) event->execute(this, nullptr, nullptr);
     }
     
-    loadDelaysFromConfig("/Users/eswar/Downloads/CppBedrock/config/config.entities.yaml");
+    // loadDelaysFromConfig("/Users/eswar/Downloads/CppBedrock/config/config.entities.yaml");
     
 }
 

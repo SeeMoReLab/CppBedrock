@@ -1,7 +1,6 @@
 #!/bin/bash
-# filepath: /Users/eswar/Downloads/CppBedrock/keys/gen_server_keys.sh
 
-NUM_SERVERS=${1:-100}  # Default to 31 servers if not specified
+NUM_SERVERS=${1:-100}  # Default to 100 servers if not specified
 
 for i in $(seq 1 $NUM_SERVERS); do
     echo "Generating keys for server $i..."

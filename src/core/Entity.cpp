@@ -150,16 +150,16 @@ Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, b
     // Load selected protocol from runtime.selection.yaml; fallback to Zyzzyva
     std::string selectedConfig = "../config/config.sbft.yaml";
     try {
-        YAML::Node runtime = YAML::LoadFile("/Users/eswar/Downloads/CppBedrock/config/runtime.selection.yaml");
+        YAML::Node runtime = YAML::LoadFile("../config/runtime.selection.yaml");
         if (runtime && runtime["protocol"]) {
             const std::string proto = runtime["protocol"].as<std::string>();
-            if (proto == "PBFT")              selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.pbft.yaml";
-            else if (proto == "LinearPBFT")   selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.linearpbft.yaml";
-            else if (proto == "Hotstuff")     selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.hotstuff.yaml";
-            else if (proto == "Hotstuff2")    selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.hotstuff2.yaml";
-            else if (proto == "SBFT")         selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.sbft.yaml";
-            else if (proto == "Zyzzyva")      selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.zyzzyva.yaml";
-            else if (proto == "ChainedHotstuff") selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.chained_hotstuff.yaml";
+            if (proto == "PBFT")              selectedConfig = "../config/config.pbft.yaml";
+            else if (proto == "LinearPBFT")   selectedConfig = "../config/config.linearpbft.yaml";
+            else if (proto == "Hotstuff")     selectedConfig = "../config/config.hotstuff.yaml";
+            else if (proto == "Hotstuff2")    selectedConfig = "../config/config.hotstuff2.yaml";
+            else if (proto == "SBFT")         selectedConfig = "../config/config.sbft.yaml";
+            else if (proto == "Zyzzyva")      selectedConfig = "../config/config.zyzzyva.yaml";
+            else if (proto == "ChainedHotstuff") selectedConfig = "../config/config.chained_hotstuff.yaml";
         }
     } catch (...) {}
     selectedConfig = "../config/config.sbft.yaml";

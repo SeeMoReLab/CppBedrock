@@ -16,6 +16,9 @@
 #include <set>
 #include <unordered_map>
 #include <arpa/inet.h>
+#include <fstream>
+#include <filesystem>
+#include <iomanip>
 #include "utils/Benchmark.h" // NEW
 
 // gRPC
@@ -125,7 +128,11 @@ int main(int argc, char* argv[]) {
     std::queue<Transaction> txnQueue;
     std::map<std::string, int> txnResponses;
     std::set<std::string> completedTxns;
+    std::map<std::string, long long> txnStartMs;
     std::mutex txnMutex;
+    std::mutex latencyMutex;
+    long long totalLatencySum = 0;
+    long long totalLatencyCount = 0;
 
     // Zyzzyva client-side tracking (NEW)
     std::unordered_map<std::string, std::set<int>> txnResponders; // txnId -> unique replica ids
@@ -227,9 +234,19 @@ int main(int argc, char* argv[]) {
                         if (seq != -1) txnSeq[op] = seq;
                         
                         if (txnResponses[op] >= requiredResponses) {
-                            completedTxns.insert(op);
+                            if (completedTxns.insert(op).second) {
+                                auto startIt = txnStartMs.find(op);
+                                if (startIt != txnStartMs.end()) {
+                                    auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::system_clock::now().time_since_epoch()).count();
+                                    long long lat = nowMs - startIt->second;
+                                    std::lock_guard<std::mutex> latLk(latencyMutex);
+                                    totalLatencySum += lat;
+                                    totalLatencyCount++;
+                                }
+                            }
                         }
-                        
+
                         if (scenario == 4) scenario4Bench.end(op); // NEW
                     }
                 } catch (...) {}
@@ -429,6 +446,42 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "[Scenario 4] num_requests=" << NUM_REQUESTS
                   << " max_clients=" << s4MaxClients << "\n";
+
+        std::filesystem::create_directories("logs");
+        auto logTs = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        std::ofstream metricsFile("logs/client_metrics_" + std::to_string(logTs) + ".csv");
+        metricsFile << "elapsed_sec,completed_total,throughput_tps,avg_latency_ms\n";
+
+        std::atomic<bool> metricsRunning{true};
+        size_t prevCompleted = 0;
+        std::thread metricsThread([&]() {
+            int elapsed = 0;
+            while (metricsRunning) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                elapsed++;
+
+                size_t curCompleted;
+                {
+                    std::lock_guard<std::mutex> lk(txnMutex);
+                    curCompleted = completedTxns.size();
+                }
+                size_t tps = curCompleted - prevCompleted;
+                prevCompleted = curCompleted;
+
+                double avg = 0;
+                {
+                    std::lock_guard<std::mutex> lk(latencyMutex);
+                    if (totalLatencyCount > 0)
+                        avg = static_cast<double>(totalLatencySum) / totalLatencyCount;
+                }
+
+                metricsFile << elapsed << "," << curCompleted << "," << tps << ","
+                            << std::fixed << std::setprecision(2) << avg << "\n";
+                metricsFile.flush();
+            }
+        });
+
         std::vector<std::thread> clientThreads;
         const int maxConcurrent = s4MaxClients;
         std::mutex gateMtx;
@@ -450,6 +503,10 @@ int main(int argc, char* argv[]) {
                 auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
                 std::string timestamp = std::to_string(ms) + "_" + std::to_string(txnIdx);
                 scenario4Bench.start(timestamp);
+                {
+                    std::lock_guard<std::mutex> lk(txnMutex);
+                    txnStartMs[timestamp] = ms;
+                }
                 std::string clientId = "client";
                 json j = {
                     {"type", "Request"},
@@ -509,6 +566,11 @@ int main(int argc, char* argv[]) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
             }
         }
+
+        metricsRunning = false;
+        metricsThread.join();
+        metricsFile.close();
+        std::cout << "[Scenario 4] Client metrics written to logs/client_metrics_" << logTs << ".csv\n";
     }
     else if (scenario == 5) {
         // Example: A->B, B->C, C->D, D->A

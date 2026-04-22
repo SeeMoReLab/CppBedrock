@@ -5,6 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY="$SCRIPT_DIR/build/CppBedrock"
 CONFIG="$SCRIPT_DIR/config/config.entities.yaml"
 
+AGENT_FLAG=""
+for arg in "$@"; do
+    if [[ "$arg" == "--agent" ]]; then
+        AGENT_FLAG="--agent"
+    fi
+done
+
 if [[ ! -f "$BINARY" ]]; then
     echo "Binary not found at $BINARY — build first with: cmake --build build"
     exit 1
@@ -23,6 +30,6 @@ echo "Starting ${#IDS[@]} nodes: ${IDS[*]}"
 for id in "${IDS[@]}"; do
     osascript \
         -e 'tell application "Terminal"' \
-        -e "  do script \"cd '$SCRIPT_DIR/build' && ./CppBedrock --node-id $id\"" \
+        -e "  do script \"cd '$SCRIPT_DIR/build' && ./CppBedrock --node-id $id $AGENT_FLAG\"" \
         -e 'end tell'
 done

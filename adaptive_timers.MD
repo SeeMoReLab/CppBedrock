@@ -4,6 +4,7 @@
 
     - Edit `config/config.entities.yaml` to change server count
     - Edit `config/config.sbft.yaml` for epoch size, agent ports and default timers
+    - Edit `config/config.sbft.byzantine.yaml` for fault scheduling
 
 - Generate server keys
 
@@ -34,16 +35,12 @@
 
 - Run Bedrock SBFT
 
-    Agents disabled `./CppBedrock`
+    Agents disabled `./start_nodes.sh`
 
-    Agents enabled `./CppBedrock --agent`
+    Agents enabled `./start_nodes.sh --agent`
 
 - Run clients in another terminal
 
     `cd build`
 
     `./integration_test 4 [total_tx_count] [num_clients]
-
-# Fault schedule
-
-Edit `config/config.sbft.byzantine.yaml`

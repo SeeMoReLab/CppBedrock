@@ -427,6 +427,12 @@ void Entity::stop() {
     }
     running = false;
 
+    // Stop batch timer before tearing down gRPC so a late fire can't call sendProtocolToAll
+    if (batchTimer) {
+        batchTimer->stop();
+        batchTimer.reset();
+    }
+
     // connection.stopListening();  // removed to avoid TCP use
 
     stopGrpcServer();
@@ -452,6 +458,16 @@ void Entity::loadProtocolConfig(const std::string& configFile) {
         if (protocolConfig["metrics"]) {
             const YAML::Node& metrics = protocolConfig["metrics"];
             if (metrics["window_size"]) windowSize = metrics["window_size"].as<int>();
+        }
+        if (protocolConfig["batching"]) {
+            const YAML::Node& batching = protocolConfig["batching"];
+            if (batching["batch_size"])    batchSize    = batching["batch_size"].as<int>();
+            if (batching["batch_timer_ms"]) batchTimerMs = batching["batch_timer_ms"].as<int>();
+        }
+        std::cout << "[Node " << nodeId << "] Batching: size=" << batchSize << " timerMs=" << batchTimerMs << "\n";
+        if (batchTimerMs > 0) {
+            batchTimer = std::make_unique<TimeKeeper>(batchTimerMs, [this] { flushBatch(); });
+            batchTimer->start();
         }
         if (protocolConfig["agents"] && protocolConfig["agents"][nodeId]) {
             agentPort = protocolConfig["agents"][nodeId].as<int>();
@@ -846,14 +862,20 @@ void Entity::markOperationProcessed(int seq) {
 
             // Compute end-to-end latency from client-embedded timestamp (format: "ms_idx")
             // reuse opStr already read above
+            int batchCount = 1;
+            if (commitBatchSizes.count(seq)) {
+                batchCount = commitBatchSizes.at(seq);
+                commitBatchSizes.erase(seq);
+            }
             if (!opStr.empty()) {
                 auto sep = opStr.find('_');
                 if (sep != std::string::npos) {
                     long long clientMs = std::stoll(opStr.substr(0, sep));
                     long long latUs = nowUs - clientMs * 1000LL;
                     if (latUs > 0) {
-                        nodeBench.record(latUs);
-                        ++windowTxCount; // only count txns with valid latency
+                        for (int i = 0; i < batchCount; ++i)
+                            nodeBench.record(latUs);
+                        windowTxCount += batchCount;
                     }
                 }
             }
@@ -1193,6 +1215,97 @@ void Entity::initiateViewChange() {
         std::cout << "[Node " << getNodeId() << "] Broadcasted ViewChange(view=" << newView
                   << ", committed_seq=" << committedSeq << ").\n";
     }
+}
+
+// Called from timer thread — acquires eventMtx before touching shared state.
+void Entity::flushBatch() {
+    std::lock_guard<std::mutex> evLk(eventMtx);
+    flushBatchLocked();
+}
+
+// Called from event handlers that already hold eventMtx.
+void Entity::flushBatchLocked() {
+    if (inViewChange) {
+        std::lock_guard<std::mutex> lk(batchMtx);
+        pendingBatch.clear();
+        return;
+    }
+    std::vector<nlohmann::json> batch;
+    {
+        std::lock_guard<std::mutex> lk(batchMtx);
+        if (pendingBatch.empty()) return;
+        batch.swap(pendingBatch);
+    }
+
+    int seq = allocateNextSequence();
+    int currentView = entityInfo["view"].get<int>();
+
+    if (!sequenceStates.count(seq)) {
+        sequenceStates.emplace(seq,
+            EntityState(getState().getRole(), "Request", currentView, seq));
+    }
+
+    bedrock::ProtocolEnvelope env;
+    auto* m = env.mutable_pre_prepare();
+    m->set_view(currentView);
+    m->set_sequence(seq);
+    m->set_message_sender_id(getNodeId());
+    m->set_type("PrePrepare");
+
+    const auto& first = batch[0];
+    m->set_timestamp(first.value("timestamp", ""));
+    m->set_operation(first.value("operation", ""));
+    m->set_client_listen_port(first.value("client_listen_port", -1));
+    m->set_client_id(first.value("message_sender_id", ""));
+    auto* tx = m->mutable_transaction();
+    tx->set_from(first["transaction"].value("from", ""));
+    tx->set_to(first["transaction"].value("to", ""));
+    tx->set_amount(first["transaction"].value("amount", 0));
+
+    std::string digest_input;
+    for (const auto& item : batch)
+        digest_input += item["transaction"].dump() + item.value("timestamp", "");
+    m->set_signature(cryptoProvider->sign(digest_input));
+
+    Entity::PrePrepareInfo info;
+    info.operation   = m->operation();
+    info.client_port = m->client_listen_port();
+    info.timestamp   = m->timestamp();
+    info.from        = tx->from();
+    info.to          = tx->to();
+    info.amount      = tx->amount();
+
+    for (const auto& item : batch) {
+        auto* br = m->add_batch_requests();
+        br->set_timestamp(item.value("timestamp", ""));
+        br->set_client_listen_port(item.value("client_listen_port", -1));
+        const auto& jtx = item["transaction"];
+        auto* br_tx = br->mutable_transaction();
+        br_tx->set_from(jtx.value("from", ""));
+        br_tx->set_to(jtx.value("to", ""));
+        br_tx->set_amount(jtx.value("amount", 0));
+
+        Entity::BatchItem bi;
+        bi.timestamp   = item.value("timestamp", "");
+        bi.from        = jtx.value("from", "");
+        bi.to          = jtx.value("to", "");
+        bi.amount      = jtx.value("amount", 0);
+        bi.client_port = item.value("client_listen_port", -1);
+        info.batch.push_back(std::move(bi));
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(prePrepareMtx);
+        prePrepareIndex[seq] = std::move(info);
+    }
+
+    ProtoMessage pmsg(env);
+    auto storeEv = EventFactory::getInstance().createEvent("storeMessage");
+    if (storeEv) storeEv->execute(this, &pmsg, &_entityState);
+
+    std::cout << "[Node " << getNodeId() << "] Flushing batch of "
+              << batch.size() << " requests, seq=" << seq << "\n";
+    sendProtocolToAll(env);
 }
 
 int Entity::allocateNextSequence() {

@@ -58,16 +58,7 @@ void TimeKeeper::run() {
 
         if (running && cbCopy) {
             lock.unlock();
-
-            // Offload callback to a detached thread
-            std::thread([cbCopy]() {
-                try {
-                    cbCopy();
-                } catch (const std::exception&) {
-                    // Optionally log error
-                }
-            }).detach();
-
+            try { cbCopy(); } catch (...) {}
             lock.lock();
             if (!running) break;
         }

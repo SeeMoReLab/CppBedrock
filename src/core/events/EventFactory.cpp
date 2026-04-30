@@ -112,6 +112,19 @@ public:
                 info.from   = p->tx_from();
                 info.to     = p->tx_to();
                 info.amount = p->tx_amount();
+                if (p->hasBatchRequests()) {
+                    for (const auto& br : p->batchRequests()) {
+                        Entity::BatchItem bi;
+                        bi.timestamp   = br.timestamp();
+                        bi.client_port = br.client_listen_port();
+                        if (br.has_transaction()) {
+                            bi.from   = br.transaction().from();
+                            bi.to     = br.transaction().to();
+                            bi.amount = br.transaction().amount();
+                        }
+                        info.batch.push_back(std::move(bi));
+                    }
+                }
                 {
                     std::lock_guard<std::mutex> lk(entity->prePrepareMtx);
                     entity->prePrepareIndex[seq] = std::move(info);
@@ -786,6 +799,7 @@ public:
                     info.from   = stored.from;
                     info.to     = stored.to;
                     info.amount = stored.amount;
+                    info.batch  = stored.batch;
                     entity->prePrepareIndex.erase(it);
                 }
             }
@@ -797,33 +811,51 @@ public:
             //           << ", To: " << info.to
             //           << ", Amount: " << info.amount
             //           << std::endl;
-            const std::string& txnId = info.timestamp;
-
-            if (!txnId.empty() && entity->executedTransactions.count(txnId) == 0) {
-                if (!info.from.empty() && !info.to.empty() && info.amount > 0) {
-                    entity->updateBalances(info.from, info.to, info.amount);
-                    entity->executedTransactions.insert(txnId);
-                    // std::cout << "[Node " << entity->getNodeId() << "] Transaction executed: "
-                    //           << info.from << " -> " << info.to << " : " << info.amount
-                    //           << " Sequence: " << seq << std::endl << std::endl;
-                }
-            }
-
             entity->commitOperations[seq] = info.operation;
+            entity->commitBatchSizes[seq] = info.batch.empty() ? 1 : (int)info.batch.size();
             entity->markOperationProcessed(seq);
 
-            // Reply once to client
-            if (info.client_port > 0) {
-                // std::cout << "[Node " << entity->getNodeId() << "] Sending response to client on port " << info.client_port << " for sequence " << seq << std::endl;
-                nlohmann::json response{
-                    {"type","Response"},
-                    {"view", entity->getState().getViewNumber()},
-                    {"timestamp", info.timestamp},
-                    {"message_sender_id", entity->getNodeId()},
-                    {"result","success"}
-                };
-                Message reply(response.dump());
-                entity->sendTo(info.client_port, reply);
+            if (!info.batch.empty()) {
+                // Batch case: execute every item and reply to every client
+                for (const auto& bi : info.batch) {
+                    if (!bi.timestamp.empty() && entity->executedTransactions.count(bi.timestamp) == 0) {
+                        if (!bi.from.empty() && !bi.to.empty() && bi.amount > 0) {
+                            entity->updateBalances(bi.from, bi.to, bi.amount);
+                            entity->executedTransactions.insert(bi.timestamp);
+                        }
+                    }
+                    if (bi.client_port > 0) {
+                        nlohmann::json response{
+                            {"type","Response"},
+                            {"view", entity->getState().getViewNumber()},
+                            {"timestamp", bi.timestamp},
+                            {"message_sender_id", entity->getNodeId()},
+                            {"result","success"}
+                        };
+                        Message reply(response.dump());
+                        entity->sendTo(bi.client_port, reply);
+                    }
+                }
+            } else {
+                // Single-request case: existing behavior
+                const std::string& txnId = info.timestamp;
+                if (!txnId.empty() && entity->executedTransactions.count(txnId) == 0) {
+                    if (!info.from.empty() && !info.to.empty() && info.amount > 0) {
+                        entity->updateBalances(info.from, info.to, info.amount);
+                        entity->executedTransactions.insert(txnId);
+                    }
+                }
+                if (info.client_port > 0) {
+                    nlohmann::json response{
+                        {"type","Response"},
+                        {"view", entity->getState().getViewNumber()},
+                        {"timestamp", info.timestamp},
+                        {"message_sender_id", entity->getNodeId()},
+                        {"result","success"}
+                    };
+                    Message reply(response.dump());
+                    entity->sendTo(info.client_port, reply);
+                }
             }
 
             return true;
@@ -1360,6 +1392,19 @@ public:
                 entity->timeKeeper.reset();
             }
         }
+
+        // Discard stale pending requests and stop the batch timer.
+        // Requests queued before the view change belong to the old term; the new
+        // leader (possibly a different node) will repropose them from its own queue.
+        if (entity->batchTimer) {
+            entity->batchTimer->stop();
+            entity->batchTimer.reset();
+        }
+        {
+            std::lock_guard<std::mutex> lk(entity->batchMtx);
+            entity->pendingBatch.clear();
+        }
+
         return true;
     }
 };
@@ -1539,75 +1584,28 @@ public:
                 std::this_thread::sleep_for(std::chrono::milliseconds(byzState.proposalDelayMs));
             }
         }
-        if (!operation.empty() && !entity->hasProcessedOperation(std::stoi(operation.substr(9)))) {
+        // Dedup: drop requests for already-committed operations
+        const std::string op = j.value("operation", "");
+        if (!op.empty() && op.size() > 9) {
+            try {
+                if (entity->hasProcessedOperation(std::stoi(op.substr(9)))) return true;
+            } catch (...) {}
+        }
 
-            int seq = entity->allocateNextSequence(); // NEW
+        // Add request to the pending batch, flush when size threshold is hit.
+        {
+            std::lock_guard<std::mutex> bLk(entity->batchMtx);
+            entity->pendingBatch.push_back(j);
 
-            // Create sequence state if absent
-            if (!entity->sequenceStates.count(seq)) {
-                entity->sequenceStates.emplace(
-                    seq,
-                    EntityState(entity->getState().getRole(),
-                                currentPhase,
-                                entity->entityInfo["view"],
-                                seq));
+            if ((int)entity->pendingBatch.size() < entity->batchSize) {
+                return true; // waiting for more requests or timer
             }
-
-            std::string stringforDigest = j["transaction"].dump() + j["timestamp"].get<std::string>();
-            std::string digest = computeSHA256(stringforDigest);
-            
-            // Create PrePrepare message
-            nlohmann::json preprepareMsg;
-            preprepareMsg["type"] = entity->getPhaseConfig(currentPhase)["next_state"].as<std::string>();
-            preprepareMsg["view"] = entity->entityInfo["view"];
-            preprepareMsg["sequence"] = seq;
-            preprepareMsg["digest"] = digest;
-            preprepareMsg["signature"] = entity->cryptoProvider->sign(stringforDigest);
-            preprepareMsg["clientid"] = j.value("message_sender_id", "");
-            preprepareMsg["transaction"] = j.value("transaction", nlohmann::json{});
-            preprepareMsg["timestamp"] = j.value("timestamp", "");
-            preprepareMsg["operation"] = operation;
-            preprepareMsg["message_sender_id"] = entity->getNodeId();
-            preprepareMsg["client_listen_port"] = j["client_listen_port"].get<int>();
-
-            // Create typed PrePrepare and broadcast via protobuf
-            bedrock::ProtocolEnvelope env;
-            auto* m = env.mutable_pre_prepare();
-            m->set_view(entity->entityInfo["view"].get<int>());
-            m->set_sequence(seq);
-            m->set_timestamp(j.value("timestamp",""));
-            m->set_operation(operation);
-            auto* tx = m->mutable_transaction();
-            tx->set_from(j["transaction"].value("from",""));
-            tx->set_to(j["transaction"].value("to",""));
-            tx->set_amount(j["transaction"].value("amount",0));
-            m->set_client_listen_port(j["client_listen_port"].get<int>());
-            m->set_signature(entity->cryptoProvider->sign(j["transaction"].dump() + j["timestamp"].get<std::string>()));
-            m->set_message_sender_id(entity->getNodeId());
-            m->set_client_id(j.value("message_sender_id", std::string("client")));
-            // NEW: include type like JSON path (next_state)
-            m->set_type(entity->getPhaseConfig(currentPhase)["next_state"].as<std::string>());
-
-            // Persist locally via StoreMessageEvent (typed path will store from ProtoMessage)
-            ProtoMessage pmsg(env);
-            auto storeEv = EventFactory::getInstance().createEvent("storeMessage");
-            if (storeEv) storeEv->execute(entity, &pmsg, state);
-
-            // Broadcast typed
-            std::cout << "[Node " << entity->getNodeId() << "] Broadcasting PrePrepare for seq " << seq << " operation " << operation << "\n";
-            entity->sendProtocolToAll(env);
-            // std::cout << "[Node " << entity->getNodeId() << "] Leader broadcasted " << preprepareMsg["type"] << " for seq " << seq << " operation " << operation << "\n\n";
-            return true;
+            // Size threshold reached,fall through to flush (lock released below).
         }
-        else{
-            // std::cout << "[Node " << entity->getNodeId() << "] Operation already processed or empty, skipping broadcast.\n";
-            //print processed operations
-            //std::cout << "[Node " << entity->getNodeId() << "] Processed operations: ";
-            // for (const auto& op : entity->processedOperations) {
-            //     std::cout << op << " ";
-            // }
-            // std::cout << "\n";
-        }
+        // eventMtx is already held by processJsonFromGrpc, use the locked variant.
+        entity->flushBatchLocked();
+        // Restart the timer.
+        if (entity->batchTimer) entity->batchTimer->reset();
         return true;
     }
 };

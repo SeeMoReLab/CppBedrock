@@ -48,6 +48,7 @@ message PrePrepare {
   repeated AggregatedMessage combined_messages = 10;
   string qc = 11;
   string type = 12; // NEW: mirrors JSON "type" (e.g., "PrePrepare")
+  repeated AggregatedMessage batch_requests = 13; // batched client requests
 }
 
 message Prepare {

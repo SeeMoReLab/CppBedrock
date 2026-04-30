@@ -120,6 +120,13 @@ public:
         return "";
     }
 
+    bool hasBatchRequests() const {
+        return envelope_.has_pre_prepare() && envelope_.pre_prepare().batch_requests_size() > 0;
+    }
+    const ::google::protobuf::RepeatedPtrField<bedrock::AggregatedMessage>& batchRequests() const {
+        return envelope_.pre_prepare().batch_requests();
+    }
+
     const bedrock::ProtocolEnvelope& envelope() const { return envelope_; }
 
     bool execute(Entity*, const Message*, EntityState*) override { return true; }

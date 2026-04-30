@@ -1,4 +1,7 @@
 protocol: PBFT
+batching:
+  batch_size: 10
+  batch_timer_ms: 50
 phases:
   Request:
     quorum: 1

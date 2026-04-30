@@ -222,6 +222,7 @@ public:
     std::unordered_map<int, std::string> prePrepareOperations;
     std::unordered_map<int, std::string> prepareOperations;
     std::unordered_map<int, std::string> commitOperations;
+    std::unordered_map<int, int> commitBatchSizes; // seq -> number of txns in batch
     std::unordered_map<int, std::vector<nlohmann::json>> viewChangeMessages;
     std::unordered_map<int, nlohmann::json> latestPreparePerSeq;
     std::mutex latestPrepareMtx;
@@ -245,6 +246,13 @@ public:
     YAML::Node protocolConfig;
     int viewChangeTimeoutMs{8000};
     int fastPathWaitMs{20};
+    int batchSize{1};
+    int batchTimerMs{0};
+    std::vector<nlohmann::json> pendingBatch;
+    std::mutex batchMtx;
+    std::unique_ptr<TimeKeeper> batchTimer;
+    void flushBatch();       // acquires eventMtx — called from timer thread
+    void flushBatchLocked(); // assumes eventMtx already held — called from event handlers
     void onTimeout();
     void sendNewViewToNextLeader();
 
@@ -299,6 +307,14 @@ public:
     void loadDelaysFromConfig(const std::string& configFile);
     void setAgentEnabled(bool enabled) { agentEnabled_ = enabled; }
 
+    struct BatchItem {
+        std::string timestamp;
+        std::string from;
+        std::string to;
+        int amount{0};
+        int client_port{-1};
+    };
+
     struct PrePrepareInfo {
         std::string timestamp;
         std::string operation;
@@ -306,6 +322,7 @@ public:
         std::string to;
         int amount{0};
         int client_port{-1};
+        std::vector<BatchItem> batch; // empty = single request
     };
 
     // Fast lookup for CompleteEvent; does not change existing dataset behavior

@@ -1,6 +1,9 @@
 protocol: SBFT
 metrics:
   window_size: 100
+batching:
+  batch_size: 10
+  batch_timer_ms: 50
 timers:
   view_change_ms: 8000
   fast_path_wait_ms: 20

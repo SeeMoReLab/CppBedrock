@@ -340,6 +340,11 @@ public:
     struct ByzantineScheduleEntry {
         int atSeconds{0};
         std::unordered_map<int, ByzantineNodeState> nodes; // nodeId -> state
+
+        // XML spec.
+        // Applied to leader + next f-1 replicas at phase-activation time (frozen).
+        bool hasLeaderEntry{false};
+        ByzantineNodeState leaderEntryState;
     };
     std::vector<ByzantineScheduleEntry> byzantineSchedule; // sorted ascending by atSeconds
     std::chrono::steady_clock::time_point byzantineStartTime;
@@ -351,7 +356,17 @@ public:
     mutable size_t nextByzScheduleIdx{0};
     mutable ByzantineNodeState activeByzantineState;
 
+    // XML failure-spec path (replaces YAML when loaded via loadFailureSpec()).
+    bool xmlScheduleLoaded{false};
+    long long xmlStartTimestamp{0};  // unix time_t of experiment start
+    int xmlWarmUpSeconds{0};
+    mutable bool warmupLoggedStart{false};
+    mutable bool warmupLoggedEnd{false};
+    // Frozen leader+f-1 node-ID sets per schedule entry index (populated lazily, under byzantineMtx)
+    mutable std::unordered_map<size_t, std::unordered_set<int>> xmlResolvedLeaderSets;
+
     void loadByzantineSchedule(const std::string& configFile);
+    void loadFailureSpec(const std::string& xmlFile, long long startTimestamp);
     ByzantineNodeState getActiveByzantineState() const;
 
     // Windowed metrics (also protected by processedMtx)

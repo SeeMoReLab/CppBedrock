@@ -1,8 +1,17 @@
-cmake_minimum_required(VERSION 3.14) 
+cmake_minimum_required(VERSION 3.14)
 project(CppBedrock VERSION 1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+include(FetchContent)
+FetchContent_Declare(
+    pugixml
+    GIT_REPOSITORY https://github.com/zeux/pugixml.git
+    GIT_TAG        v1.14
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(pugixml)
 
 # Manually specify the include path for yaml-cpp
 include_directories("/opt/homebrew/Cellar/yaml-cpp/0.9.0/include")
@@ -127,6 +136,7 @@ target_link_libraries(CppBedrockLib PUBLIC
   OpenSSL::Crypto OpenSSL::SSL
   yaml-cpp nlohmann_json::nlohmann_json
   bedrock_proto agent_proto gRPC::grpc++ protobuf::libprotobuf
+  pugixml
 )
 target_include_directories(CppBedrockLib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 

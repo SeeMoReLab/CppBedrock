@@ -1,4 +1,5 @@
 #include "../../include/core/Entity.h"
+#include <pugixml.hpp>
 // RE-ENABLE TcpConnection for client replies
 #include "../../include/coordination/connections/TcpConnection.h"
 #include "../../include/core/events/EventFactory.h"
@@ -1483,34 +1484,173 @@ void Entity::loadByzantineSchedule(const std::string& configFile) {
     }
 }
 
+void Entity::loadFailureSpec(const std::string& xmlFile, long long startTimestamp) {
+    try {
+        pugi::xml_document doc;
+        pugi::xml_parse_result result = doc.load_file(xmlFile.c_str());
+        if (!result) {
+            std::cerr << "[Node " << getNodeId() << "] Failed to parse failure spec: "
+                      << result.description() << "\n";
+            return;
+        }
+        pugi::xml_node root = doc.child("failureSpec");
+        if (!root) {
+            std::cerr << "[Node " << getNodeId() << "] <failureSpec> root not found in " << xmlFile << "\n";
+            return;
+        }
+
+        int warmUp = 0;
+        if (root.child("warmUpTime"))
+            warmUp = root.child("warmUpTime").text().as_int();
+
+        std::vector<ByzantineScheduleEntry> entries;
+
+        for (pugi::xml_node phase : root.child("phases").children("phase")) {
+            ByzantineScheduleEntry e;
+            e.atSeconds = phase.child("atTime").text().as_int();
+
+            pugi::xml_node sbft = phase.child("sbft");
+            if (sbft) {
+                // Helper to parse a replica element's <id>: returns -1 for "leader", else the int id.
+                auto parseReplicaId = [](pugi::xml_node replica) -> int {
+                    std::string idStr = replica.child("id").text().as_string();
+                    return (idStr == "leader") ? -1 : std::stoi(idStr);
+                };
+
+                // <proposalDelay>
+                for (pugi::xml_node replica : sbft.child("proposalDelay").child("replicas").children("replica")) {
+                    int id = parseReplicaId(replica);
+                    int delayMs = replica.child("delayMs").text().as_int();
+                    if (id == -1) {
+                        e.hasLeaderEntry = true;
+                        e.leaderEntryState.proposalDelayMs = delayMs;
+                    } else {
+                        e.nodes[id].proposalDelayMs = delayMs;
+                    }
+                }
+
+                // <skipFastPath>
+                for (pugi::xml_node replica : sbft.child("skipFastPath").child("replicas").children("replica")) {
+                    int id = parseReplicaId(replica);
+                    if (id == -1) {
+                        e.hasLeaderEntry = true;
+                        e.leaderEntryState.skipFastPath = true;
+                    } else {
+                        e.nodes[id].skipFastPath = true;
+                    }
+                }
+
+                // <delayFastPath>
+                for (pugi::xml_node replica : sbft.child("delayFastPath").child("replicas").children("replica")) {
+                    int id = parseReplicaId(replica);
+                    int delayMs = replica.child("delayMs").text().as_int();
+                    if (id == -1) {
+                        e.hasLeaderEntry = true;
+                        e.leaderEntryState.fastPathExtraDelayMs = delayMs;
+                    } else {
+                        e.nodes[id].fastPathExtraDelayMs = delayMs;
+                    }
+                }
+            }
+
+            entries.push_back(std::move(e));
+        }
+
+        std::sort(entries.begin(), entries.end(),
+                  [](const auto& a, const auto& b) { return a.atSeconds < b.atSeconds; });
+
+        {
+            std::lock_guard<std::mutex> lk(byzantineMtx);
+            byzantineSchedule = std::move(entries);
+            xmlWarmUpSeconds = warmUp;
+            xmlStartTimestamp = startTimestamp;
+            xmlScheduleLoaded = true;
+            nextByzScheduleIdx = 0;
+            activeByzantineState = {};
+            xmlResolvedLeaderSets.clear();
+        }
+
+        std::cout << "[Node " << getNodeId() << "] Loaded failure spec ("
+                  << byzantineSchedule.size() << " phases, warmUp=" << warmUp
+                  << "s) from " << xmlFile << "\n";
+        std::cout << "[Node " << getNodeId() << "] Warmup started, duration=" << warmUp << "s\n";
+        warmupLoggedStart = true;
+    } catch (const std::exception& ex) {
+        std::cerr << "[Node " << getNodeId() << "] failure spec load error: " << ex.what() << "\n";
+    }
+}
+
 Entity::ByzantineNodeState Entity::getActiveByzantineState() const {
     if (byzantineSchedule.empty()) return {};
+
+    // Compute elapsed seconds.
+    int elapsed = 0;
+    if (xmlScheduleLoaded) {
+        elapsed = static_cast<int>((long long)std::time(nullptr) - xmlStartTimestamp);
+        if (elapsed < xmlWarmUpSeconds) {
+            if (!warmupLoggedStart) {
+                warmupLoggedStart = true;
+                std::cout << "[Node " << nodeId << "] Warmup started, duration=" << xmlWarmUpSeconds << "s\n";
+            }
+            return {};
+        }
+        if (!warmupLoggedEnd) {
+            warmupLoggedEnd = true;
+            std::cout << "[Node " << nodeId << "] Warmup complete, activating failure spec phases\n";
+        }
+    }
+
     ByzantineNodeState snapshot;
     bool stateChanged = false;
-    int elapsed = 0;
     {
         std::lock_guard<std::mutex> lk(byzantineMtx);
-        elapsed = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - byzantineStartTime).count());
-        // Advance through any newly-elapsed entries; O(1) amortised.
+        if (!xmlScheduleLoaded) {
+            elapsed = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - byzantineStartTime).count());
+        }
+        // For XML schedules, atTime is relative to end of warmup (atTime=0 == warmup complete).
+        int phaseElapsed = xmlScheduleLoaded ? (elapsed - xmlWarmUpSeconds) : elapsed;
+        // Advance through any newly-elapsed entries.
         while (nextByzScheduleIdx < byzantineSchedule.size() &&
-               byzantineSchedule[nextByzScheduleIdx].atSeconds <= elapsed) {
+               byzantineSchedule[nextByzScheduleIdx].atSeconds <= phaseElapsed) {
             const auto& entry = byzantineSchedule[nextByzScheduleIdx];
+
+            // Clear previous state.
+            activeByzantineState = {};
+            stateChanged = true;
+
             auto it = entry.nodes.find(nodeId);
-            if (it != entry.nodes.end()) {
+            if (it != entry.nodes.end())
                 activeByzantineState = it->second;
-                stateChanged = true;
+
+            // XML failure spec: "leader" placeholder: resolve once, then freeze for this phase.
+            if (xmlScheduleLoaded && entry.hasLeaderEntry) {
+                auto& resolvedSet = xmlResolvedLeaderSets[nextByzScheduleIdx];
+                if (resolvedSet.empty()) {
+                    int view = entityInfo["view"].get<int>();
+                    int n = static_cast<int>(peerPorts.size());
+                    if (n > 0) {
+                        // Leader + next f-1 replicas (f total) in peerPorts circular order.
+                        for (int k = 0; k < f; ++k)
+                            resolvedSet.insert(peerPorts[(view % n + k) % n]);
+                    }
+                }
+                if (resolvedSet.count(nodeId))
+                    activeByzantineState = entry.leaderEntryState;
             }
+
             ++nextByzScheduleIdx;
         }
         snapshot = activeByzantineState;
     } // lock released here
-    if (stateChanged)
-        std::cout << "[Node " << nodeId << "] Byzantine state updated at t+" << elapsed
+    if (stateChanged) {
+        int phaseElapsed = xmlScheduleLoaded ? (elapsed - xmlWarmUpSeconds) : elapsed;
+        std::cout << "[Node " << nodeId << "] Byzantine state updated at t+" << phaseElapsed
                   << "s: proposalDelay=" << snapshot.proposalDelayMs
                   << "ms skipFastPath=" << snapshot.skipFastPath
                   << " fastPathExtra=" << snapshot.fastPathExtraDelayMs << "ms\n";
+    }
     return snapshot;
 }
 

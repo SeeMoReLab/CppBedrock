@@ -7,6 +7,7 @@
 #include <csignal>
 #include <condition_variable>
 #include <mutex>
+#include <sys/stat.h>
 
 static std::condition_variable g_cv;
 static std::mutex g_mu;
@@ -15,10 +16,13 @@ static bool g_stop = false;
 int main(int argc, char** argv) {
     bool agentEnabled = false;
     int nodeId = -1;
+    long long startTimestamp = -1;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--agent") agentEnabled = true;
         if (std::string(argv[i]) == "--node-id" && i + 1 < argc)
             nodeId = std::stoi(argv[++i]);
+        if (std::string(argv[i]) == "--start-time" && i + 1 < argc)
+            startTimestamp = std::stoll(argv[++i]);
     }
 
     if (nodeId != -1) {
@@ -41,7 +45,16 @@ int main(int argc, char** argv) {
             return 1;
         }
         entity->setAgentEnabled(agentEnabled);
-        entity->loadByzantineSchedule("../config/config.sbft.byzantine.yaml");
+        {
+            const std::string specPath = "../config/failure_spec.xml";
+            struct stat st{};
+            if (stat(specPath.c_str(), &st) == 0) {
+                long long t = (startTimestamp >= 0) ? startTimestamp : (long long)std::time(nullptr);
+                entity->loadFailureSpec(specPath, t);
+            } else {
+                entity->loadByzantineSchedule("../config/config.sbft.byzantine.yaml");
+            }
+        }
         entity->start();
 
         signal(SIGINT, [](int) {

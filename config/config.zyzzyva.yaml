@@ -1,4 +1,14 @@
 protocol: Zyzzyva
+timers:
+  view_change_ms: 6000
+  fast_path_wait_ms: 50
+metrics:
+  window_size: 100
+agents:
+  1: 50100
+  2: 50101
+  3: 50102
+  4: 50103
 phases:
   Request: 
     quorum: 1

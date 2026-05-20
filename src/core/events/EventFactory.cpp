@@ -96,8 +96,8 @@ public:
                 if (entity->processedOperations.count(seq)) return true;
             }
 
-            // Index PrePrepare minimal info
-            if (phase == "PrePrepare") {
+            // Index PrePrepare minimal info (also covers Hotstuff's Prepare = first proposal phase)
+            if (phase == "PrePrepare" || phase == "Prepare") {
                 {
                     long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -214,8 +214,8 @@ public:
                 }
             }
 
-            // Lightweight PrePrepare indexing for JSON-origin PrePrepare
-            if (phase == "PrePrepare") {
+            // Lightweight PrePrepare indexing; also covers Hotstuff's Prepare = first proposal phase
+            if (phase == "PrePrepare" || phase == "Prepare") {
                 Entity::PrePrepareInfo info;
                 info.timestamp   = j.value("timestamp", std::string());
                 info.operation   = j.value("operation", std::string());
@@ -400,6 +400,8 @@ public:
                 for (auto& c : phaseLowerTmp) c = (char)std::tolower(c);
                 if (phaseLowerTmp == "prepare")
                     entity->phaseTs_prepare.emplace(seq, nowUs);
+                else if (phaseLowerTmp == "precommit")   // Hotstuff: maps to same bench as prepare
+                    entity->phaseTs_prepare.emplace(seq, nowUs);
                 else if (phaseLowerTmp == "commit")
                     entity->phaseTs_commit.emplace(seq, nowUs);
             }
@@ -563,6 +565,8 @@ public:
             std::string phaseLowerTmp = currentPhase;
             for (auto& c : phaseLowerTmp) c = (char)std::tolower(c);
             if (phaseLowerTmp == "prepare")
+                entity->phaseTs_prepare.emplace(seq, nowUs);
+            else if (phaseLowerTmp == "precommit")   // Hotstuff: maps to same bench as prepare
                 entity->phaseTs_prepare.emplace(seq, nowUs);
             else if (phaseLowerTmp == "commit")
                 entity->phaseTs_commit.emplace(seq, nowUs);

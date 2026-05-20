@@ -1,4 +1,13 @@
 protocol: Hotstuff
+timers:
+  view_change_ms: 8000
+metrics:
+  window_size: 100
+agents:
+  1: 50100
+  2: 50101
+  3: 50102
+  4: 50103
 phases:
   Request:
     quorum: 1
@@ -60,6 +69,12 @@ phases:
     next_state: Request
     actions:
       - "handleNewView"
+
+  NewViewforHotstuff:
+    quorum: 1
+    next_state: Request
+    actions:
+      - "storeNewViewMessage"
 
   QueryBalances:
     quorum: 1

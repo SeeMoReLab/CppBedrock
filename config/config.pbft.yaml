@@ -2,6 +2,15 @@ protocol: PBFT
 batching:
   batch_size: 10
   batch_timer_ms: 50
+timers:
+  view_change_ms: 8000
+metrics:
+  window_size: 100
+agents:
+  1: 50200
+  2: 50201
+  3: 50202
+  4: 50203
 phases:
   Request:
     quorum: 1

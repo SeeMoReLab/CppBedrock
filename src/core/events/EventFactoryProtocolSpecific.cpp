@@ -142,6 +142,22 @@ public:
             // Typed fast-path
             int seq = p->sequence();
             std::string txnId = p->timestamp();
+            // Record speculative-exec latency directly using client timestamp
+            {
+                long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                auto sep = txnId.find('_');
+                if (sep != std::string::npos) {
+                    try {
+                        long long clientMs = std::stoll(txnId.substr(0, sep));
+                        long long latUs = nowUs - clientMs * 1000LL;
+                        if (latUs > 0) entity->phaseBench_preprepare.record(latUs);
+                    } catch (...) {}
+                }
+            }
+            // Populate commitOperations so markOperationProcessed can compute end-to-end latency
+            if (!txnId.empty())
+                entity->commitOperations[seq] = txnId;
             if (!txnId.empty() && !entity->hasExecutedSpeculativeTransaction(txnId)) {
                 std::string from = p->has_tx() ? p->tx_from() : "";
                 std::string to   = p->has_tx() ? p->tx_to()   : "";
@@ -156,7 +172,6 @@ public:
                 }
             }
             entity->markOperationProcessed(seq);
-            // Reply to client (JSON wire) for now
             int clientPort = p->client_listen_port();
             if (clientPort > 0) {
                 nlohmann::json response{
@@ -165,10 +180,11 @@ public:
                     {"sequence", p->sequence()},
                     {"timestamp", p->timestamp()},
                     {"message_sender_id", entity->getNodeId()},
-                    {"result","speculative"}
+                    {"result","speculative"},
+                    {"client_listen_port", clientPort}
                 };
                 Message BalancesReply(response.dump());
-                entity->sendTo(clientPort - 5000, BalancesReply);
+                entity->sendTo(clientPort, BalancesReply);
             }
             return true;
         }
@@ -191,6 +207,19 @@ public:
 
         // Use timestamp as unique transaction ID
         std::string txnId = j.value("timestamp", "");
+        // Record speculative-exec latency directly using client timestamp
+        {
+            long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            auto sep = txnId.find('_');
+            if (sep != std::string::npos) {
+                try {
+                    long long clientMs = std::stoll(txnId.substr(0, sep));
+                    long long latUs = nowUs - clientMs * 1000LL;
+                    if (latUs > 0) entity->phaseBench_preprepare.record(latUs);
+                } catch (...) {}
+            }
+        }
         if (!txnId.empty() && !entity->hasExecutedSpeculativeTransaction(txnId)) {
             if (j.contains("transaction")) {
                 auto tx = j["transaction"];
@@ -222,9 +251,10 @@ public:
             response["message_sender_id"] = entity->getNodeId();
             response["result"] = "speculative";
             response["clientid"] = j.value("clientid", "");
+            response["client_listen_port"] = clientPort;
             Message BalancesReply(response.dump());
             if (clientPort != -1) {
-                entity->sendTo(clientPort - 5000, BalancesReply);
+                entity->sendTo(clientPort, BalancesReply);
             }
         }
         return true;
@@ -245,6 +275,19 @@ public:
             if (s < 0) {
                 std::cout << "[Node " << entity->getNodeId() << "] CommitCertificateEvent(proto): missing sequence, ignoring\n";
                 return false;
+            }
+            // Record commit-cert latency directly using client timestamp
+            {
+                long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                auto sep = txnId.find('_');
+                if (sep != std::string::npos) {
+                    try {
+                        long long clientMs = std::stoll(txnId.substr(0, sep));
+                        long long latUs = nowUs - clientMs * 1000LL;
+                        if (latUs > 0) entity->phaseBench_commit.record(latUs);
+                    } catch (...) {}
+                }
             }
             // Commit all entries with seq ≤ s
             std::vector<int> toErase;
@@ -291,6 +334,20 @@ public:
         if (s < 0) {
             std::cout << "[Node " << entity->getNodeId() << "] CommitCertificateEvent: missing sequence, ignoring\n";
             return false;
+        }
+
+        // Record commit-cert latency directly using client timestamp
+        {
+            long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            auto sep = txnId.find('_');
+            if (sep != std::string::npos) {
+                try {
+                    long long clientMs = std::stoll(txnId.substr(0, sep));
+                    long long latUs = nowUs - clientMs * 1000LL;
+                    if (latUs > 0) entity->phaseBench_commit.record(latUs);
+                } catch (...) {}
+            }
         }
 
         // 1) Commit all entries with seq ≤ s
@@ -511,7 +568,6 @@ void registerUncommonEvents(EventFactory& factory) {
     factory.registerEvent<SendNewViewToNextLeaderEvent>("sendNewViewToNextLeader");
     factory.registerEvent<SpeculativeCompleteEvent>("speculativeComplete");
     factory.registerEvent<CommitCertificateEvent>("commitCertificate"); // NEW
-    factory.registerEvent<FillHoleRequestEvent>("fillHoleRequest");
 }
 
 // Static registrars to ensure event names are available

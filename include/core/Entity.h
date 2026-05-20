@@ -369,17 +369,22 @@ public:
     void loadFailureSpec(const std::string& xmlFile, long long startTimestamp);
     ByzantineNodeState getActiveByzantineState() const;
 
+    // Active protocol name (set from protocolConfig["protocol"] in loadProtocolConfig)
+    std::string activeProtocol_;
+
     // Windowed metrics (also protected by processedMtx)
     Benchmark nodeBench;
     Benchmark phaseBench_preprepare{"preprepare_phase"};
     Benchmark phaseBench_prepare{"prepare_phase"};
     Benchmark phaseBench_commit{"commit_phase"};
+    // Additional phase benches used by Hotstuff variants (phaseBench_commit covers Decide for Hotstuff)
+    Benchmark phaseBench_decide{"decide_phase"};
     int windowSize = 100;
     int windowTxCount = 0;
     int windowId = 1;
 
-    std::unordered_map<int, long long> phaseTs_preprepare; // seq → µs when PrePrepare stored
-    std::unordered_map<int, long long> phaseTs_prepare;    // seq → µs when prepare quorum first met
+    std::unordered_map<int, long long> phaseTs_preprepare; // seq → µs when first proposal stored
+    std::unordered_map<int, long long> phaseTs_prepare;    // seq → µs when prepare/precommit quorum first met
     std::unordered_map<int, long long> phaseTs_commit;     // seq → µs when commit quorum first met
     std::mutex phaseTsMtx;
 
@@ -433,15 +438,13 @@ private:
 
     std::mutex pendingTimeoutMtx;
     bool pendingTimeoutReady{false};
-    SbftTimeout pendingTimeout;
+    Timeout pendingTimeout_;               // protocol-generic pending timeout from agent
     std::atomic<bool> agentStopPolling{false};
 
-    SbftTimeout activeTimeoutSnapshot; // timeout active during current episode
+    Timeout activeTimeoutSnapshot_;        // timeout active during current episode
 
     struct SavedEpisodeReward {
-        uint32_t episode{0};
-        SbftReport report;
-        SbftTimeout timeoutUsed;
+        Reward reward;                     // protocol-specific reward (report + timeout used)
     };
     bool hasSavedReward{false};
     SavedEpisodeReward savedReward;

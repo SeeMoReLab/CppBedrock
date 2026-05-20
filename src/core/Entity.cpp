@@ -160,10 +160,9 @@ Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, b
             else if (proto == "Hotstuff2")    selectedConfig = "../config/config.hotstuff2.yaml";
             else if (proto == "SBFT")         selectedConfig = "../config/config.sbft.yaml";
             else if (proto == "Zyzzyva")      selectedConfig = "../config/config.zyzzyva.yaml";
-            else if (proto == "ChainedHotstuff") selectedConfig = "../config/config.chained_hotstuff.yaml";
+            else if (proto == "ChainedHotstuff") selectedConfig = "../config/config.chainedhotstuff.yaml";
         }
     } catch (...) {}
-    selectedConfig = "../config/config.sbft.yaml";
     loadProtocolConfig(selectedConfig);
     std::cout << "[Node " << nodeId << "] Loaded protocol config: " << selectedConfig << "\n";
     timeKeeper = std::make_unique<TimeKeeper>(viewChangeTimeoutMs, [this] {
@@ -327,7 +326,7 @@ void Entity::onTimeout() {
             ? nlohmann::json(sequenceStates[lastSeq].getLockedQC())
             : nlohmann::json{};
         Message msg(viewChangeMsg.dump());
-        int nextLeader = (newView + 1) % (peerPorts.size());
+        int nextLeader = peerPorts[(newView + 1) % peerPorts.size()];
         sendTo(nextLeader, msg);
     } else {
         Message msg(viewChangeMsg.dump());
@@ -345,7 +344,7 @@ void Entity::sendNewViewToNextLeader() {
     if (currentView == 0) currentView -= 1;
     currentView += 1;
     entityInfo["view"] = currentView;
-    int nextLeader = (currentView + 1) % peerPorts.size();
+    int nextLeader = peerPorts[(currentView + 1) % peerPorts.size()];
 
     // Fast path: send typed ProtocolEnvelope over gRPC
     // Use a lightweight PrePrepare envelope to carry NewView (type field set to "NewView")
@@ -390,9 +389,18 @@ void Entity::start() {
     startGrpcServer();
     initGrpcStubs();
 
-    // Initialise active timeout snapshot from config values
-    activeTimeoutSnapshot.set_election_timeout_milliseconds(viewChangeTimeoutMs);
-    activeTimeoutSnapshot.set_slow_path_timeout_milliseconds(fastPathWaitMs);
+    // Initialise active timeout snapshot from config values (protocol-generic wrapper)
+    if (activeProtocol_ == "SBFT") {
+        activeTimeoutSnapshot_.mutable_sbft()->set_election_timeout_milliseconds(viewChangeTimeoutMs);
+        activeTimeoutSnapshot_.mutable_sbft()->set_slow_path_timeout_milliseconds(fastPathWaitMs);
+    } else if (activeProtocol_ == "PBFT" || activeProtocol_ == "LinearPBFT") {
+        activeTimeoutSnapshot_.mutable_pbft()->set_election_timeout_milliseconds(viewChangeTimeoutMs);
+    } else if (activeProtocol_ == "Hotstuff" || activeProtocol_ == "Hotstuff2" || activeProtocol_ == "ChainedHotstuff") {
+        activeTimeoutSnapshot_.mutable_hotstuff()->set_election_timeout_milliseconds(viewChangeTimeoutMs);
+    } else if (activeProtocol_ == "Zyzzyva") {
+        activeTimeoutSnapshot_.mutable_zyzzyva()->set_speculative_timeout_milliseconds(fastPathWaitMs);
+        activeTimeoutSnapshot_.mutable_zyzzyva()->set_commit_cert_timeout_milliseconds(viewChangeTimeoutMs);
+    }
 
     if (agentEnabled_ && agentPort > 0) {
         auto ch = grpc::CreateChannel("127.0.0.1:" + std::to_string(agentPort),
@@ -451,6 +459,8 @@ void Entity::processMessages() {
 void Entity::loadProtocolConfig(const std::string& configFile) {
     try {
         protocolConfig = YAML::LoadFile(configFile);
+        if (protocolConfig["protocol"])
+            activeProtocol_ = protocolConfig["protocol"].as<std::string>();
         if (protocolConfig["timers"]) {
             const YAML::Node& timers = protocolConfig["timers"];
             if (timers["view_change_ms"]) viewChangeTimeoutMs = timers["view_change_ms"].as<int>();
@@ -944,7 +954,7 @@ void Entity::markOperationProcessed(int seq) {
                     << spp.avg << "," << spr.avg << "," << sco.avg << "\n";
             };
 
-            // Helper: snapshot current bench stats into an SbftReport
+            // ---- Per-protocol report builders ----
             auto buildSbftReport = [&]() -> SbftReport {
                 auto s_   = nodeBench.stats();
                 auto spp_ = phaseBench_preprepare.stats();
@@ -961,6 +971,75 @@ void Entity::markOperationProcessed(int seq) {
                 return rep;
             };
 
+            auto buildPbftReport = [&]() -> PbftReport {
+                auto s_   = nodeBench.stats();
+                auto spp_ = phaseBench_preprepare.stats();
+                auto spr_ = phaseBench_prepare.stats();
+                auto sco_ = phaseBench_commit.stats();
+                PbftReport rep;
+                rep.set_total_transactions(static_cast<uint32_t>(s_.completed));
+                rep.set_total_consensus_instances(static_cast<uint32_t>(s_.completed));
+                rep.set_avg_consensus_latency_ms(s_.avg / 1000.0f);
+                rep.set_throughput_tps(s_.throughput);
+                rep.set_phase_propose_avg_delay_ms(spp_.avg / 1000.0f);
+                rep.set_phase_write_avg_delay_ms(spr_.avg / 1000.0f);
+                rep.set_phase_accept_avg_delay_ms(sco_.avg / 1000.0f);
+                return rep;
+            };
+
+            auto buildHotstuffReport = [&]() -> HotstuffReport {
+                auto s_   = nodeBench.stats();
+                auto spp_ = phaseBench_preprepare.stats();
+                auto spr_ = phaseBench_prepare.stats();
+                auto sco_ = phaseBench_commit.stats();
+                HotstuffReport rep;
+                rep.set_total_transactions(static_cast<uint32_t>(s_.completed));
+                rep.set_total_consensus_instances(static_cast<uint32_t>(s_.completed));
+                rep.set_avg_consensus_latency_ms(s_.avg / 1000.0f);
+                rep.set_throughput_tps(s_.throughput);
+                rep.set_prepare_latency_ms(spp_.avg / 1000.0f);
+                rep.set_precommit_latency_ms(spr_.avg / 1000.0f);
+                rep.set_commit_latency_ms(sco_.avg / 1000.0f);
+                return rep;
+            };
+
+            auto buildZyzzyvaReport = [&]() -> ZyzzyvaReport {
+                auto s_   = nodeBench.stats();
+                auto spp_ = phaseBench_preprepare.stats();
+                auto sco_ = phaseBench_commit.stats();
+                ZyzzyvaReport rep;
+                rep.set_total_transactions(static_cast<uint32_t>(s_.completed));
+                rep.set_total_consensus_instances(static_cast<uint32_t>(s_.completed));
+                rep.set_avg_consensus_latency_ms(s_.avg / 1000.0f);
+                rep.set_throughput_tps(s_.throughput);
+                rep.set_speculative_exec_latency_ms(spp_.avg / 1000.0f);
+                rep.set_commit_cert_latency_ms(sco_.avg / 1000.0f);
+                return rep;
+            };
+
+            // ---- Helper: determine Protocol enum for active protocol ----
+            auto activeProtocolEnum = [&]() -> Protocol {
+                if (activeProtocol_ == "SBFT")             return PROTOCOL_SBFT;
+                if (activeProtocol_ == "PBFT" || activeProtocol_ == "LinearPBFT") return PROTOCOL_PBFT;
+                if (activeProtocol_ == "Hotstuff")         return PROTOCOL_HOTSTUFF;
+                if (activeProtocol_ == "Hotstuff2")        return PROTOCOL_HOTSTUFF2;
+                if (activeProtocol_ == "ChainedHotstuff")  return PROTOCOL_CHAINED_HOTSTUFF;
+                if (activeProtocol_ == "Zyzzyva")          return PROTOCOL_ZYZZYVA;
+                return PROTOCOL_UNSPECIFIED;
+            };
+
+            // ---- Helper: check whether a TimeoutStatus contains the right sub-type ----
+            auto timeoutMatches = [&](const TimeoutStatus& ts) -> bool {
+                if (!ts.has_timeout()) return false;
+                const auto& t = ts.timeout();
+                if (activeProtocol_ == "SBFT")                                      return t.has_sbft();
+                if (activeProtocol_ == "PBFT" || activeProtocol_ == "LinearPBFT")   return t.has_pbft();
+                if (activeProtocol_ == "Hotstuff" || activeProtocol_ == "Hotstuff2" ||
+                    activeProtocol_ == "ChainedHotstuff")                            return t.has_hotstuff();
+                if (activeProtocol_ == "Zyzzyva")                                   return t.has_zyzzyva();
+                return false;
+            };
+
             if (windowTxCount == half) {
                 logWindowMetrics("50pct");
 
@@ -969,25 +1048,31 @@ void Entity::markOperationProcessed(int seq) {
                     { std::lock_guard<std::mutex> lk(pendingTimeoutMtx); pendingTimeoutReady = false; }
                     agentStopPolling = false;
 
-                    // Build report and optionally attach prior episode reward
+                    // Build protocol-specific report
                     ReportLocal rpt;
                     rpt.set_node_id(getNodeId());
                     rpt.set_episode(agentEpisode);
-                    rpt.set_protocol(PROTOCOL_SBFT);
+                    rpt.set_protocol(activeProtocolEnum());
                     rpt.set_start_tick((agentEpisode - 1) * static_cast<uint32_t>(windowSize));
                     rpt.set_report_seq(agentEpisode * static_cast<uint32_t>(windowSize / 2));
-                    *rpt.mutable_sbft_state() = buildSbftReport();
 
-                    if (hasSavedReward) {
-                        auto* rwd = rpt.mutable_reward()->mutable_sbft();
-                        rwd->set_episode(savedReward.episode);
-                        *rwd->mutable_report() = savedReward.report;
-                        *rwd->mutable_timeout_used() = savedReward.timeoutUsed;
-                    }
+                    if (activeProtocol_ == "SBFT")
+                        *rpt.mutable_sbft_state() = buildSbftReport();
+                    else if (activeProtocol_ == "PBFT" || activeProtocol_ == "LinearPBFT")
+                        *rpt.mutable_pbft_state() = buildPbftReport();
+                    else if (activeProtocol_ == "Hotstuff" || activeProtocol_ == "Hotstuff2" ||
+                             activeProtocol_ == "ChainedHotstuff")
+                        *rpt.mutable_hotstuff_state() = buildHotstuffReport();
+                    else if (activeProtocol_ == "Zyzzyva")
+                        *rpt.mutable_zyzzyva_state() = buildZyzzyvaReport();
+
+                    if (hasSavedReward)
+                        *rpt.mutable_reward() = savedReward.reward;
 
                     auto* stub = agentStub_.get();
                     uint32_t ep = agentEpisode;
-                    std::thread([this, stub, ep, rpt = std::move(rpt)]() mutable {
+                    Protocol ep_proto = activeProtocolEnum();
+                    std::thread([this, stub, ep, ep_proto, rpt = std::move(rpt)]() mutable {
                         try {
                             // Send report
                             {
@@ -1004,16 +1089,24 @@ void Entity::markOperationProcessed(int seq) {
                                                  std::chrono::milliseconds(100));
                                 TimeoutRequest treq;
                                 treq.set_episode(ep);
-                                treq.set_protocol(PROTOCOL_SBFT);
+                                treq.set_protocol(ep_proto);
                                 TimeoutStatus ts;
                                 auto st = stub->GetTimeout(&ctx, treq, &ts);
-                                if (st.ok() &&
-                                    ts.status() == TimeoutStatus::READY &&
-                                    ts.has_timeout() && ts.timeout().has_sbft()) {
-                                    std::lock_guard<std::mutex> lk(pendingTimeoutMtx);
-                                    pendingTimeout = ts.timeout().sbft();
-                                    pendingTimeoutReady = true;
-                                    break;
+                                if (st.ok() && ts.status() == TimeoutStatus::READY && ts.has_timeout()) {
+                                    const auto& t = ts.timeout();
+                                    bool matched = false;
+                                    if (ep_proto == PROTOCOL_SBFT && t.has_sbft())          matched = true;
+                                    else if (ep_proto == PROTOCOL_PBFT && t.has_pbft())     matched = true;
+                                    else if ((ep_proto == PROTOCOL_HOTSTUFF ||
+                                              ep_proto == PROTOCOL_HOTSTUFF2 ||
+                                              ep_proto == PROTOCOL_CHAINED_HOTSTUFF) && t.has_hotstuff()) matched = true;
+                                    else if (ep_proto == PROTOCOL_ZYZZYVA && t.has_zyzzyva()) matched = true;
+                                    if (matched) {
+                                        std::lock_guard<std::mutex> lk(pendingTimeoutMtx);
+                                        pendingTimeout_ = ts.timeout();
+                                        pendingTimeoutReady = true;
+                                        break;
+                                    }
                                 }
                                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                             }
@@ -1025,35 +1118,76 @@ void Entity::markOperationProcessed(int seq) {
                 logWindowMetrics("80pct");
 
                 if (agentStub_) {
-                    agentStopPolling = true; // stop poll thread
+                    agentStopPolling = true;
 
                     std::lock_guard<std::mutex> lk(pendingTimeoutMtx);
                     if (pendingTimeoutReady) {
-                        const int prevElection  = viewChangeTimeoutMs;
-                        const int prevSlowPath  = fastPathWaitMs;
-                        if (pendingTimeout.election_timeout_milliseconds() > 0) {
-                            viewChangeTimeoutMs = pendingTimeout.election_timeout_milliseconds();
-                            std::lock_guard<std::mutex> lk2(timerMtx);
-                            if (timeKeeper) {
-                                timeKeeper->stop();
-                                timeKeeper = std::make_unique<TimeKeeper>(
-                                    viewChangeTimeoutMs, [this] { onTimeout(); });
+                        const int prevElection = viewChangeTimeoutMs;
+                        const int prevSlowPath = fastPathWaitMs;
+
+                        auto applyElection = [&](int newMs) {
+                            if (newMs > 0) {
+                                viewChangeTimeoutMs = newMs;
+                                std::lock_guard<std::mutex> lk2(timerMtx);
+                                if (timeKeeper) {
+                                    timeKeeper->stop();
+                                    timeKeeper = std::make_unique<TimeKeeper>(
+                                        viewChangeTimeoutMs, [this] { onTimeout(); });
+                                }
                             }
+                        };
+
+                        if (activeProtocol_ == "SBFT" && pendingTimeout_.has_sbft()) {
+                            applyElection(pendingTimeout_.sbft().election_timeout_milliseconds());
+                            if (pendingTimeout_.sbft().slow_path_timeout_milliseconds() > 0)
+                                fastPathWaitMs = pendingTimeout_.sbft().slow_path_timeout_milliseconds();
+                        } else if ((activeProtocol_ == "PBFT" || activeProtocol_ == "LinearPBFT") &&
+                                   pendingTimeout_.has_pbft()) {
+                            applyElection(pendingTimeout_.pbft().election_timeout_milliseconds());
+                        } else if ((activeProtocol_ == "Hotstuff" || activeProtocol_ == "Hotstuff2" ||
+                                    activeProtocol_ == "ChainedHotstuff") && pendingTimeout_.has_hotstuff()) {
+                            applyElection(pendingTimeout_.hotstuff().election_timeout_milliseconds());
+                        } else if (activeProtocol_ == "Zyzzyva" && pendingTimeout_.has_zyzzyva()) {
+                            if (pendingTimeout_.zyzzyva().speculative_timeout_milliseconds() > 0)
+                                fastPathWaitMs = pendingTimeout_.zyzzyva().speculative_timeout_milliseconds();
+                            applyElection(pendingTimeout_.zyzzyva().commit_cert_timeout_milliseconds());
                         }
-                        if (pendingTimeout.slow_path_timeout_milliseconds() > 0)
-                            fastPathWaitMs = pendingTimeout.slow_path_timeout_milliseconds();
+
+                        std::string label1, label2;
+                        if (activeProtocol_ == "Zyzzyva") {
+                            label1 = "commit_cert"; label2 = "speculative";
+                        } else if (activeProtocol_ == "SBFT") {
+                            label1 = "election"; label2 = "slow_path";
+                        } else {
+                            label1 = "election"; label2 = "";
+                        }
                         std::cout << "[Node " << getNodeId()
                                   << "] Timer update (episode=" << agentEpisode
+                                  << " protocol=" << activeProtocol_
                                   << " window=" << windowId << "):"
-                                  << " election " << prevElection << "->" << viewChangeTimeoutMs << "ms"
-                                  << " slow_path " << prevSlowPath << "->" << fastPathWaitMs << "ms\n";
+                                  << " " << label1 << " " << prevElection << "->" << viewChangeTimeoutMs << "ms";
+                        if (!label2.empty())
+                            std::cout << " " << label2 << " " << prevSlowPath << "->" << fastPathWaitMs << "ms";
+                        std::cout << "\n";
                     } else {
                         std::cout << "[Node " << getNodeId()
                                   << "] No timeout received by 80%, skipping\n";
                     }
+
                     // Always snapshot the active timeout (applied or unchanged)
-                    activeTimeoutSnapshot.set_election_timeout_milliseconds(viewChangeTimeoutMs);
-                    activeTimeoutSnapshot.set_slow_path_timeout_milliseconds(fastPathWaitMs);
+                    activeTimeoutSnapshot_.Clear();
+                    if (activeProtocol_ == "SBFT") {
+                        activeTimeoutSnapshot_.mutable_sbft()->set_election_timeout_milliseconds(viewChangeTimeoutMs);
+                        activeTimeoutSnapshot_.mutable_sbft()->set_slow_path_timeout_milliseconds(fastPathWaitMs);
+                    } else if (activeProtocol_ == "PBFT" || activeProtocol_ == "LinearPBFT") {
+                        activeTimeoutSnapshot_.mutable_pbft()->set_election_timeout_milliseconds(viewChangeTimeoutMs);
+                    } else if (activeProtocol_ == "Hotstuff" || activeProtocol_ == "Hotstuff2" ||
+                               activeProtocol_ == "ChainedHotstuff") {
+                        activeTimeoutSnapshot_.mutable_hotstuff()->set_election_timeout_milliseconds(viewChangeTimeoutMs);
+                    } else if (activeProtocol_ == "Zyzzyva") {
+                        activeTimeoutSnapshot_.mutable_zyzzyva()->set_speculative_timeout_milliseconds(fastPathWaitMs);
+                        activeTimeoutSnapshot_.mutable_zyzzyva()->set_commit_cert_timeout_milliseconds(viewChangeTimeoutMs);
+                    }
                 }
 
                 // Reset benchmarks so 80–100% is tracked as a clean reward window
@@ -1066,10 +1200,30 @@ void Entity::markOperationProcessed(int seq) {
                 logWindowMetrics("100pct");
 
                 if (agentStub_) {
-                    // Save this episode's final report + timeout for use as reward next episode
-                    savedReward.episode   = agentEpisode;
-                    savedReward.report    = buildSbftReport();
-                    savedReward.timeoutUsed = activeTimeoutSnapshot;
+                    // Save this episode's reward (report from 80-100% window + applied timeout)
+                    savedReward.reward.Clear();
+                    if (activeProtocol_ == "SBFT") {
+                        auto* r = savedReward.reward.mutable_sbft();
+                        r->set_episode(agentEpisode);
+                        *r->mutable_report() = buildSbftReport();
+                        *r->mutable_timeout_used() = activeTimeoutSnapshot_.sbft();
+                    } else if (activeProtocol_ == "PBFT" || activeProtocol_ == "LinearPBFT") {
+                        auto* r = savedReward.reward.mutable_pbft();
+                        r->set_episode(agentEpisode);
+                        *r->mutable_report() = buildPbftReport();
+                        *r->mutable_timeout_used() = activeTimeoutSnapshot_.pbft();
+                    } else if (activeProtocol_ == "Hotstuff" || activeProtocol_ == "Hotstuff2" ||
+                               activeProtocol_ == "ChainedHotstuff") {
+                        auto* r = savedReward.reward.mutable_hotstuff();
+                        r->set_episode(agentEpisode);
+                        *r->mutable_report() = buildHotstuffReport();
+                        *r->mutable_timeout_used() = activeTimeoutSnapshot_.hotstuff();
+                    } else if (activeProtocol_ == "Zyzzyva") {
+                        auto* r = savedReward.reward.mutable_zyzzyva();
+                        r->set_episode(agentEpisode);
+                        *r->mutable_report() = buildZyzzyvaReport();
+                        *r->mutable_timeout_used() = activeTimeoutSnapshot_.zyzzyva();
+                    }
                     hasSavedReward = true;
                     ++agentEpisode;
                 }
@@ -1246,12 +1400,16 @@ void Entity::flushBatchLocked() {
             EntityState(getState().getRole(), "Request", currentView, seq));
     }
 
+    const std::string activeProto = protocolConfig["protocol"]
+        ? protocolConfig["protocol"].as<std::string>() : "";
+    const std::string broadcastType = (activeProto == "Zyzzyva") ? "SpeculativeExecute" : "PrePrepare";
+
     bedrock::ProtocolEnvelope env;
     auto* m = env.mutable_pre_prepare();
     m->set_view(currentView);
     m->set_sequence(seq);
     m->set_message_sender_id(getNodeId());
-    m->set_type("PrePrepare");
+    m->set_type(broadcastType);
 
     const auto& first = batch[0];
     m->set_timestamp(first.value("timestamp", ""));
@@ -1303,6 +1461,11 @@ void Entity::flushBatchLocked() {
     ProtoMessage pmsg(env);
     auto storeEv = EventFactory::getInstance().createEvent("storeMessage");
     if (storeEv) storeEv->execute(this, &pmsg, &_entityState);
+
+    if (activeProto == "Zyzzyva") {
+        auto speculativeEv = EventFactory::getInstance().createEvent("speculativeComplete");
+        if (speculativeEv) speculativeEv->execute(this, &pmsg, &_entityState);
+    }
 
     std::cout << "[Node " << getNodeId() << "] Flushing batch of "
               << batch.size() << " requests, seq=" << seq << "\n";

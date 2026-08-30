@@ -6,6 +6,8 @@
 #include "connections/TcpConnection.h"
 #include "../core/Entity.h"
 #include "../core/crypto/OpenSSLCryptoProvider.h"
+#include <memory>
+#include <vector>
 
 class CoordinationUnit : public Coordinator {
 public:

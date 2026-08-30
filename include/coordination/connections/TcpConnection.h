@@ -7,6 +7,7 @@
 #include <vector>
 #include <string>
 #include <netinet/in.h>
+#include <queue>
 
 class TcpConnection {
 public:

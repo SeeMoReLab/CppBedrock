@@ -22,6 +22,11 @@
 #include <grpcpp/grpcpp.h>
 #include "proto/bedrock.grpc.pb.h"
 #include "proto/bedrock.pb.h"
+#include <algorithm>
+#include <condition_variable>
+#include <memory>
+#include <string>
+#include <tuple>
 
 using json = nlohmann::json;
 
@@ -114,6 +119,16 @@ int main(int argc, char* argv[]) {
     if (argc > 2) s4NumRequests = std::stoi(argv[2]);
     if (argc > 3) s4MaxClients  = std::stoi(argv[3]);
 
+    // Optional replica count: <scenario> [num_requests] [max_clients] [num_nodes]
+    int numNodes = 4;
+    if (argc > 4) {
+        numNodes = std::stoi(argv[4]);
+        if (numNodes < 4) {
+            std::cerr << "Invalid num_nodes " << numNodes << "; need at least 4." << std::endl;
+            return 1;
+        }
+    }
+
     if (scenario == 4) {
         scenario4Bench.reset("scenario4"); // was: scenario4Bench = Benchmark("scenario4");
     }
@@ -131,7 +146,8 @@ int main(int argc, char* argv[]) {
     std::unordered_map<std::string, std::set<int>> txnResponders; // txnId -> unique replica ids
     std::unordered_map<std::string, int> txnSeq;                  // txnId -> sequence
 
-    std::vector<int> nodePorts = {5001, 5002, 5003, 5004};
+    std::vector<int> nodePorts;
+    for (int i = 1; i <= numNodes; ++i) nodePorts.push_back(5000 + i);
     const int n = nodePorts.size();
     const int f = (n - 1) / 3;
     int requiredResponses = 2 * f + 1;

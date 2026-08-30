@@ -8,6 +8,8 @@
 #include <mutex>
 #include <condition_variable>
 #include "core/Entity.h"
+#include <functional>
+#include <string>
 
 class AsyncNodeServer {
 public:

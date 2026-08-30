@@ -2,6 +2,8 @@
 #include <openssl/evp.h>
 #include <sstream>
 #include <iomanip>
+#include <stdexcept>
+#include <string>
 
 std::string computeSHA256(const std::string& input) {
     unsigned char hash[EVP_MAX_MD_SIZE];

@@ -3,6 +3,8 @@
 #include <iostream>
 #include <thread>
 #include <cstdlib>   // NEW for std::getenv
+#include <chrono>
+#include <string>
 
 int main(int argc, char** argv) {
     bool agentEnabled = false;

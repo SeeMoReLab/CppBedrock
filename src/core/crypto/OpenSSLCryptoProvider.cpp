@@ -10,6 +10,8 @@
 #include <cstring>
 #include <iostream>
 #include <iomanip>
+#include <cstdlib>
+#include <string>
 
 namespace {
     std::string toHex(const unsigned char* data, size_t len) {

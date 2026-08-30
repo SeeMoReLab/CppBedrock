@@ -3,6 +3,7 @@
 #include "NodeServiceImpl.h"
 #include <iostream>
 #include <thread>
+#include <string>
 
 int main(int argc, char** argv) {
     int nodeId = (argc > 1) ? std::stoi(argv[1]) : 0;

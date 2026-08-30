@@ -24,9 +24,22 @@ if(NOT TARGET OpenSSL::SSL AND DEFINED OPENSSL_SSL_LIBRARY)
     INTERFACE_INCLUDE_DIRECTORIES "${OPENSSL_INCLUDE_DIR}")
 endif()
 
-# gRPC will pull protobuf, so don't call find_package(Protobuf) explicitly
-# find_package(Protobuf REQUIRED)
-find_package(gRPC CONFIG REQUIRED)
+# Prefer gRPC's own CMake package (Homebrew, source installs); fall back to
+# pkg-config for distro packages, since Ubuntu's libgrpc++-dev ships no
+# gRPCConfig.cmake.
+find_package(gRPC CONFIG QUIET)
+if(gRPC_FOUND)
+  message(STATUS "Using gRPC via CMake config")
+else()
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(GRPCPP REQUIRED IMPORTED_TARGET GLOBAL grpc++)
+  add_library(gRPC::grpc++ ALIAS PkgConfig::GRPCPP)
+  find_program(GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin REQUIRED)
+  add_executable(gRPC::grpc_cpp_plugin IMPORTED GLOBAL)
+  set_target_properties(gRPC::grpc_cpp_plugin PROPERTIES
+    IMPORTED_LOCATION "${GRPC_CPP_PLUGIN_EXECUTABLE}")
+  message(STATUS "Using gRPC via pkg-config (plugin: ${GRPC_CPP_PLUGIN_EXECUTABLE})")
+endif()
 find_package(Protobuf REQUIRED)
 
 # Manually specify the library path for yaml-cpp
@@ -43,6 +56,7 @@ set(SOURCES
     src/core/events/Event.cpp
     src/core/events/EventFactory.cpp
     src/core/Entity.cpp
+    src/core/agent/AgentClient.cpp
     src/coordination/connections/TcpConnection.cpp
     src/coordination/CoordinationServer.cpp
     src/coordination/CoordinationUnit.cpp
@@ -101,11 +115,13 @@ add_custom_command(
   COMMAND $<TARGET_FILE:protobuf::protoc>
           --proto_path=${PROTO_DIR}
           --proto_path=${Protobuf_INCLUDE_DIRS}
+          --experimental_allow_proto3_optional
           --cpp_out=${GENERATED_PROTO_DIR}
           ${AGENT_PROTO_FILE}
   COMMAND $<TARGET_FILE:protobuf::protoc>
           --proto_path=${PROTO_DIR}
           --proto_path=${Protobuf_INCLUDE_DIRS}
+          --experimental_allow_proto3_optional
           --grpc_out=${GENERATED_PROTO_DIR}
           --plugin=protoc-gen-grpc=$<TARGET_FILE:gRPC::grpc_cpp_plugin>
           ${AGENT_PROTO_FILE}
@@ -133,6 +149,12 @@ target_include_directories(CppBedrockLib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/incl
 # Add the executable and link libraries
 add_executable(${PROJECT_NAME} src/main.cpp)
 target_link_libraries(${PROJECT_NAME} PRIVATE CppBedrockLib)
+
+# Live smoke test for the learning-agent client (needs a running agent)
+add_executable(agent_client_smoke tests/agent_client_smoke.cpp)
+add_dependencies(agent_client_smoke agent_proto)
+target_link_libraries(agent_client_smoke PRIVATE CppBedrockLib agent_proto gRPC::grpc++ protobuf::libprotobuf)
+target_include_directories(agent_client_smoke PRIVATE ${CMAKE_BINARY_DIR})
 
 # Add integration test executable and link libraries
 add_executable(integration_test tests/integration_test.cpp)

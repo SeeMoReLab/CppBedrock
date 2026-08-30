@@ -1,5 +1,6 @@
 #include "coordination/grpc/AsyncNodeServer.h"
 #include <nlohmann/json.hpp>
+#include <string>
 
 using json = nlohmann::json;
 

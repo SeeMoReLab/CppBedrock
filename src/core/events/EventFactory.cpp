@@ -7,6 +7,15 @@
 #include <unistd.h>
 #include "../../../include/core/events/ProtoMessage.h"
 
+#include <cctype>
+#include <ctime>
+#include <iomanip>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <unordered_set>
 void registerUncommonEvents(EventFactory& factory);
 
 int computeQuorumEventFactory(const std::string& quorumStr, int f) {

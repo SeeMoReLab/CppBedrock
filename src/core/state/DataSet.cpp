@@ -1,6 +1,9 @@
 #include "../../../include/core/state/DataSet.h"
 #include <fstream>
 #include <iostream>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 void DataSet::setRecords(const std::unordered_map<std::string, nlohmann::json>& records) {
     std::lock_guard<std::mutex> lock(_mtx);

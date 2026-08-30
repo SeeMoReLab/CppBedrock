@@ -2,6 +2,11 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <iostream>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
 
 TcpConnection::TcpConnection(int port, bool isServer) 
     : port(port), isServer(isServer), running(false), clientSock(-1) {

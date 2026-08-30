@@ -1,6 +1,7 @@
 #include <grpcpp/grpcpp.h>
 #include "bedrock.grpc.pb.h"
 #include <iostream>
+#include <string>
 
 int main(int argc, char** argv) {
     int targetNode = (argc > 1) ? std::stoi(argv[1]) : 1;

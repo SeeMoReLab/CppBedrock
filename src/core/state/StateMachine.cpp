@@ -1,4 +1,6 @@
 #include "../../../include/core/state/StateMachine.h"
+#include <iostream>
+#include <string>
 
 void StateMachine::handleMessage(const Message* message, EntityState* context) {
     std::cout << "[StateMachine] Handling message: \n";

@@ -1,6 +1,7 @@
 #include "../../include/coordination/CoordinationServer.h"
 #include <iostream>
 #include "../../include/coordination/connections/TcpConnection.h"
+#include <string>
 //#include <yaml-cpp/yaml.h>
 
 CoordinationServer::CoordinationServer() {}

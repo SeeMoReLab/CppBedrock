@@ -31,11 +31,12 @@
 #include <grpcpp/grpcpp.h>
 #include "proto/bedrock.grpc.pb.h"
 #include "proto/bedrock.pb.h"
-#include "proto/agent.grpc.pb.h"
-#include "proto/agent.pb.h"
+#include "agent/AgentClient.h"
 #include <functional> // For std::hash
+#include <chrono>
 
-namespace grpc { class Server; }
+// grpc::Server comes from <grpcpp/grpcpp.h> above; do not forward-declare it
+// (older gRPC defines it as a typedef, which a class forward-declaration breaks).
 class NodeServiceImpl;
 
 class Event;
@@ -391,28 +392,17 @@ private:
     void initGrpcStubs();             // create stubs for all peers and self
     bedrock::Node::Stub* getStub(int peerId);
 
-    // Learning agent connection (optional, per-node)
+    // Learning agent (optional, per-node). The wall-clock learning cycle and
+    // all protocol-specific report/timeout handling live in AgentClient; the
+    // entity only feeds consensus samples and applies recommended timeouts.
     int agentPort{-1};
-    bool agentEnabled_{false};
-    std::unique_ptr<LearningAgent::Stub> agentStub_;
+    bool agentEnabled_{false};        // forced on via the --agent CLI flag
+    bool agentConfigEnabled_{false};  // agent.enabled in the protocol config
+    AgentClientConfig agentConfig_;
+    std::unique_ptr<AgentClient> agentClient_;
 
-    // Agent episode / reward state
-    uint32_t agentEpisode{1};
-
-    std::mutex pendingTimeoutMtx;
-    bool pendingTimeoutReady{false};
-    SbftTimeout pendingTimeout;
-    std::atomic<bool> agentStopPolling{false};
-
-    SbftTimeout activeTimeoutSnapshot; // timeout active during current episode
-
-    struct SavedEpisodeReward {
-        uint32_t episode{0};
-        SbftReport report;
-        SbftTimeout timeoutUsed;
-    };
-    bool hasSavedReward{false};
-    SavedEpisodeReward savedReward;
+    // Applies a recommendation from the learning agent (learning thread).
+    void applyAgentTimeouts(const AgentTimeouts& timeouts);
 
 };
 

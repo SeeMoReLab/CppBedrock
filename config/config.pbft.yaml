@@ -1,4 +1,24 @@
 protocol: PBFT
+timers:
+  view_change_ms: 8000
+
+# Learning-agent integration (wall-clock learning cycle).
+# Each episode: collect features for feature_duration_ms, wait reply_wait_ms
+# for the agent's recommendation, apply it and discard warmup_duration_ms,
+# then collect the reward for reward_duration_ms.
+agent:
+  enabled: false
+  ports:
+    1: 50100
+    2: 50101
+    3: 50102
+    4: 50103
+  feature_duration_ms: 8000
+  reply_wait_ms: 2000
+  warmup_duration_ms: 2000
+  reward_duration_ms: 8000
+  poll_interval_ms: 50
+  rpc_timeout_ms: 500
 phases:
   Request:
     quorum: 1

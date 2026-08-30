@@ -8,6 +8,9 @@
 #include <queue>
 #include <functional>
 #include <thread>
+#include <algorithm>
+#include <string>
+#include <vector>
 
 using json = nlohmann::json;
 

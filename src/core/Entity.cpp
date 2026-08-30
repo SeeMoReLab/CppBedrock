@@ -25,6 +25,14 @@
 #include <iomanip>
 #include <ctime>
 #include <tuple>           // for batching rows
+#include <algorithm>
+#include <cstdint>
+#include <mutex>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <unistd.h>
+#include <vector>
 
 // Batch CSV buffers (per-process, keyed by node id)
 namespace {
@@ -147,22 +155,24 @@ Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, b
 {
     nodeBench.reset("node_" + std::to_string(id) + "_w1");
     EventFactory::getInstance().initialize();
-    // Load selected protocol from runtime.selection.yaml; fallback to Zyzzyva
+    // Load selected protocol from runtime.selection.yaml; fallback to SBFT.
     std::string selectedConfig = "../config/config.sbft.yaml";
     try {
-        YAML::Node runtime = YAML::LoadFile("/Users/eswar/Downloads/CppBedrock/config/runtime.selection.yaml");
+        YAML::Node runtime = YAML::LoadFile("../config/runtime.selection.yaml");
         if (runtime && runtime["protocol"]) {
             const std::string proto = runtime["protocol"].as<std::string>();
-            if (proto == "PBFT")              selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.pbft.yaml";
-            else if (proto == "LinearPBFT")   selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.linearpbft.yaml";
-            else if (proto == "Hotstuff")     selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.hotstuff.yaml";
-            else if (proto == "Hotstuff2")    selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.hotstuff2.yaml";
-            else if (proto == "SBFT")         selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.sbft.yaml";
-            else if (proto == "Zyzzyva")      selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.zyzzyva.yaml";
-            else if (proto == "ChainedHotstuff") selectedConfig = "/Users/eswar/Downloads/CppBedrock/config/config.chained_hotstuff.yaml";
+            if (proto == "PBFT")              selectedConfig = "../config/config.pbft.yaml";
+            else if (proto == "LinearPBFT")   selectedConfig = "../config/config.linearpbft.yaml";
+            else if (proto == "Hotstuff")     selectedConfig = "../config/config.hotstuff.yaml";
+            else if (proto == "Hotstuff2")    selectedConfig = "../config/config.hotstuff2.yaml";
+            else if (proto == "SBFT")         selectedConfig = "../config/config.sbft.yaml";
+            else if (proto == "Zyzzyva")      selectedConfig = "../config/config.zyzzyva.yaml";
+            else if (proto == "ChainedHotstuff") selectedConfig = "../config/config.chainedhotstuff.yaml";
+            else throw std::runtime_error("unknown protocol in runtime.selection.yaml: " + proto);
         }
-    } catch (...) {}
-    selectedConfig = "../config/config.sbft.yaml";
+    } catch (const YAML::BadFile&) {
+        std::cout << "[Node " << id << "] runtime.selection.yaml not found; using " << selectedConfig << "\n";
+    }
     loadProtocolConfig(selectedConfig);
     std::cout << "[Node " << nodeId << "] Loaded protocol config: " << selectedConfig << "\n";
     timeKeeper = std::make_unique<TimeKeeper>(viewChangeTimeoutMs, [this] {
@@ -389,25 +399,23 @@ void Entity::start() {
     startGrpcServer();
     initGrpcStubs();
 
-    // Initialise active timeout snapshot from config values
-    activeTimeoutSnapshot.set_election_timeout_milliseconds(viewChangeTimeoutMs);
-    activeTimeoutSnapshot.set_slow_path_timeout_milliseconds(fastPathWaitMs);
-
-    if (agentEnabled_ && agentPort > 0) {
-        auto ch = grpc::CreateChannel("127.0.0.1:" + std::to_string(agentPort),
-                                      grpc::InsecureChannelCredentials());
-        agentStub_ = LearningAgent::NewStub(ch);
-        std::cout << "[Node " << getNodeId() << "] Agent stub created on port " << agentPort << "\n";
-        try {
-            grpc::ClientContext ctx;
-            ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(500));
-            google::protobuf::Empty req, resp;
-            auto st = agentStub_->Reset(&ctx, req, &resp);
-            if (st.ok())
-                std::cout << "[Node " << getNodeId() << "] Agent reset OK\n";
-            else
-                std::cout << "[Node " << getNodeId() << "] Agent reset failed (agent may not be running): " << st.error_message() << "\n";
-        } catch (...) {}
+    if (agentEnabled_ || agentConfigEnabled_) {
+        if (agentPort <= 0) {
+            throw std::runtime_error(
+                "[Node " + std::to_string(getNodeId()) +
+                "] learning agent enabled but no port configured for this node "
+                "(expected agent.ports." + std::to_string(getNodeId()) + " in the protocol config)");
+        }
+        const std::string protocol =
+            protocolConfig["protocol"] ? protocolConfig["protocol"].as<std::string>() : "";
+        agentConfig_.nodeId = getNodeId();
+        agentConfig_.port = agentPort;
+        agentClient_ = std::make_unique<AgentClient>(
+            agentConfig_,
+            makeProtocolAgentAdapter(protocol),
+            AgentTimeouts{viewChangeTimeoutMs, fastPathWaitMs},
+            [this](const AgentTimeouts& t) { applyAgentTimeouts(t); });
+        agentClient_->start();
     }
 
     processingThread = std::thread(&Entity::processMessages, this);
@@ -420,6 +428,9 @@ void Entity::start() {
 }
 void Entity::stop() {
     std::cout << "[Entity] Stopping entity: " << _entityState.getRole() << "\n";
+    if (agentClient_) {
+        agentClient_->stop();
+    }
     // Flush any remaining batched rows for this node before shutdown
     {
         std::lock_guard<std::mutex> lk(s_csvBatchMtx);
@@ -453,8 +464,18 @@ void Entity::loadProtocolConfig(const std::string& configFile) {
             const YAML::Node& metrics = protocolConfig["metrics"];
             if (metrics["window_size"]) windowSize = metrics["window_size"].as<int>();
         }
-        if (protocolConfig["agents"] && protocolConfig["agents"][nodeId]) {
-            agentPort = protocolConfig["agents"][nodeId].as<int>();
+        if (protocolConfig["agent"]) {
+            const YAML::Node& agent = protocolConfig["agent"];
+            if (agent["enabled"]) agentConfigEnabled_ = agent["enabled"].as<bool>();
+            if (agent["ports"] && agent["ports"][nodeId]) {
+                agentPort = agent["ports"][nodeId].as<int>();
+            }
+            if (agent["feature_duration_ms"]) agentConfig_.featureDurationMs = agent["feature_duration_ms"].as<int>();
+            if (agent["reply_wait_ms"]) agentConfig_.replyWaitMs = agent["reply_wait_ms"].as<int>();
+            if (agent["warmup_duration_ms"]) agentConfig_.warmupDurationMs = agent["warmup_duration_ms"].as<int>();
+            if (agent["reward_duration_ms"]) agentConfig_.rewardDurationMs = agent["reward_duration_ms"].as<int>();
+            if (agent["poll_interval_ms"]) agentConfig_.pollIntervalMs = agent["poll_interval_ms"].as<int>();
+            if (agent["rpc_timeout_ms"]) agentConfig_.rpcTimeoutMs = agent["rpc_timeout_ms"].as<int>();
         }
         const YAML::Node& phases = protocolConfig["phases"];
         if (!phases.IsMap()) {
@@ -846,6 +867,8 @@ void Entity::markOperationProcessed(int seq) {
 
             // Compute end-to-end latency from client-embedded timestamp (format: "ms_idx")
             // reuse opStr already read above
+            long long e2eLatUs = -1;
+            long long ppLatUs = -1, prLatUs = -1, coLatUs = -1;
             if (!opStr.empty()) {
                 auto sep = opStr.find('_');
                 if (sep != std::string::npos) {
@@ -853,6 +876,7 @@ void Entity::markOperationProcessed(int seq) {
                     long long latUs = nowUs - clientMs * 1000LL;
                     if (latUs > 0) {
                         nodeBench.record(latUs);
+                        e2eLatUs = latUs;
                         ++windowTxCount; // only count txns with valid latency
                     }
                 }
@@ -866,15 +890,15 @@ void Entity::markOperationProcessed(int seq) {
                 auto it_co = phaseTs_commit.find(seq);
                 if (it_pp != phaseTs_preprepare.end() && it_pr != phaseTs_prepare.end()) {
                     long long ppUs = it_pr->second - it_pp->second;
-                    if (ppUs > 0) phaseBench_preprepare.record(ppUs);
+                    if (ppUs > 0) { phaseBench_preprepare.record(ppUs); ppLatUs = ppUs; }
                 }
                 if (it_pr != phaseTs_prepare.end() && it_co != phaseTs_commit.end()) {
                     long long prUs = it_co->second - it_pr->second;
-                    if (prUs > 0) phaseBench_prepare.record(prUs);
+                    if (prUs > 0) { phaseBench_prepare.record(prUs); prLatUs = prUs; }
                 }
                 if (it_co != phaseTs_commit.end()) {
                     long long coUs = nowUs - it_co->second;
-                    if (coUs > 0) phaseBench_commit.record(coUs);
+                    if (coUs > 0) { phaseBench_commit.record(coUs); coLatUs = coUs; }
                 }
                 phaseTs_preprepare.erase(seq);
                 phaseTs_prepare.erase(seq);
@@ -888,6 +912,18 @@ void Entity::markOperationProcessed(int seq) {
                     it = (nowUs - it->second > kStaleTtlUs) ? phaseTs_prepare.erase(it) : std::next(it);
                 for (auto it = phaseTs_commit.begin(); it != phaseTs_commit.end(); )
                     it = (nowUs - it->second > kStaleTtlUs) ? phaseTs_commit.erase(it) : std::next(it);
+            }
+
+            // Feed the learning agent with this consensus sample (wall-clock
+            // windows are managed inside AgentClient).
+            if (agentClient_) {
+                AgentConsensusSample sample;
+                sample.sequence = seq > 0 ? static_cast<uint32_t>(seq) : 0;
+                sample.latencyUs = e2eLatUs;
+                sample.phase1Us = ppLatUs;
+                sample.phase2Us = prLatUs;
+                sample.phase3Us = coLatUs;
+                agentClient_->recordConsensus(sample);
             }
 
             int half   = windowSize / 2;
@@ -921,135 +957,12 @@ void Entity::markOperationProcessed(int seq) {
                     << spp.avg << "," << spr.avg << "," << sco.avg << "\n";
             };
 
-            // Helper: snapshot current bench stats into an SbftReport
-            auto buildSbftReport = [&]() -> SbftReport {
-                auto s_   = nodeBench.stats();
-                auto spp_ = phaseBench_preprepare.stats();
-                auto spr_ = phaseBench_prepare.stats();
-                auto sco_ = phaseBench_commit.stats();
-                SbftReport rep;
-                rep.set_total_transactions(static_cast<uint32_t>(s_.completed));
-                rep.set_total_consensus_instances(static_cast<uint32_t>(s_.completed));
-                rep.set_avg_consensus_latency_ms(s_.avg / 1000.0f);
-                rep.set_throughput_tps(s_.throughput);
-                rep.set_pre_prepare_latency_ms(spp_.avg / 1000.0f);
-                rep.set_prepare_latency_ms(spr_.avg / 1000.0f);
-                rep.set_commit_latency_ms(sco_.avg / 1000.0f);
-                return rep;
-            };
-
             if (windowTxCount == half) {
                 logWindowMetrics("50pct");
-
-                if (agentStub_) {
-                    // Reset pending state for this episode
-                    { std::lock_guard<std::mutex> lk(pendingTimeoutMtx); pendingTimeoutReady = false; }
-                    agentStopPolling = false;
-
-                    // Build report and optionally attach prior episode reward
-                    ReportLocal rpt;
-                    rpt.set_node_id(getNodeId());
-                    rpt.set_episode(agentEpisode);
-                    rpt.set_protocol(PROTOCOL_SBFT);
-                    rpt.set_start_tick((agentEpisode - 1) * static_cast<uint32_t>(windowSize));
-                    rpt.set_report_seq(agentEpisode * static_cast<uint32_t>(windowSize / 2));
-                    *rpt.mutable_sbft_state() = buildSbftReport();
-
-                    if (hasSavedReward) {
-                        auto* rwd = rpt.mutable_reward()->mutable_sbft();
-                        rwd->set_episode(savedReward.episode);
-                        *rwd->mutable_report() = savedReward.report;
-                        *rwd->mutable_timeout_used() = savedReward.timeoutUsed;
-                    }
-
-                    auto* stub = agentStub_.get();
-                    uint32_t ep = agentEpisode;
-                    std::thread([this, stub, ep, rpt = std::move(rpt)]() mutable {
-                        try {
-                            // Send report
-                            {
-                                grpc::ClientContext ctx;
-                                ctx.set_deadline(std::chrono::system_clock::now() +
-                                                 std::chrono::milliseconds(500));
-                                google::protobuf::Empty empty;
-                                stub->SendReport(&ctx, rpt, &empty);
-                            }
-                            // Poll GetTimeout until READY or stop signal
-                            while (!agentStopPolling.load()) {
-                                grpc::ClientContext ctx;
-                                ctx.set_deadline(std::chrono::system_clock::now() +
-                                                 std::chrono::milliseconds(100));
-                                TimeoutRequest treq;
-                                treq.set_episode(ep);
-                                treq.set_protocol(PROTOCOL_SBFT);
-                                TimeoutStatus ts;
-                                auto st = stub->GetTimeout(&ctx, treq, &ts);
-                                if (st.ok() &&
-                                    ts.status() == TimeoutStatus::READY &&
-                                    ts.has_timeout() && ts.timeout().has_sbft()) {
-                                    std::lock_guard<std::mutex> lk(pendingTimeoutMtx);
-                                    pendingTimeout = ts.timeout().sbft();
-                                    pendingTimeoutReady = true;
-                                    break;
-                                }
-                                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                            }
-                        } catch (...) {}
-                    }).detach();
-                }
-
             } else if (windowTxCount == eighty) {
                 logWindowMetrics("80pct");
-
-                if (agentStub_) {
-                    agentStopPolling = true; // stop poll thread
-
-                    std::lock_guard<std::mutex> lk(pendingTimeoutMtx);
-                    if (pendingTimeoutReady) {
-                        const int prevElection  = viewChangeTimeoutMs;
-                        const int prevSlowPath  = fastPathWaitMs;
-                        if (pendingTimeout.election_timeout_milliseconds() > 0) {
-                            viewChangeTimeoutMs = pendingTimeout.election_timeout_milliseconds();
-                            std::lock_guard<std::mutex> lk2(timerMtx);
-                            if (timeKeeper) {
-                                timeKeeper->stop();
-                                timeKeeper = std::make_unique<TimeKeeper>(
-                                    viewChangeTimeoutMs, [this] { onTimeout(); });
-                            }
-                        }
-                        if (pendingTimeout.slow_path_timeout_milliseconds() > 0)
-                            fastPathWaitMs = pendingTimeout.slow_path_timeout_milliseconds();
-                        std::cout << "[Node " << getNodeId()
-                                  << "] Timer update (episode=" << agentEpisode
-                                  << " window=" << windowId << "):"
-                                  << " election " << prevElection << "->" << viewChangeTimeoutMs << "ms"
-                                  << " slow_path " << prevSlowPath << "->" << fastPathWaitMs << "ms\n";
-                    } else {
-                        std::cout << "[Node " << getNodeId()
-                                  << "] No timeout received by 80%, skipping\n";
-                    }
-                    // Always snapshot the active timeout (applied or unchanged)
-                    activeTimeoutSnapshot.set_election_timeout_milliseconds(viewChangeTimeoutMs);
-                    activeTimeoutSnapshot.set_slow_path_timeout_milliseconds(fastPathWaitMs);
-                }
-
-                // Reset benchmarks so 80–100% is tracked as a clean reward window
-                nodeBench.reset("node_" + std::to_string(getNodeId()) + "_w" + std::to_string(windowId) + "_reward");
-                phaseBench_preprepare.reset("preprepare_phase_w" + std::to_string(windowId) + "_reward");
-                phaseBench_prepare.reset("prepare_phase_w"    + std::to_string(windowId) + "_reward");
-                phaseBench_commit.reset("commit_phase_w"      + std::to_string(windowId) + "_reward");
-
             } else if (windowTxCount >= windowSize) {
                 logWindowMetrics("100pct");
-
-                if (agentStub_) {
-                    // Save this episode's final report + timeout for use as reward next episode
-                    savedReward.episode   = agentEpisode;
-                    savedReward.report    = buildSbftReport();
-                    savedReward.timeoutUsed = activeTimeoutSnapshot;
-                    hasSavedReward = true;
-                    ++agentEpisode;
-                }
 
                 ++windowId;
                 windowTxCount = 0;
@@ -1134,8 +1047,25 @@ void Entity::saveEntityInfo() {
     std::filesystem::rename(tmpFilename, filename);
 }
 
+void Entity::applyAgentTimeouts(const AgentTimeouts& timeouts) {
+    if (timeouts.electionMs > 0 && timeouts.electionMs != viewChangeTimeoutMs) {
+        viewChangeTimeoutMs = timeouts.electionMs;
+        std::lock_guard<std::mutex> lk(timerMtx);
+        if (timeKeeper) {
+            timeKeeper->stop();
+            timeKeeper = std::make_unique<TimeKeeper>(viewChangeTimeoutMs, [this] { onTimeout(); });
+        }
+    }
+    if (timeouts.slowPathMs > 0) {
+        fastPathWaitMs = timeouts.slowPathMs;
+    }
+}
+
 void Entity::initiateViewChange() {
     std::cout << "[Node " << getNodeId() << "] Initiating view change.\n";
+    if (agentClient_) {
+        agentClient_->recordViewChange();
+    }
 
     int newView = entityInfo["view"].get<int>() + 1;
     entityInfo["view"] = newView;

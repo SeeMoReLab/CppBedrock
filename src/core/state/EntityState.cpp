@@ -1,5 +1,6 @@
 #include "../../../include/core/state/EntityState.h"
 #include <iostream>
+#include <string>
 // Constructor definition
 EntityState::EntityState(const std::string& role, const std::string& state, int view, int sequence)
     : _role(role), _state(state), viewNumber(view), sequenceNumber(sequence) {

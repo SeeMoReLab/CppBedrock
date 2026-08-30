@@ -4,6 +4,11 @@
 #include "../../../include/core/events/ProtoMessage.h"
 #include <nlohmann/json.hpp>
 #include <iostream>
+#include <algorithm>
+#include <map>
+#include <mutex>
+#include <string>
+#include <vector>
 
 int computeQuorumEventFactoryProtocolSpecific(const std::string& quorumStr, int f) {
     if (quorumStr == "2f") return 2 * f;

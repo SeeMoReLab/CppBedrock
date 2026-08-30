@@ -1,2 +1,0 @@
-/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ar qc libbedrock_proto.a CMakeFiles/bedrock_proto.dir/proto/bedrock.pb.cc.o CMakeFiles/bedrock_proto.dir/proto/bedrock.grpc.pb.cc.o
-/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ranlib libbedrock_proto.a

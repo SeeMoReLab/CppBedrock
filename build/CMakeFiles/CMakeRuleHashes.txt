@@ -1,2 +1,0 @@
-# Hashes of file build rules.
-df23e14cf9963ec854b7bb67ae860285 proto/bedrock.pb.cc

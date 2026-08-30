@@ -33,3 +33,5 @@
 
 # Ignore PEM files
 *.pem
+
+build/

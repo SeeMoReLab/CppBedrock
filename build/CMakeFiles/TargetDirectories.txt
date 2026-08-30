@@ -1,6 +1,0 @@
-/Users/eswar/Downloads/CppBedrock/build/CMakeFiles/bedrock_proto.dir
-/Users/eswar/Downloads/CppBedrock/build/CMakeFiles/CppBedrockLib.dir
-/Users/eswar/Downloads/CppBedrock/build/CMakeFiles/CppBedrock.dir
-/Users/eswar/Downloads/CppBedrock/build/CMakeFiles/integration_test.dir
-/Users/eswar/Downloads/CppBedrock/build/CMakeFiles/edit_cache.dir
-/Users/eswar/Downloads/CppBedrock/build/CMakeFiles/rebuild_cache.dir

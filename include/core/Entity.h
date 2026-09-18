@@ -97,7 +97,12 @@ struct EntityOptions {
     // names batches by digest, so the window costs kilobytes: default to all
     // of it rather than to a figure that silently caps throughput.
     int maxInflightBatches{bedrock::kConsensusWindow};
-    int maxPendingRequests{32768};
+    // A replica must buffer the requests in flight, which is the offered rate
+    // times the time to order one: at 40,000 requests/s and a 150 ms one-way
+    // delay that is about 25,000, and a regime change transiently needs more.
+    // The byte bound is the real memory limit; the count only has to be large
+    // enough not to reject work the pipeline could still carry.
+    int maxPendingRequests{131072};
     int maxPendingBytes{16 * 1024 * 1024};
     // Optional transport injection for deterministic protocol tests. The
     // callbacks enqueue delivery; they must not re-enter another replica.

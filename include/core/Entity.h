@@ -517,11 +517,7 @@ private:
     void scheduleLeaderObservation();
     void scheduleProposalTick();
     void proposeBatch();
-    // Takes the request by value so the pending pool can move it in. It is
-    // copied once out of the gRPC message into the ingress queue; copying it
-    // again here and a third time into the proposal is a whole protobuf per
-    // request per second, at forty thousand a second.
-    void acceptClientRequest(bedrock::ClientRequest request, long long arrival);
+    void acceptClientRequest(const bedrock::ClientRequest& request, long long arrival);
     void rebuildProposalQueue();
     void scheduleProposal(const std::string& key);
     void proposeRequest(const std::string& key);

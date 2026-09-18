@@ -83,7 +83,7 @@ void Entity::onClientRequest(const json& request) {
     wire.mutable_transaction()->set_from(tx.value("from", std::string()));
     wire.mutable_transaction()->set_to(tx.value("to", std::string()));
     wire.mutable_transaction()->set_amount(tx.value("amount", 0));
-    acceptClientRequest(std::move(wire), request.value("arrival_us", nowUs()));
+    acceptClientRequest(wire, request.value("arrival_us", nowUs()));
 }
 
 // Every replica observes the leader a few times per second so the failure

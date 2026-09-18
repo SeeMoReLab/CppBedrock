@@ -51,7 +51,7 @@ void usage(const char* argv0) {
         << "  [--proposal-interval <ms>]           fixed batch cadence (default 100)\n"
         << "  [--batch-max-requests <count>]       requests per batch (default/max 8192)\n"
         << "  [--batch-max-bytes <bytes>]          batch bytes (default/max 524288)\n"
-        << "  [--max-inflight-batches <count>]     unexecuted batches (default 4, max 4)\n"
+        << "  [--max-inflight-batches <count>]     unexecuted batches (default and max 16, the consensus window)\n"
         << "  [--max-pending-requests <count>]     bound each ingress/pending queue (default 32768)\n"
         << "  [--max-pending-bytes <bytes>]        bound each ingress/pending queue (default 16777216)\n"
         << "  [--proposal-signing <true|false>]     Required true for PBFT/SBFT (default true)\n"

@@ -92,7 +92,11 @@ struct EntityOptions {
     int proposalIntervalMs{100};
     int batchMaxRequests{8192};
     int batchMaxBytes{512 * 1024};
-    int maxInflightBatches{4};
+    // Keeping the cadence at a 150 ms one-way delay needs roughly six batches
+    // in flight, since a decision takes about four one-way trips. Evidence
+    // names batches by digest, so the window costs kilobytes: default to all
+    // of it rather than to a figure that silently caps throughput.
+    int maxInflightBatches{bedrock::kConsensusWindow};
     int maxPendingRequests{32768};
     int maxPendingBytes{16 * 1024 * 1024};
     // Optional transport injection for deterministic protocol tests. The

@@ -33,7 +33,7 @@ void Entity::submitClientRequest(const bedrock::ClientRequest& request) {
     }
 }
 
-void Entity::acceptClientRequest(const bedrock::ClientRequest& request, long long arrival) {
+void Entity::acceptClientRequest(bedrock::ClientRequest request, long long arrival) {
     const auto key = requestKey(request.client_id(), request.request_id());
     const auto bytes = request.ByteSizeLong() + 8;
     if (request.client_id().empty() || request.request_id() == 0 || request.operation().empty() ||
@@ -55,8 +55,10 @@ void Entity::acceptClientRequest(const bedrock::ClientRequest& request, long lon
     }
     PendingRequest pending;
     pending.clientId = request.client_id(); pending.requestId = request.request_id();
-    pending.wire = request; pending.bytes = bytes; pending.arrivalUs = arrival;
+    pending.bytes = bytes; pending.arrivalUs = arrival;
     pending.acceptedAt = Clock::now();
+    // Last use of request: everything read from it is already copied out.
+    pending.wire = std::move(request);
     if (!inViewChange) requestTimer_.track(key, pending.acceptedAt);
     pendingRequests_.emplace(key, std::move(pending));
     pendingBytes_ += bytes;
@@ -95,7 +97,7 @@ void Entity::proposalTick() {
     }
     requestsReceived_ += incoming.size();
     const auto admitStart = nowUs();
-    for (const auto& [request, arrival] : incoming) acceptClientRequest(request, arrival);
+    for (auto& [request, arrival] : incoming) acceptClientRequest(std::move(request), arrival);
     admitUs_ += static_cast<uint64_t>(nowUs() - admitStart);
     // Followers do not need an ordering queue. Rebuild it upon leadership.
     if (!isCurrentLeader()) {

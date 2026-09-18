@@ -140,7 +140,18 @@ Four replicas in network namespaces on one 32-core CloudLab host (`amd244.utah.c
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 5 ms | 500 ms | 39,806 to 39,918 | 151 ms | 205 ms | 244 ms | 4,300 | 101 of 101 | 0 |
 | 5 + 50 ms | 1,000 ms | 39,837 to 39,869 | 313 ms | 367 ms | 396 ms | 12,132 | 99 of 100 | 0 |
-| 5 + 150 ms | 500 to 8,000 ms | 29,668 to 37,450 | 660 to 1,200 ms | 1,671 to 9,650 ms | up to 10,000 ms | at the 32,768 cap | 13 to 34 of 100 | 1 to 3 |
+| 5 + 150 ms | 2,000 ms | 36,300 to 39,600 | 599 to 637 ms | 751 to 8,297 ms | - | 26,287 to the cap | 79 to 100 of 100 | 0 to 3 |
+
+A seventh fix, **not re-deriving what the leader just computed**, changed the 150 ms regime substantially. `proposeBatch` assembles a batch, digests it and signs it, then handed the envelope to the same path a proposal from the network takes, which verified the signature this replica had just produced and recomputed the digest over half a megabyte it had just hashed - about 87 ms of every second on the thread whose wall clock decides whether the cadence holds. An interleaved A/B on one host, alternating the commit in and out so drift could not bias it:
+
+| | TPS | p50 | p99 | full cadence | elections |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| leader skips its own re-derivation | 38,533 and 38,596 | 637 and 634 ms | 4,848 and 3,698 ms | 79 and 88 of 100 | 2 |
+| leader re-derives | 30,835 and 31,956 | 1,314 and 1,235 ms | 8,832 and 8,757 ms | 10 and 10 of 100 | 3 |
+
+Twenty-five percent more throughput and the cadence restored, from removing work that cost a tenth of the engine budget - because getting the tick back under its budget breaks the feedback loop rather than merely shaving it. A later pair of runs reached 39,438 and 39,602 TPS with no elections and 99 to 100 full-cadence seconds, so the target is now reachable in this regime; roughly half of runs still tip into the slow state during the transient when the injected delay steps up.
+
+Two further ideas were tried and removed because measurement did not support them. **Moving rather than copying** a request into the pending pool removes the middle of three protobuf copies, but an interleaved A/B could not resolve it: 36,317 and 39,438 TPS with the change against 39,602 and 38,382 without, a within-pair spread larger than the difference. **Enlarging the pending pool** fails in both directions: the runs that elect are the ones that reach the cap during the transient, but raising the cap to 49,152 gave 32,349, 34,811 and 32,418 TPS with three to five elections and all three runs reaching the new cap, and 131,072 gave 21,573 with ten. Reaching the cap is a symptom of a run that has already fallen into the slow state, not its cause; the extra depth only adds queueing delay on top.
 
 The first two regimes are reproducible across three runs each. **The 150 ms regime is not.** One run reached 39,737 TPS with no elections and has never reproduced: eight later runs across election timeouts of 500, 2,000, 3,000, 4,000 and 8,000 ms, pending caps of 32,768, 40,960 and 131,072, and batch caps of 4,096 and 8,192 all landed between 29,668 and 37,450 with one to three elections. The election timeout does not order the results - 2,000 ms beat 8,000 ms in one pair and lost to it in another - so the spread is run-to-run bistability rather than a timeout effect, and any single run in this regime is one sample of a wide distribution.
 

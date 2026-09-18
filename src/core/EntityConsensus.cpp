@@ -89,8 +89,10 @@ bool Entity::verifyControl(const json& msg) {
         options_.keysDir + "/server_" + std::to_string(sender) + "_public.pem");
 }
 
-bool Entity::validateProposal(const ProtocolEnvelope& env) {
-    if (!env.has_pre_prepare() || !verifyEnvelope(env)) return false;
+bool Entity::validateProposal(const ProtocolEnvelope& env, bool selfBuilt) {
+    // This replica signed a self-built proposal a moment ago; checking its own
+    // signature proves nothing it does not already know.
+    if (!env.has_pre_prepare() || (!selfBuilt && !verifyEnvelope(env))) return false;
     const auto& p = env.pre_prepare();
     if (p.type() != "PrePrepare" || p.message_sender_id() != leaderForView(p.view()) ||
         !p.operation().empty() || !p.timestamp().empty() || !p.client_id().empty() ||
@@ -101,7 +103,10 @@ bool Entity::validateProposal(const ProtocolEnvelope& env) {
     // digest, so the batch can be fetched from any peer and checked against
     // it. A partially filled body never is. Replicas vote and execute only
     // once the named batch is in hand (see advanceConsensus, drainExecution).
-    if (!bedrock::bodyMatchesDigest(env)) return p.requests_size() == 0;
+    // The digest of a self-built proposal was computed over this exact body in
+    // proposeBatch. Everything below still runs: the field, size and duplicate
+    // checks are what would catch an assembly mistake, and they are cheap.
+    if (!selfBuilt && !bedrock::bodyMatchesDigest(env)) return p.requests_size() == 0;
     // Reject a batch that names the same request twice, without allocating a
     // key per request: views into the batch's own bytes sort just as well, and
     // a batch holds thousands of requests.
@@ -274,22 +279,22 @@ void Entity::acceptProposal(const ProtocolEnvelope& env) {
     onPrePrepareAccepted(p.sequence(), p.view());
 }
 
-void Entity::handleConsensusEnvelope(const ProtocolEnvelope& env) {
+void Entity::handleConsensusEnvelope(const ProtocolEnvelope& env, bool selfBuilt) {
     const auto handleStart = nowUs();
-    handleEnvelope(env);
+    handleEnvelope(env, selfBuilt);
     handleUs_ += static_cast<uint64_t>(nowUs() - handleStart);
 }
 
-void Entity::handleEnvelope(const ProtocolEnvelope& env) {
+void Entity::handleEnvelope(const ProtocolEnvelope& env, bool selfBuilt) {
     if (inViewChange) return;
     ProtoMessage p(env);
     if (p.view() != currentView() || p.sequence() <= stableCheckpoint_ ||
         static_cast<int64_t>(p.sequence()) > static_cast<int64_t>(stableCheckpoint_) + bedrock::kConsensusWindow ||
-        !verifyEnvelope(env)) return;
+        (!selfBuilt && !verifyEnvelope(env))) return;
     const auto phase = p.explicit_type();
     if (env.has_pre_prepare()) {
         const auto validateStart = nowUs();
-        const bool valid = validateProposal(env);
+        const bool valid = validateProposal(env, selfBuilt);
         validateUs_ += static_cast<uint64_t>(nowUs() - validateStart);
         if (!valid) return;
         auto existing = consensusInstances_.find(p.sequence());

@@ -550,7 +550,7 @@ private:
     // Accepts a proposal header, and its batch when one is attached.
     // Evidence carries headers; voting and execution additionally require
     // the batch the header's digest names.
-    bool validateProposal(const bedrock::ProtocolEnvelope& env);
+    bool validateProposal(const bedrock::ProtocolEnvelope& env, bool selfBuilt = false);
     // The digest this replica is bound to for seq, from its own evidence.
     std::string digestFor(int seq) const;
     // Fills env's batch from a locally held copy when the digest matches.
@@ -565,8 +565,14 @@ private:
     bool validateCheckpoint(const nlohmann::json& proof);
     bool validateViewChange(const nlohmann::json& msg);
     nlohmann::json selectNewView(const nlohmann::json& changes, int view);
-    void handleConsensusEnvelope(const bedrock::ProtocolEnvelope& env);
-    void handleEnvelope(const bedrock::ProtocolEnvelope& env);
+    // selfBuilt marks the one envelope a replica did not receive: the proposal
+    // the leader assembled, digested and signed microseconds earlier in
+    // proposeBatch. Re-deriving a digest over half a megabyte it just produced,
+    // and verifying its own signature, cost 87 ms of every second on the thread
+    // that sets the proposal cadence. Every structural check still runs; only
+    // the two that re-derive what this replica computed are skipped.
+    void handleConsensusEnvelope(const bedrock::ProtocolEnvelope& env, bool selfBuilt = false);
+    void handleEnvelope(const bedrock::ProtocolEnvelope& env, bool selfBuilt);
     void handleConsensusControl(const nlohmann::json& msg);
     void advanceConsensus(int seq);
     void acceptProposal(const bedrock::ProtocolEnvelope& env);

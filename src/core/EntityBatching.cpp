@@ -178,7 +178,7 @@ void Entity::proposeBatch() {
     proposeUs_ += static_cast<uint64_t>(nowUs() - proposeStart);
     const auto delay = proposalDelay_->delayForProposal(nodeId, currentLeader(), peerIds_);
     if (delay.count() <= 0) {
-        handleConsensusEnvelope(env);
+        handleConsensusEnvelope(env, /*selfBuilt=*/true);
         sendProtocolToAll(env);
     } else {
         ++delayedProposals_;
@@ -186,7 +186,7 @@ void Entity::proposeBatch() {
         scheduler_.scheduleAfter(delay, [this, generation, env = std::move(env)] {
             std::lock_guard<std::recursive_mutex> lock(eventMtx);
             if (!running || generation != proposalGeneration_ || inViewChange || !isCurrentLeader()) return;
-            handleConsensusEnvelope(env);
+            handleConsensusEnvelope(env, /*selfBuilt=*/true);
             sendProtocolToAll(env);
         });
     }

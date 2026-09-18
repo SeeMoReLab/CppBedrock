@@ -111,6 +111,32 @@ bool ClientStreams::reply(const std::string& clientId, const ClientReply& reply)
     return true;
 }
 
+size_t ClientStreams::reply(const std::string& clientId, std::vector<ClientReply>& replies) {
+    if (replies.empty()) return 0;
+    std::shared_ptr<Stream> stream;
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = streams_.find(clientId);
+        if (it == streams_.end()) { dropped_ += replies.size(); return 0; }
+        stream = it->second;
+    }
+    const size_t count = replies.size();
+    {
+        std::lock_guard<std::mutex> lock(stream->writeMtx);
+        if (stream->closed) { dropped_ += count; return 0; }
+        if (stream->queue.size() + count >= 32768) {
+            dropped_ += stream->queue.size() + count;
+            stream->queue.clear(); stream->closed = true;
+            stream->context->TryCancel(); stream->cv.notify_one();
+            LOG_WARN("client reply queue full; closing stream " << clientId);
+            return 0;
+        }
+        for (auto& reply : replies) stream->queue.push_back(std::move(reply));
+    }
+    stream->cv.notify_one();
+    return count;
+}
+
 size_t ClientStreams::size() const {
     std::lock_guard<std::mutex> lock(mtx_);
     return streams_.size();

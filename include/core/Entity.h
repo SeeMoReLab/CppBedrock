@@ -228,6 +228,12 @@ public:
     // ---- balances (smallbank-style transfers) ----
     void updateBalances(const std::string& from, const std::string& to, int amount) {
         std::lock_guard<std::mutex> lock(balancesMutex);
+        applyTransfer(from, to, amount);
+    }
+
+    // Applies one transfer with balancesMutex already held, so executing a
+    // batch takes the lock once rather than once per transaction.
+    void applyTransfer(const std::string& from, const std::string& to, int amount) {
         if (balances.find(from) == balances.end()) balances[from] = 100;
         if (balances.find(to) == balances.end()) balances[to] = 100;
         balances[from] -= amount;

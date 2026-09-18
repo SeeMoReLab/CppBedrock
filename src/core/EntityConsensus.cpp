@@ -8,6 +8,7 @@
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 
 using json = nlohmann::json;
 using bedrock::ProtocolEnvelope;
@@ -101,12 +102,18 @@ bool Entity::validateProposal(const ProtocolEnvelope& env) {
     // it. A partially filled body never is. Replicas vote and execute only
     // once the named batch is in hand (see advanceConsensus, drainExecution).
     if (!bedrock::bodyMatchesDigest(env)) return p.requests_size() == 0;
-    std::unordered_set<std::string> requests;
+    // Reject a batch that names the same request twice, without allocating a
+    // key per request: views into the batch's own bytes sort just as well, and
+    // a batch holds thousands of requests.
+    std::vector<std::pair<std::string_view, uint64_t>> named;
+    named.reserve(p.requests_size());
     for (const auto& r : p.requests()) {
-        if (r.client_id().empty() || r.request_id() == 0 || r.operation().empty() || !r.has_transaction() ||
-            !requests.insert(requestKey(r.client_id(), r.request_id())).second) return false;
+        if (r.client_id().empty() || r.request_id() == 0 || r.operation().empty() || !r.has_transaction())
+            return false;
+        named.emplace_back(r.client_id(), r.request_id());
     }
-    return true;
+    std::sort(named.begin(), named.end());
+    return std::adjacent_find(named.begin(), named.end()) == named.end();
 }
 
 std::string Entity::digestFor(int seq) const {

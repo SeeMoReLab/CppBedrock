@@ -223,22 +223,40 @@ bool Entity::completeSequence(int seq, int path) {
         uint32_t executed = 0;
         std::vector<std::string> completed;
         completed.reserve(batch.requests_size() + 1);
-        for (const auto& r : batch.requests()) {
-            const auto key = requestKey(r.client_id(), r.request_id());
-            if (executedRequests_.insert(r.client_id(), r.request_id()).second) {
-                const auto& tx = r.transaction();
-                if (!tx.from().empty() && !tx.to().empty() && tx.amount() > 0)
-                    updateBalances(tx.from(), tx.to(), tx.amount());
-                ++executed;
+        // One reply queue per client and one balance-lock acquisition for the
+        // whole batch. Per-request replies cost a condition-variable wake each,
+        // which at thousands of requests per batch dominates execution.
+        std::unordered_map<std::string, std::vector<bedrock::ClientReply>> replies;
+        const int view = currentView();
+        const int leader = currentLeader();
+        {
+            std::lock_guard<std::mutex> balanceLock(balancesMutex);
+            for (const auto& r : batch.requests()) {
+                const auto key = requestKey(r.client_id(), r.request_id());
+                if (executedRequests_.insert(r.client_id(), r.request_id()).second) {
+                    const auto& tx = r.transaction();
+                    if (!tx.from().empty() && !tx.to().empty() && tx.amount() > 0)
+                        applyTransfer(tx.from(), tx.to(), tx.amount());
+                    ++executed;
+                }
+                auto pending = pendingRequests_.find(key);
+                if (pending != pendingRequests_.end()) {
+                    pendingBytes_ -= pending->second.bytes;
+                    pendingRequests_.erase(pending);
+                }
+                completed.push_back(key);
+                if (r.client_id().empty()) continue;
+                auto& reply = replies[r.client_id()].emplace_back();
+                reply.set_client_id(r.client_id());
+                reply.set_request_id(r.request_id());
+                reply.set_view(view);
+                reply.set_replica_id(nodeId);
+                reply.set_leader_id(leader);
+                reply.set_result("success");
             }
-            auto pending = pendingRequests_.find(key);
-            if (pending != pendingRequests_.end()) {
-                pendingBytes_ -= pending->second.bytes;
-                pendingRequests_.erase(pending);
-            }
-            completed.push_back(key);
-            replyToClient(r.client_id(), r.request_id(), "success");
         }
+        for (auto& [clientId, queue] : replies)
+            repliesSent_.fetch_add(clientStreams_.reply(clientId, queue));
         completed.push_back("seq:" + std::to_string(seq));
         requestTimer_.complete(completed);
         if (executed && !inViewChange) viewChangeBackoff_ = 0;

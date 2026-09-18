@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <grpcpp/grpcpp.h>
 #include "proto/bedrock.grpc.pb.h"
@@ -32,6 +33,11 @@ public:
     // Writes a reply on the client's stream. Returns false when the client
     // has no open stream on this replica.
     bool reply(const std::string& clientId, const ClientReply& reply);
+    // Queues a whole batch of replies for one client. An executed batch holds
+    // thousands of requests, and replying one at a time costs a mutex pair and
+    // a condition-variable wake each. Returns the number queued; the batch is
+    // consumed either way.
+    size_t reply(const std::string& clientId, std::vector<ClientReply>& replies);
     size_t size() const;
     uint64_t droppedReplies() const { return dropped_; }
 

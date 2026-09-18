@@ -118,13 +118,13 @@ void Entity::proposeBatch() {
     // Give ordinary ingress and each peer's reserved relay batch a turn.
     // A busy client queue cannot reject work already admitted by a backup;
     // a busy (or faulty) forwarding peer cannot starve ordinary ingress.
-    std::unordered_set<std::string> proposed;
-    // Executed batches stay in the log to serve catch-up, but their requests
-    // are already in executedRequests_. Only unexecuted proposals matter here.
-    if (!forwardedRequests_.empty())
-        for (auto it = batchIndex_.upper_bound(lastExecuted_); it != batchIndex_.end(); ++it)
-            for (const auto& request : it->second.requests())
-                proposed.insert(requestKey(request.client_id(), request.request_id()));
+    // Relayed requests are deduplicated against executedRequests_ and
+    // pendingRequests_, which between them already cover everything ordered or
+    // in flight, plus this set of the keys taken from relays during this tick
+    // so two peers relaying the same request cannot both place it. Scanning the
+    // log instead cost a heap-allocated key per in-flight request, on every
+    // tick for as long as any relay was outstanding.
+    std::unordered_set<std::string> relayed;
     for (int attempt = 0; attempt < committeeSize() &&
          proposal->requests_size() < options_.batchMaxRequests && bytes < static_cast<size_t>(options_.batchMaxBytes); ++attempt) {
         const int source = nextProposalSource_;
@@ -151,7 +151,7 @@ void Entity::proposeBatch() {
                 const auto& request = requests.front();
                 const auto key = requestKey(request.client_id(), request.request_id());
                 if (executedRequests_.count(request.client_id(), request.request_id()) ||
-                    pendingRequests_.count(key) || proposed.count(key)) {
+                    pendingRequests_.count(key) || relayed.count(key)) {
                     requests.pop_front(); continue;
                 }
                 const auto size = request.ByteSizeLong() + 8;
@@ -159,7 +159,7 @@ void Entity::proposeBatch() {
                 *proposal->add_requests() = request;
                 bytes += size;
                 ++relayedRequests_;
-                proposed.insert(key);
+                relayed.insert(key);
                 requests.pop_front();
             }
             if (requests.empty()) forwardedRequests_.erase(found);
@@ -203,32 +203,31 @@ void Entity::rebuildProposalQueue() {
 
 void Entity::forwardPendingRequests() {
     const auto watch = requestTimer_.watch();
-    if (!watch || !pendingRequests_.count(watch->key)) return;
+    if (!watch) return;
+    const auto watched = pendingRequests_.find(watch->key);
+    if (watched == pendingRequests_.end()) return;
+    // Relaying is a liveness measure against a leader that never received a
+    // request, not a data path: the client broadcasts, so the leader almost
+    // always holds it already. A proposal that carries the watched request
+    // settles the question outright - it is waiting its turn, and phase
+    // retransmission and certified recovery cover it from here.
+    if (watched->second.proposedInView == currentView()) return;
     const auto now = Clock::now();
-    // Relaying is a liveness measure against a leader that looks stuck, not
-    // a data path: the client broadcasts, so the leader almost always holds
-    // the request already. Wait a quarter of the election timeout, and relay
-    // a given watched entry once, retrying only if it stays stuck. Relaying
-    // on every tick sends a batch several times a second to a leader that is
+    // Otherwise give the leader a quarter of the election timeout, and relay a
+    // given watched entry once, retrying only if it stays stuck. Relaying on
+    // every tick sends a batch several times a second to a leader that is
     // already behind, which is how a slow leader becomes a stopped one.
     const auto grace = std::chrono::milliseconds(std::max(1, viewChangeTimeoutMs.load() / 4));
     if (now - watch->since < grace) return;
     const auto retry = std::chrono::milliseconds(std::max(1, viewChangeTimeoutMs.load() / 2));
     if (watch->key == lastForwardedKey_ && lastRequestForward_ != Clock::time_point{} &&
         now - lastRequestForward_ < retry) return;
-    // A known proposal already carries this request; phase retransmission and
-    // certified recovery handle it. Relay only requests the leader may lack.
-    std::unordered_set<std::string> proposed;
-    for (auto it = batchIndex_.upper_bound(lastExecuted_); it != batchIndex_.end(); ++it)
-        for (const auto& request : it->second.requests())
-            proposed.insert(requestKey(request.client_id(), request.request_id()));
-    if (proposed.count(watch->key)) return;
     bedrock::ProtocolEnvelope payload;
     auto* batch = payload.mutable_pre_prepare();
     size_t bytes = 0;
     for (const auto& key : requestTimer_.oldestKeys(options_.batchMaxRequests + bedrock::kConsensusWindow)) {
         const auto found = pendingRequests_.find(key);
-        if (found == pendingRequests_.end() || proposed.count(key)) continue;
+        if (found == pendingRequests_.end() || found->second.proposedInView == currentView()) continue;
         if (bytes + found->second.bytes > static_cast<size_t>(options_.batchMaxBytes) ||
             batch->requests_size() >= options_.batchMaxRequests) break;
         *batch->add_requests() = found->second.wire;

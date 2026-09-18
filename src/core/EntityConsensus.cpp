@@ -261,6 +261,15 @@ void Entity::acceptProposal(const ProtocolEnvelope& env) {
         phaseTs_preprepare.emplace(p.sequence(), nowUs());
         firstSeenUs.emplace(p.sequence(), nowUs());
     }
+    // Mark the requests this batch carries as in flight, exactly as a fetched
+    // body does. Without it a replica cannot tell a request waiting its turn
+    // in the leader's queue from one the leader never received, and both the
+    // relay path and the next proposal answered that question by scanning the
+    // whole log and building a key per in-flight request.
+    for (const auto& r : p.requests()) {
+        auto pending = pendingRequests_.find(requestKey(r.client_id(), r.request_id()));
+        if (pending != pendingRequests_.end()) pending->second.proposedInView = p.view();
+    }
     entityInfo["sequence"] = std::max(entityInfo["sequence"].get<int>(), p.sequence());
     onPrePrepareAccepted(p.sequence(), p.view());
 }

@@ -447,6 +447,12 @@ private:
     std::atomic<uint64_t> fastPathTotal_{0};
     std::atomic<uint64_t> slowPathTotal_{0};
     std::atomic<uint64_t> delayedProposals_{0};
+    // Relaying is how a request a backup holds but the leader does not reaches
+    // the leader. If a watched request starves while these stay flat, the
+    // watchdog is suspecting a leader that was never given the request.
+    std::atomic<uint64_t> relaysSent_{0};      // relay batches this replica sent to the leader
+    std::atomic<uint64_t> relaysAccepted_{0};  // relay batches this replica accepted as leader
+    std::atomic<uint64_t> relayedRequests_{0}; // requests taken from relays into a proposal
     // Engine CPU accounting, reported as per-second microseconds in Stats.
     // Consensus batches amortize messages, not per-request work, so this is
     // where a batching throughput ceiling becomes visible.

@@ -158,6 +158,7 @@ void Entity::proposeBatch() {
                 if (bytes + size > static_cast<size_t>(options_.batchMaxBytes)) break;
                 *proposal->add_requests() = request;
                 bytes += size;
+                ++relayedRequests_;
                 proposed.insert(key);
                 requests.pop_front();
             }
@@ -236,6 +237,7 @@ void Entity::forwardPendingRequests() {
     if (batch->requests().empty()) return;
     lastRequestForward_ = now;
     lastForwardedKey_ = watch->key;
+    ++relaysSent_;
     LOG_DEBUG("relaying " << batch->requests_size() << " pending requests to leader " << currentLeader()
               << " (watched " << watch->key << " for "
               << std::chrono::duration_cast<std::chrono::milliseconds>(now - watch->since).count() << " ms)");
@@ -264,5 +266,8 @@ void Entity::acceptForwardedRequests(const nlohmann::json& message) {
         if (!executedRequests_.count(request.client_id(), request.request_id()) &&
             !pendingRequests_.count(key)) requests.push_back(request);
     }
-    if (!requests.empty()) forwardedRequests_.emplace(sender, std::move(requests));
+    if (!requests.empty()) {
+        ++relaysAccepted_;
+        forwardedRequests_.emplace(sender, std::move(requests));
+    }
 }

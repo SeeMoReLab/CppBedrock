@@ -1,18 +1,15 @@
-#include "../../include/core/TimeKeeper.h"
-#include <iostream>
-#include <chrono>
-#include <mutex>
-#include <thread>
+#include "core/TimeKeeper.h"
 
-TimeKeeper::TimeKeeper(int timeoutMs, Callback cb)
-    : timeoutMs(timeoutMs), callback(cb) {}
+#include <algorithm>
+
+TimeKeeper::TimeKeeper(const std::atomic<int>& timeoutMs, Callback cb)
+    : timeoutMs(timeoutMs), callback(std::move(cb)) {}
 
 TimeKeeper::~TimeKeeper() {
     stop();
 }
 
 void TimeKeeper::start() {
-    // std::cout << "[TimeKeeper] Starting timer with timeout: " << timeoutMs << " ms" << std::endl;   
     std::lock_guard<std::mutex> lock(mtx);
     if (running) return;
     running = true;
@@ -20,12 +17,10 @@ void TimeKeeper::start() {
 }
 
 void TimeKeeper::reset() {
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        if (!running) return;
-        resetFlag = true;
-        cv.notify_one();
-    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (!running) return;
+    resetFlag = true;
+    cv.notify_one();
 }
 
 void TimeKeeper::stop() {
@@ -38,11 +33,9 @@ void TimeKeeper::stop() {
         cv.notify_all();
         should_join = timerThread.joinable();
     }
-    
     if (should_join) {
         timerThread.join();
     }
-    
 }
 
 void TimeKeeper::run() {
@@ -51,26 +44,23 @@ void TimeKeeper::run() {
 
     while (running) {
         resetFlag = false;
-
+        const int waitMs = std::max(1, timeoutMs.load());
         auto status = cv.wait_for(lock,
-            std::chrono::milliseconds(timeoutMs),
+            std::chrono::milliseconds(waitMs),
             [this] { return resetFlag || !running; });
 
         if (!running) break;
-        if (status) continue;
+        if (status) continue;  // reset: re-arm with the current timeout
 
         if (running && cbCopy) {
             lock.unlock();
-
-            // Offload callback to a detached thread
+            // Offload the callback so a slow handler never blocks the timer.
             std::thread([cbCopy]() {
                 try {
                     cbCopy();
                 } catch (const std::exception&) {
-                    // Optionally log error
                 }
             }).detach();
-
             lock.lock();
             if (!running) break;
         }

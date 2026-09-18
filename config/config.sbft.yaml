@@ -1,72 +1,16 @@
+# SBFT uses the authenticated engine in EntityConsensus.cpp.
+# Phase prerequisites and quorum thresholds are protocol invariants in C++.
+# YAML configures timers and the client entry point only.
 protocol: SBFT
-metrics:
-  window_size: 100
 timers:
   view_change_ms: 8000
   fast_path_wait_ms: 20
-# Learning-agent integration (wall-clock learning cycle).
-# Each episode: collect features for feature_duration_ms, wait reply_wait_ms
-# for the agent's recommendation, apply it and discard warmup_duration_ms,
-# then collect the reward for reward_duration_ms.
-agent:
-  enabled: false
-  ports:
-    1: 50100
-    2: 50101
-    3: 50102
-    4: 50103
-  feature_duration_ms: 8000
-  reply_wait_ms: 2000
-  warmup_duration_ms: 2000
-  reward_duration_ms: 8000
-  poll_interval_ms: 50
-  rpc_timeout_ms: 500
 phases:
   Request:
-    quorum: 1
     next_state: PrePrepare
     actions:
-      - verifySignature:
-          public_key: "../keys/${client_id}_public.pem"
-      - "handleClientRequestAsLeader"
-  PrePrepare:
-    quorum: 1
-    next_state: prepare
-    actions:
-      - "storeMessage"
-      - "startTimer"
-      - "verifyPBFTConditions"
-      - "unicastifParticipant"
-  prepare:
-    quorum: 2f
-    next_state: commit
-    actions:
-      - "storeMessage"
-      - "checkQuorumForSBFT"
-      - "resetTimer"
-      - "broadcastifLeader"
-      - "unicastifParticipant"
-  commit:
-    quorum: 2f
-    next_state: Request
-    actions:
-      - "storeMessage"
-      - "checkQuorumForSBFT"
-      - "stopTimer"
-      - "broadcastifLeader"
-      - "complete"
-  ViewChange:
-    quorum: 2f
-    next_state: Request
-    actions:
-      - "handleViewChange"
-  NewView:
-    quorum: 1
-    next_state: Request
-    actions:
-      - "handleNewView"
+      - "handleClientRequest"
   QueryBalances:
-    quorum: 1
     next_state: Request
     actions:
       - "queryBalances"

@@ -2,6 +2,8 @@
 
 #include "CryptoProvider.h"
 #include <string>
+#include <mutex>
+#include <unordered_map>
 
 class OpenSSLCryptoProvider : public CryptoProvider {
 public:
@@ -12,5 +14,7 @@ public:
     bool verify(const std::string& data, const std::string& signature, const std::string& pubkey) override;
 
 private:
+    std::mutex keysMutex_;
+    std::unordered_map<std::string, void*> publicKeys_;
     void* pkey; // EVP_PKEY*, opaque to avoid OpenSSL headers in .h
 };

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package bedrock;
 
+// Legacy JSON carrier for the message types that have no typed envelope
+// (view change, new view, fill-hole, HotStuff/Zyzzyva extras).
 message RawJson {
   string json = 1;
 }
@@ -12,27 +14,42 @@ message Transaction {
   int32 amount = 3;
 }
 
-// New lightweight aggregated message for quorum piggyback
+// Aggregated vote carried inside a leader's prepare/commit broadcast.
 message AggregatedMessage {
   int32 view = 1;
   int32 sequence = 2;
   string digest = 3;
   int32 message_sender_id = 4;
   string signature = 5;
-  int32 client_listen_port = 6;
-  string clientid = 7;
+  string client_id = 6;
+  uint64 request_id = 7;
   string timestamp = 8;
   Transaction transaction = 9;
 }
 
+// One client request on a client stream. request_id 0 with operation
+// "hello" registers the stream for replies without entering consensus.
 message ClientRequest {
-  string message_sender_id = 1;
-  string timestamp = 2;
-  Transaction transaction = 3;
-  int32 view = 4;
+  string client_id = 1;
+  uint64 request_id = 2;
+  string timestamp = 3;
+  Transaction transaction = 4;
   string operation = 5;
-  int32 client_listen_port = 6;
-  string signature = 7;
+  string signature = 6;
+}
+
+// One replica's reply for a committed request, delivered on the stream the
+// client opened to that replica. leader_id is the replica's current leader,
+// which lets the client follow leadership changes.
+message ClientReply {
+  string client_id = 1;
+  uint64 request_id = 2;
+  int32 view = 3;
+  int32 replica_id = 4;
+  int32 leader_id = 5;
+  string result = 6;
+  // v3 transport coalescing: when nonempty, these IDs share this result.
+  repeated uint64 request_ids = 7;
 }
 
 message PrePrepare {
@@ -40,14 +57,17 @@ message PrePrepare {
   int32  sequence           = 2;
   string operation          = 3;
   string timestamp          = 4;
-  int32  client_listen_port = 5;
-  Transaction transaction   = 6;
-  string signature          = 7;
-  int32  message_sender_id  = 8;
-  string client_id          = 9;
+  string client_id          = 5;
+  uint64 request_id         = 6;
+  Transaction transaction   = 7;
+  string signature          = 8;
+  int32  message_sender_id  = 9;
   repeated AggregatedMessage combined_messages = 10;
   string qc = 11;
-  string type = 12; // NEW: mirrors JSON "type" (e.g., "PrePrepare")
+  string type = 12; // mirrors the JSON "type" (e.g. "PrePrepare")
+  // PBFT/SBFT v3: one ordered batch per sequence. The singular request
+  // fields above are used only by legacy protocols. Empty means a no-op.
+  repeated ClientRequest requests = 13;
 }
 
 message Prepare {
@@ -57,7 +77,7 @@ message Prepare {
   int32  message_sender_id  = 4;
   repeated AggregatedMessage combined_messages = 5;
   string qc = 6;
-  string type = 7; // NEW
+  string type = 7;
 }
 
 message Commit {
@@ -67,7 +87,9 @@ message Commit {
   int32  message_sender_id  = 4;
   repeated AggregatedMessage combined_messages = 5;
   string qc = 6;
-  string type = 7; // NEW
+  string type = 7;   // "commit", "commitAck", or "execute" for SBFT
+  // SBFT: the certificate holds shares from all n replicas (fast path).
+  bool fast_path = 8;
 }
 
 message ProtocolEnvelope {
@@ -76,6 +98,10 @@ message ProtocolEnvelope {
     Prepare prepare = 2;
     Commit commit = 3;
   }
+  // PBFT/SBFT v3: digest binds the ordered batch; signature covers
+  // the entire envelope (with signature cleared), including certificates.
+  string digest = 10;
+  string signature = 11;
 }
 
 message Ack {
@@ -84,12 +110,13 @@ message Ack {
 }
 
 service Node {
-  // Existing raw JSON endpoint (kept for other scenarios)
+  // Replica-to-replica JSON messages (view change and protocol extras).
   rpc SendRawJson (RawJson) returns (RawJson);
 
-  // New typed endpoint used by scenario 4
-  rpc SubmitRequest (ClientRequest) returns (Ack);
-
-  // New typed inter-node RPC for basic phases
+  // Replica-to-replica typed messages for the basic phases.
   rpc SendProtocol (ProtocolEnvelope) returns (Ack);
+
+  // Client-to-replica stream: requests flow in, replies for committed
+  // requests flow back on the same stream.
+  rpc ClientStream (stream ClientRequest) returns (stream ClientReply);
 }

@@ -1,71 +1,15 @@
+# PBFT uses the authenticated engine in EntityConsensus.cpp.
+# Phase prerequisites and quorum thresholds are protocol invariants in C++.
+# YAML configures timers and the client entry point only.
 protocol: PBFT
 timers:
   view_change_ms: 8000
-
-# Learning-agent integration (wall-clock learning cycle).
-# Each episode: collect features for feature_duration_ms, wait reply_wait_ms
-# for the agent's recommendation, apply it and discard warmup_duration_ms,
-# then collect the reward for reward_duration_ms.
-agent:
-  enabled: false
-  ports:
-    1: 50100
-    2: 50101
-    3: 50102
-    4: 50103
-  feature_duration_ms: 8000
-  reply_wait_ms: 2000
-  warmup_duration_ms: 2000
-  reward_duration_ms: 8000
-  poll_interval_ms: 50
-  rpc_timeout_ms: 500
 phases:
   Request:
-    quorum: 1
     next_state: PrePrepare
     actions:
-      - verifySignature:
-          public_key: "../keys/${client_id}_public.pem"
-      - "handleClientRequestAsLeader"
-  PrePrepare:
-    quorum: 1
-    next_state: prepare
-    actions:
-      - "startTimer"
-      - "storeMessage"
-      - verifySignature:
-          public_key: "../keys/server_${client_id}_public.pem"
-      - "verifyPBFTConditions"
-      - "broadcast"
-  prepare:
-    quorum: 2f
-    next_state: commit
-    actions:
-      - "storeMessage"
-      - "checkQuorum"
-      - "resetTimer"
-      - "broadcast"
-  commit:
-    quorum: 2f
-    next_state: Request
-    actions:
-      - "storeMessage"
-      - "checkQuorum"
-      - "stopTimer"
-      - "complete"
-  ViewChange:
-    quorum: 2f
-    next_state: Request
-    actions:
-      - "handleViewChange"
-  NewView:
-    quorum: 1
-    next_state: Request
-    actions:
-      - "handleNewView"
-
+      - "handleClientRequest"
   QueryBalances:
-    quorum: 1
     next_state: Request
     actions:
       - "queryBalances"

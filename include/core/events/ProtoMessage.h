@@ -24,7 +24,7 @@ public:
                     {"to", m.transaction().to()},
                     {"amount", m.transaction().amount()}
                 }},
-                {"client_listen_port", m.client_listen_port()},
+                {"request_id", m.request_id()},
                 {"signature", m.signature()},
                 {"client_id", m.client_id()},
                 {"message_sender_id", m.message_sender_id()}
@@ -85,9 +85,9 @@ public:
     }
 
     // PrePrepare-only
-    int client_listen_port() const {
-        if (envelope_.has_pre_prepare()) return envelope_.pre_prepare().client_listen_port();
-        return -1;
+    uint64_t request_id() const {
+        if (envelope_.has_pre_prepare()) return envelope_.pre_prepare().request_id();
+        return 0;
     }
     std::string timestamp() const {
         if (envelope_.has_pre_prepare()) return envelope_.pre_prepare().timestamp();
@@ -120,6 +120,9 @@ public:
         return "";
     }
 
+    // SBFT: certificate carries all n shares (Commit only).
+    bool fastPath() const { return envelope_.has_commit() && envelope_.commit().fast_path(); }
+
     const bedrock::ProtocolEnvelope& envelope() const { return envelope_; }
 
     bool execute(Entity*, const Message*, EntityState*) override { return true; }
@@ -145,6 +148,8 @@ public:
             j["operation"] = operation();
             j["message_sender_id"] = sender_id();
             j["timestamp"] = timestamp();
+            j["client_id"] = client_id();
+            j["request_id"] = request_id();
             if (has_tx()) {
                 j["transaction"] = {
                     {"from", tx_from()},
@@ -164,7 +169,8 @@ public:
                     fm["view"] = am.view();
                     fm["sequence"] = am.sequence();
                     fm["message_sender_id"] = am.message_sender_id();
-                    fm["client_listen_port"] = am.client_listen_port();
+                    fm["client_id"] = am.client_id();
+                    fm["request_id"] = am.request_id();
                     fm["timestamp"] = am.timestamp();
                     if (am.has_transaction()) {
                         fm["transaction"] = {
@@ -183,7 +189,8 @@ public:
                     fm["view"] = am.view();
                     fm["sequence"] = am.sequence();
                     fm["message_sender_id"] = am.message_sender_id();
-                    fm["client_listen_port"] = am.client_listen_port();
+                    fm["client_id"] = am.client_id();
+                    fm["request_id"] = am.request_id();
                     fm["timestamp"] = am.timestamp();
                     if (am.has_transaction()) {
                         fm["transaction"] = {

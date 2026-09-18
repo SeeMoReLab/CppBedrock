@@ -2,6 +2,7 @@
 #include "../../../include/core/events/BaseEvent.h"
 #include "../../../include/core/Entity.h"
 #include "../../../include/core/events/ProtoMessage.h"
+#include "core/Log.h"
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <algorithm>
@@ -121,7 +122,7 @@ public:
         int currentView = entity->entityInfo["view"].get<int>();
         currentView += 1;
         entity->entityInfo["view"] = currentView;
-        int nextLeader = (currentView + 1) % entity->peerPorts.size();
+        int nextLeader = entity->leaderForView(currentView);
 
         // Fast path: proto envelope (PrePrepare used as carrier with type="NewViewforHotstuff")
         bedrock::ProtocolEnvelope env;
@@ -155,26 +156,12 @@ public:
                     entity->updateSpeculativeBalances(from, to, amount);
                     entity->appendSpeculativeEntry(seq, txnId, from, to, amount);
                     entity->markSpeculativeTransactionExecuted(txnId);
-                    std::cout << "[Node " << entity->getNodeId() << "] SPECULATIVE Transaction: "
-                              << from << " -> " << to << " : " << amount
-                              << " Sequence: " << seq << std::endl;
+                    LOG_DEBUG("SPECULATIVE Transaction: " << from << " -> " << to << " : " << amount
+                              << " Sequence: " << seq);
                 }
             }
             entity->markOperationProcessed(seq);
-            // Reply to client (JSON wire) for now
-            int clientPort = p->client_listen_port();
-            if (clientPort > 0) {
-                nlohmann::json response{
-                    {"type","Response"},
-                    {"view", p->view()},
-                    {"sequence", p->sequence()},
-                    {"timestamp", p->timestamp()},
-                    {"message_sender_id", entity->getNodeId()},
-                    {"result","speculative"}
-                };
-                Message BalancesReply(response.dump());
-                entity->sendTo(clientPort - 5000, BalancesReply);
-            }
+            entity->replyToClient(p->client_id(), p->request_id(), "speculative");
             return true;
         }
         auto j = nlohmann::json::parse(message->getContent());
@@ -207,31 +194,14 @@ public:
                     entity->updateSpeculativeBalances(from, to, amount);
                     entity->appendSpeculativeEntry(seq, txnId, from, to, amount); // NEW: log it
                     entity->markSpeculativeTransactionExecuted(txnId);
-                    std::cout << "[Node " << entity->getNodeId() << "] SPECULATIVE Transaction: "
-                              << from << " -> " << to << " : " << amount
-                              << " Sequence: " << seq << std::endl;
+                    LOG_DEBUG("SPECULATIVE Transaction: " << from << " -> " << to << " : " << amount
+                              << " Sequence: " << seq);
                 }
             }
         }
 
         entity->markOperationProcessed(seq);
-
-        // Send speculative response to client
-        if (j.contains("client_listen_port")) {
-            int clientPort = j.value("client_listen_port", -1);
-            nlohmann::json response;
-            response["type"] = "Response";
-            response["view"] = j.value("view", -1);
-            response["sequence"] = seq;
-            response["timestamp"] = j.value("timestamp", "");
-            response["message_sender_id"] = entity->getNodeId();
-            response["result"] = "speculative";
-            response["clientid"] = j.value("clientid", "");
-            Message BalancesReply(response.dump());
-            if (clientPort != -1) {
-                entity->sendTo(clientPort - 5000, BalancesReply);
-            }
-        }
+        entity->replyToClient(j.value("client_id", std::string()), j.value("request_id", (uint64_t)0), "speculative");
         return true;
     }
 };
@@ -248,7 +218,7 @@ public:
                 s = entity->findSeqByTxnId(txnId);
             }
             if (s < 0) {
-                std::cout << "[Node " << entity->getNodeId() << "] CommitCertificateEvent(proto): missing sequence, ignoring\n";
+                LOG_WARN("CommitCertificateEvent(proto): missing sequence, ignoring");
                 return false;
             }
             // Commit all entries with seq ≤ s
@@ -271,19 +241,8 @@ public:
             }
             entity->committedSeq = std::max(entity->committedSeq, s);
             entity->rebuildSpeculativeBalancesFromLog();
-            // Optional client ack (JSON wire)
-            int clientPort = p->client_listen_port();
-            if (clientPort > 0) {
-                nlohmann::json resp{
-                    {"type","Response"},
-                    {"sequence", s},
-                    {"timestamp", txnId},
-                    {"message_sender_id", entity->getNodeId()}
-                };
-                Message ack(resp.dump());
-                entity->sendTo(clientPort - 5000, ack);
-            }
-            std::cout << "[Node " << entity->getNodeId() << "] Committed up to seq " << s << " (slow-path)\n";
+            entity->replyToClient(p->client_id(), p->request_id(), "committed");
+            LOG_DEBUG("Committed up to seq " << s << " (slow-path)");
             return true;
         }
         auto j = nlohmann::json::parse(message->getContent());
@@ -294,7 +253,7 @@ public:
             s = entity->findSeqByTxnId(txnId);
         }
         if (s < 0) {
-            std::cout << "[Node " << entity->getNodeId() << "] CommitCertificateEvent: missing sequence, ignoring\n";
+            LOG_WARN("CommitCertificateEvent: missing sequence, ignoring");
             return false;
         }
 
@@ -321,21 +280,8 @@ public:
         // 2) Rebuild speculative balances from remaining suffix
         entity->rebuildSpeculativeBalancesFromLog();
 
-        // Optional: ack client
-        if (j.contains("client_listen_port")) {
-            int clientPort = j.value("client_listen_port", -1);
-            if (clientPort != -1) {
-                nlohmann::json resp{
-                    {"type","Response"},
-                    {"sequence", s},
-                    {"timestamp", txnId},
-                    {"message_sender_id", entity->getNodeId()}
-                };
-                Message ack(resp.dump());
-                entity->sendTo(clientPort - 5000, ack);
-            }
-        }
-        std::cout << "[Node " << entity->getNodeId() << "] Committed up to seq " << s << " (slow-path)\n";
+        entity->replyToClient(j.value("client_id", std::string()), j.value("request_id", (uint64_t)0), "committed");
+        LOG_DEBUG("Committed up to seq " << s << " (slow-path)");
         return true;
     }
 };
@@ -356,10 +302,7 @@ public:
         if (!seen) arr.push_back(j);
 
         // if I'm new leader and have 2f+1 reports, compute safe log per Zyzzyva rules
-        int n = static_cast<int>(entity->peerPorts.size());
-        if (n == 0) return true;
-        int leaderId = entity->peerPorts[view % n];
-        if (entity->getNodeId() != leaderId) return true;
+        if (!entity->isLeaderForView(view)) return true;
 
         int f = entity->f;
         if (static_cast<int>(arr.size()) < 2 * f + 1) return true;
@@ -417,9 +360,8 @@ public:
         };
         Message out(nv.dump());
         entity->sendToAll(out);
-        std::cout << "[Node " << entity->getNodeId() << "] NewView(view=" << view
-                  << ") committed_seq=" << safeCommitted
-                  << " selected_log_len=" << selectedLog.size() << std::endl;
+        LOG_INFO("NewView(view=" << view << ") committed_seq=" << safeCommitted
+                 << " selected_log_len=" << selectedLog.size());
         return true;
     }
 };
@@ -435,6 +377,7 @@ public:
         int s = j.value("committed_seq", entity->committedSeq);
         entity->entityInfo["view"] = view;
         entity->inViewChange = false;
+        LOG_INFO("installed view " << view << " (leader " << entity->leaderForView(view) << ")");
 
         // 1) Commit prefix ≤ s
         std::vector<int> toErase;
@@ -482,8 +425,7 @@ public:
         // 3) Rebuild speculative balances for suffix > committedSeq
         entity->rebuildSpeculativeBalancesFromLog();
 
-        std::cout << "[Node " << entity->getNodeId() << "] Installed NewView " << view
-                  << ", committed up to " << s << ", speculative suffix rebuilt\n";
+        LOG_INFO("Installed NewView " << view << ", committed up to " << s << ", speculative suffix rebuilt");
         return true;
     }
 };

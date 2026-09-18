@@ -1,44 +1,50 @@
 #pragma once
 
+// One replica per process. PBFT/SBFT use an authenticated, explicit consensus
+// engine (EntityConsensus.cpp), certified view changes (EntityViewChange.cpp),
+// and checkpoint/state transfer (EntityRecovery.cpp). Their YAML files configure
+// timers. Legacy protocols still use EventFactory's YAML actions.
+// All protocol state changes run under engineMutex().
+
 #include "events/EventHandler.h"
 #include "events/BaseEvent.h"
-#include "state/StateMachine.h"
 #include "state/DataSet.h"
 #include "state/EntityState.h"
-#include "pipeline/Pipeline.h"
-#include "../coordination/connections/TcpConnection.h"
-#include <vector>
-#include <memory>
-#include <yaml-cpp/yaml.h>
+#include "Committee.h"
+#include "Consensus.h"
+#include "ExecutedRequests.h"
+#include "FailureSpec.h"
+#include "PendingRequestTimer.h"
+#include "TaskScheduler.h"
+#include "TimeKeeper.h"
+#include "agent/AgentClient.h"
+#include "crypto/CryptoProvider.h"
+#include "net/AsyncSender.h"
+#include "net/ClientStreams.h"
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <cstdint>
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include <set>
-#include <thread>
-#include <nlohmann/json.hpp>
-#include <map>
-#include "TimeKeeper.h"
-#include <atomic>
-#include "crypto/CryptoProvider.h"
-#include "crypto/OpenSSLCryptoProvider.h"
-#include "crypto/CryptoUtils.h"
-#include "utils/Benchmark.h"
-#include <string>
-#include <mutex>
-#include <iostream>
-#include <memory>
-#include <thread>
+#include <vector>
+
 #include <grpcpp/grpcpp.h>
+#include <nlohmann/json.hpp>
+#include <yaml-cpp/yaml.h>
 #include "proto/bedrock.grpc.pb.h"
 #include "proto/bedrock.pb.h"
-#include "agent/AgentClient.h"
-#include <functional> // For std::hash
-#include <chrono>
 
-// grpc::Server comes from <grpcpp/grpcpp.h> above; do not forward-declare it
-// (older gRPC defines it as a typedef, which a class forward-declaration breaks).
 class NodeServiceImpl;
-
 class Event;
 class Message;
 
@@ -48,7 +54,7 @@ struct ProtocolMessageRecord {
     std::string operation;
     std::string phase;         // e.g., "prepare", "commit"
     std::string protocolName;  // e.g., "Hotstuff"
-    std::map<std::string, std::string> customData; // default: empty
+    std::map<std::string, std::string> customData;
     ProtocolMessageRecord(int s, int sid, const std::string& op, const std::string& ph, const std::string& proto,
                          const std::map<std::string, std::string>& custom = {})
         : seq(s), senderId(sid), operation(op), phase(ph), protocolName(proto), customData(custom) {}
@@ -63,116 +69,199 @@ struct ViewChangeData {
     nlohmann::json locked_qc;
 };
 
-// Custom hash function for std::pair
-struct PairHash {
-    template <typename T1, typename T2>
-    std::size_t operator()(const std::pair<T1, T2>& pair) const {
-        return std::hash<T1>()(pair.first) ^ (std::hash<T2>()(pair.second) << 1);
-    }
+struct EntityOptions {
+    int nodeId{-1};
+    std::string committeePath;
+    std::string protocolConfigPath;
+    std::string keysDir;
+    // Learning agent; 0 disables the agent client.
+    int agentPort{0};
+    AgentClientConfig agentConfig;
+    // Initial timeouts; 0 means "take the protocol config's timers value".
+    int initialElectionTimeoutMs{0};
+    int initialSlowPathTimeoutMs{0};
+    // Shared failure_spec.xml; the replica reads only its protocol's section
+    // (<pbft>, <sbft>, ...) for proposal-delay injection. Empty disables it.
+    // failureStartUnixMs anchors the spec's phases (harness start_unix_ms).
+    std::string failureSpecPath;
+    std::uint64_t failureStartUnixMs{0};
+    // Period of the "Stats" log line; 0 disables it.
+    int statsIntervalMs{1000};
+    // PBFT/SBFT require this to be true: all replica messages are signed.
+    bool proposalSigning{true};
+    int proposalIntervalMs{100};
+    int batchMaxRequests{8192};
+    int batchMaxBytes{512 * 1024};
+    int maxInflightBatches{4};
+    int maxPendingRequests{32768};
+    int maxPendingBytes{16 * 1024 * 1024};
+    // Optional transport injection for deterministic protocol tests. The
+    // callbacks enqueue delivery; they must not re-enter another replica.
+    std::function<void(int, const bedrock::ProtocolEnvelope&)> protocolTransport;
+    std::function<void(int, const std::string&)> controlTransport;
 };
 
 class Entity : public EventHandler<EntityState> {
-    friend class Event; // <-- Add this line
+    friend class Event;
 public:
-    Entity(const std::string& role, int id, const std::vector<int>& peers, bool byzantine = false);
-    ~Entity(); // <-- Add this line
-    void start(); // ensure you call startGrpcServer() inside
-    void stop();  // ensure you call stopGrpcServer() inside
+    using Clock = std::chrono::steady_clock;
+
+    explicit Entity(const EntityOptions& options);
+    ~Entity();
+
+    void start();
+    void stop();
     void handleEvent(const Event* event, EntityState* context) override;
     EntityState& getState();
-    void sendToAll(const Message& message);
-    void sendTo(int peerId, const Message& message);
-    void processMessages();
-    void loadProtocolConfig(const std::string& configFile);
 
+    // ---- identity and committee ----
     int getNodeId() const { return nodeId; }
     int getF() const { return f; }
-    int getView() const { return _entityState.getView(); }
-    void storePrepareMessage(int nodeId, int sequence);
-    void storeCommitMessage(int nodeId, int sequence);
-    void storePrePrepareMessage(int nodeId, int sequence);
-    void storePrePrepareMessage(int nodeId, int sequence, const std::string& operation);
-    void storePrepareMessage(int nodeId, int sequence, const std::string& operation);
-    void storeCommitMessage(int nodeId, int sequence, const std::string& operation);
-    int getPrepareCount(int sequence) const;
-    int getCommitCount(int sequence) const;
-    int getPrePrepareCount(int sequence) const;
-    void printDataStore();
-    void printCommittedMessages();
-    void loadOrInitDataset();
-    void initiateViewChange();
-    void updateEntityInfoField(const std::string& key, const nlohmann::json& value);
-    
-    void saveEntityInfo();
-    // Protocol config access
-    //const YAML::Node& getPhaseConfig(const std::string& phase) const;
+    int committeeSize() const { return committee_.size(); }
+    const std::vector<int>& peerIds() const { return peerIds_; }
+    int currentView() const { return entityInfo["view"].get<int>(); }
+    int leaderForView(int view) const { return committee_.leaderForView(view); }
+    int currentLeader() const { return leaderForView(currentView()); }
+    bool isLeaderForView(int view) const { return leaderForView(view) == nodeId; }
+    bool isCurrentLeader() const { return currentLeader() == nodeId; }
+    const std::string& protocolName() const { return protocolName_; }
+    bool proposalSigning() const { return options_.proposalSigning; }
+    // True for the protocols that use the shared PBFT request timer, view
+    // change, and request buffering (PBFT and SBFT).
+    bool usesPbftCore() const { return pbftCore_; }
+
+    // ---- replica-to-replica messaging ----
+    void sendToAll(const Message& message);
+    void sendTo(int peerId, const Message& message);
+    void processProtocolEnvelope(const bedrock::ProtocolEnvelope& env);
+    void sendProtocolToAll(const bedrock::ProtocolEnvelope& env);
+    void sendProtocolTo(int peer, const bedrock::ProtocolEnvelope& env);
+    // Accept a JSON message coming via gRPC and route it through the handler.
+    bool processJsonFromGrpc(const std::string& json);
+    // Serializes every state-machine transition; taken by handleEvent and by
+    // the threads (request timer, scheduler) that mutate protocol state.
+    // Recursive because handlers re-enter the engine (e.g. the leader
+    // processes its own broadcast inline).
+    std::recursive_mutex& engineMutex() { return eventMtx; }
+
+    // ---- client replies ----
+    bedrock::ClientStreams& clientStreams() { return clientStreams_; }
+    void replyToClient(const std::string& clientId, uint64_t requestId, const std::string& result);
+
+    // ---- protocol config ----
+    void loadProtocolConfig(const std::string& configFile);
     YAML::Node getPhaseConfig(const std::string& phase) const;
     YAML::Node getPhaseConfigInsensitive(const std::string& phase) const;
-
-    // Protocol-agnostic verification
     bool runVerification(const std::string& verifyType, const nlohmann::json& msg, EntityState* context);
 
+    // ---- sequence bookkeeping ----
     int getNextSequenceNumber() { return nextSequenceNumber++; }
-    int assignSequenceNumber() {
-        return nextSequenceNumber+1;
-    }
-
+    int assignSequenceNumber() { return nextSequenceNumber + 1; }
+    // Allocate a new monotonically increasing sequence (thread-safe, leader-side)
+    int allocateNextSequence();
     void removeSequenceState(int seq);
+    bool hasProcessedOperation(int seq) const;
+    // Records when this replica first learned of the request behind seq
+    // (client arrival on the leader, PrePrepare arrival on followers); the
+    // consensus latency reported to the agent is measured from here.
+    void noteFirstSeen(int seq, long long firstSeenUs);
+    // Marks seq executed: feeds the learning agent sample (path: 1 fast,
+    // 0 slow, -1 not applicable) and drives pruning.
+    void markOperationProcessed(int seq, int path = -1, uint32_t transactions = 1, uint32_t batchSize = 1);
+    static long long nowUs();
+    // Aggregation key for a protocol phase: votes are counted per
+    // (phase, view, sequence) so messages of an abandoned view never
+    // contribute to a quorum in the next one.
+    static std::string aggregationKey(const std::string& phase, int view, int seq);
+    // Distinct senders recorded under aggregationKey(phase, view, seq).
+    std::size_t senderCount(const std::string& phase, int view, int seq) const;
+    std::set<int> senders(const std::string& phase, int view, int seq) const;
 
-    const std::unordered_map<int, std::string>& getPrePrepareOperations() const { return prePrepareOperations; }
+    // ---- request path (EntityRequests.cpp) ----
+    struct PrePrepareInfo {
+        std::string timestamp;
+        std::string operation;
+        std::string from;
+        std::string to;
+        int amount{0};
+        std::string clientId;
+        uint64_t requestId{0};
+    };
+    static std::string requestKey(const std::string& clientId, uint64_t requestId);
+    // A client request arrived (any replica). Buffers it, arms the request
+    // timer, and schedules the proposal when this replica leads.
+    void onClientRequest(const nlohmann::json& request);
+    // A PrePrepare for seq was stored: arms the request timer on followers
+    // and records the request info used for execution and view changes.
+    void onPrePrepareAccepted(int seq, int view);
+    // Executes the request behind seq (once), replies to the client, and
+    // releases every timer and buffer entry for it. path: 1 fast, 0 slow,
+    // -1 not applicable. Returns false when the PrePrepare is unknown.
+    bool completeSequence(int seq, int path);
+    std::size_t pendingRequestCount() const;
+    // Thread-safe bounded ingress, bypassing the consensus RPC work queue.
+    void submitClientRequest(const bedrock::ClientRequest& request);
+    // A single cadence opportunity, also driven explicitly by protocol tests.
+    void proposalTick();
 
-    std::set<int> prePrepareBroadcasted;
+    // ---- view changes (EntityViewChange.cpp) ----
+    void onRequestTimerExpired(std::uint64_t generation);
+    void startViewChange(int newView, const std::string& reason);
+    void onViewChangeMessage(const nlohmann::json& msg);
+    void onNewViewMessage(const nlohmann::json& msg);
+    // Applies a recommendation from the learning agent (learning thread).
+    void applyAgentTimeouts(const AgentTimeouts& timeouts);
 
-    bool hasProcessedOperation(const int operation) const {
-        return processedOperations.find(operation) != processedOperations.end();
-    }
-    
-    void markOperationProcessed(const int operation);
+    // ---- legacy view change (Hotstuff/Zyzzyva paths) ----
+    void onTimeout();
+    void sendNewViewToNextLeader();
+    void initiateViewChange();
 
+    // SBFT timeout callback checks both the view and sequence.
+    void sbftDecide(int seq, int view, bool fast);
+    bedrock::TaskScheduler& scheduler() { return scheduler_; }
+    int executedThrough() const { return lastExecuted_; }
+    int stableCheckpoint() const { return stableCheckpoint_; }
+    // Periodic retransmission and catch-up, also driven explicitly in tests.
+    void maintainConsensus();
+
+    // ---- balances (smallbank-style transfers) ----
     void updateBalances(const std::string& from, const std::string& to, int amount) {
         std::lock_guard<std::mutex> lock(balancesMutex);
         if (balances.find(from) == balances.end()) balances[from] = 100;
         if (balances.find(to) == balances.end()) balances[to] = 100;
         balances[from] -= amount;
         balances[to] += amount;
-        // std::cout << "[Node " << getNodeId() << "] Updated balances: " << from << "=" << balances[from] << ", " << to << "=" << balances[to] << std::endl;
     }
 
-    // Update speculative balances (thread-safe)
     void updateSpeculativeBalances(const std::string& from, const std::string& to, int amount) {
         std::lock_guard<std::mutex> lock(speculativeBalancesMutex);
         if (speculativeBalances.find(from) == speculativeBalances.end()) speculativeBalances[from] = 100;
         if (speculativeBalances.find(to) == speculativeBalances.end()) speculativeBalances[to] = 100;
         speculativeBalances[from] -= amount;
         speculativeBalances[to] += amount;
-        std::cout << "[Node " << getNodeId() << "] Updated SPECULATIVE balances: " << from << "=" << speculativeBalances[from] << ", " << to << "=" << speculativeBalances[to] << std::endl;
     }
 
-    // Get speculative balance for an account (thread-safe)
     int getSpeculativeBalance(const std::string& account) {
         std::lock_guard<std::mutex> lock(speculativeBalancesMutex);
         auto it = speculativeBalances.find(account);
         return (it != speculativeBalances.end()) ? it->second : 100;
     }
 
-    // Mark a speculative transaction as executed
     void markSpeculativeTransactionExecuted(const std::string& txnId) {
         executedSpeculativeTransactions.insert(txnId);
     }
 
-    // Check if a speculative transaction has been executed
     bool hasExecutedSpeculativeTransaction(const std::string& txnId) const {
         return executedSpeculativeTransactions.find(txnId) != executedSpeculativeTransactions.end();
     }
 
-    // Optionally, clear all speculative balances (e.g., on commit/rollback)
     void clearSpeculativeBalances() {
         std::lock_guard<std::mutex> lock(speculativeBalancesMutex);
         speculativeBalances.clear();
         executedSpeculativeTransactions.clear();
     }
 
-    // Speculative log entry
     struct SpeculativeEntry {
         int seq;
         std::string txnId;
@@ -181,7 +270,6 @@ public:
         int amount;
     };
 
-    // Append to speculative log
     void appendSpeculativeEntry(int seq, const std::string& txnId,
                                 const std::string& from, const std::string& to, int amount) {
         std::lock_guard<std::mutex> g(speculativeLogMtx);
@@ -190,7 +278,6 @@ public:
         }
     }
 
-    // Find seq by txnId (timestamp). Returns -1 if not found.
     int findSeqByTxnId(const std::string& txnId) {
         std::lock_guard<std::mutex> g(speculativeLogMtx);
         for (const auto& [k, e] : speculativeLog) {
@@ -199,7 +286,6 @@ public:
         return -1;
     }
 
-    // Rebuild speculative balances from current speculative log > committedSeq
     void rebuildSpeculativeBalancesFromLog() {
         {
             std::lock_guard<std::mutex> lock(speculativeBalancesMutex);
@@ -213,7 +299,7 @@ public:
         }
     }
 
-    std::vector<int> peerPorts;
+    // ---- protocol state shared with the event implementations ----
     std::map<std::string, int> balances;
     std::mutex balancesMutex;
     std::map<int, EntityState> sequenceStates;
@@ -223,17 +309,14 @@ public:
     std::unordered_map<int, std::string> prePrepareOperations;
     std::unordered_map<int, std::string> prepareOperations;
     std::unordered_map<int, std::string> commitOperations;
+    // Legacy (Hotstuff/Zyzzyva) view-change buffers.
     std::unordered_map<int, std::vector<nlohmann::json>> viewChangeMessages;
-    std::unordered_map<int, nlohmann::json> latestPreparePerSeq;
-    std::mutex latestPrepareMtx;
-    std::unordered_map<std::pair<int, int>, int, PairHash> nodeDelays;
     bool inViewChange = false;
     std::unique_ptr<TimeKeeper> timeKeeper;
     std::mutex timerMtx;
 
-    // Track received messages: [sequence][type][sender]
     std::unordered_map<int, std::unordered_map<std::string, std::set<int>>> receivedMessages;
-    std::set<int> processedOperations;  // Track completed operations
+    std::set<int> processedOperations;
     std::unordered_map<int, std::atomic<bool>> preparePhaseTimerRunning;
     std::unordered_map<std::string, std::unique_ptr<BaseEvent>> actions;
 
@@ -244,15 +327,11 @@ public:
     nlohmann::json entityInfo;
     std::unique_ptr<CryptoProvider> cryptoProvider;
     YAML::Node protocolConfig;
-    int viewChangeTimeoutMs{8000};
-    int fastPathWaitMs{20};
-    void onTimeout();
-    void sendNewViewToNextLeader();
+    // Timeouts read by the timers at every arm; written by the learning agent.
+    std::atomic<int> viewChangeTimeoutMs{8000};
+    std::atomic<int> fastPathWaitMs{20};
 
-    bool isByzantine;
-    std::unordered_map<int, std::unique_ptr<TimeKeeper>> prepareTimers;
-
-    std::mutex senderIdsMtx;
+    mutable std::mutex senderIdsMtx;
     std::unordered_map<std::string, std::unordered_set<int>> keyToSenderIds;
 
     // Quorum deduplication: ensures broadcast fires exactly once per phase+seq
@@ -261,23 +340,16 @@ public:
 
     std::mutex prePrepareMtx;
 
-    std::unordered_set<std::string> executedTransactions;
-
     std::map<int, std::set<int>> newViewHotstuffSenders;
-    nlohmann::json piggyback; // Stores the latest piggyback info
+    nlohmann::json piggyback;
     std::mutex piggybackMtx;
     bool piggybackBroadcastStarted = false;
 
-    // For Zyzzyva and speculative execution
-    std::map<std::string, int> speculativeBalances;      // Speculative balances for speculative complete
-    std::mutex speculativeBalancesMutex;                 // Mutex for thread-safe access to speculativeBalances
-
-    // For tracking speculative transactions (optional, similar to executedTransactions)
+    std::map<std::string, int> speculativeBalances;
+    std::mutex speculativeBalancesMutex;
     std::unordered_set<std::string> executedSpeculativeTransactions;
-
-    // New: speculative log and commit index
-    std::map<int, SpeculativeEntry> speculativeLog; // key: seq
-    mutable std::mutex speculativeLogMtx; // CHANGED: added mutable
+    std::map<int, SpeculativeEntry> speculativeLog;
+    mutable std::mutex speculativeLogMtx;
     int committedSeq = 0;
     int f;
 
@@ -287,122 +359,206 @@ public:
     void cachePrePrepare(int seq, const nlohmann::json& msg);
     void replayRangeTo(int fromSeq, int toSeq, int targetNodeId);
 
-    // Allocate a new monotonically increasing sequence (thread-safe, leader-side)
-    int allocateNextSequence();
+    // Fast lookup for execution and view changes (seq -> request info from the PrePrepare)
+    std::unordered_map<int, PrePrepareInfo> prePrepareIndex;
 
-    // Accept a JSON message coming via gRPC and route it through the normal handler
-    bool processJsonFromGrpc(const std::string& json);
-
-    // Protobuf-only basic phases
-    void processProtocolEnvelope(const bedrock::ProtocolEnvelope& env);
-    void sendProtocolToAll(const bedrock::ProtocolEnvelope& env);
-    void sendProtocolTo(int peer, const bedrock::ProtocolEnvelope& env);
-    void loadDelaysFromConfig(const std::string& configFile);
-    void setAgentEnabled(bool enabled) { agentEnabled_ = enabled; }
-
-    struct PrePrepareInfo {
-        std::string timestamp;
-        std::string operation;
-        std::string from;
-        std::string to;
-        int amount{0};
-        int client_port{-1};
-    };
-
-    // Fast lookup for CompleteEvent; does not change existing dataset behavior
-    std::unordered_map<int, PrePrepareInfo> prePrepareIndex; // seq -> info
-
-    
     mutable std::mutex processedMtx;     // protects processedOperations
 
-    // ---- Byzantine fault-injection schedule ----
-    struct ByzantineNodeState {
-        int proposalDelayMs{0};
-        bool skipFastPath{false};
-        int fastPathExtraDelayMs{0};
-    };
-    struct ByzantineScheduleEntry {
-        int atSeconds{0};
-        std::unordered_map<int, ByzantineNodeState> nodes; // nodeId -> state
-    };
-    std::vector<ByzantineScheduleEntry> byzantineSchedule; // sorted ascending by atSeconds
-    std::chrono::steady_clock::time_point byzantineStartTime;
-
-    // Cached active state — updated lazily when the next entry's time has elapsed.
-    // Entries that list this node fully replace the cached state (omitted fields → default).
-    // Entries that don't mention this node leave the cached state unchanged.
-    mutable std::mutex byzantineMtx;
-    mutable size_t nextByzScheduleIdx{0};
-    mutable ByzantineNodeState activeByzantineState;
-
-    void loadByzantineSchedule(const std::string& configFile);
-    ByzantineNodeState getActiveByzantineState() const;
-
-    // Windowed metrics (also protected by processedMtx)
-    Benchmark nodeBench;
-    Benchmark phaseBench_preprepare{"preprepare_phase"};
-    Benchmark phaseBench_prepare{"prepare_phase"};
-    Benchmark phaseBench_commit{"commit_phase"};
-    int windowSize = 100;
-    int windowTxCount = 0;
-    int windowId = 1;
-
-    std::unordered_map<int, long long> phaseTs_preprepare; // seq → µs when PrePrepare stored
-    std::unordered_map<int, long long> phaseTs_prepare;    // seq → µs when prepare quorum first met
-    std::unordered_map<int, long long> phaseTs_commit;     // seq → µs when commit quorum first met
+    // Phase timestamps (microseconds, steady clock), keyed by sequence.
+    std::unordered_map<int, long long> phaseTs_preprepare; // seq -> PrePrepare stored
+    std::unordered_map<int, long long> phaseTs_prepare;    // seq -> prepared (quorum or certificate)
+    std::unordered_map<int, long long> phaseTs_commit;     // seq -> committed (quorum or certificate)
+    std::unordered_map<int, long long> firstSeenUs;        // seq -> request first seen locally
     std::mutex phaseTsMtx;
 
 private:
-    int nodeId;
-    
-    EntityState _entityState;
-    TcpConnection connection;
-    std::thread processingThread;
+    friend struct EntityTimerTestAccess;
 
-    
-    
-    
-    std::atomic<int> nextSequenceNumber{0}; // was plain int
-    std::mutex clientRequestMtx;            // NEW: serialize leader request handling
+    struct PendingRequest {
+        nlohmann::json request;
+        std::string clientId;
+        uint64_t requestId{0};
+        long long arrivalUs{0};
+        Clock::time_point acceptedAt{};
+        int proposedInView{-1};   // -1: not proposed by this replica yet
+        bedrock::ClientRequest wire;
+        size_t bytes{0};
+    };
+
+    EntityOptions options_;
+    int nodeId;
+    bedrock::Committee committee_;
+    std::vector<int> peerIds_;
+    std::string protocolName_;
+    bool pbftCore_{false};
+
+    EntityState _entityState;
+
+    std::atomic<int> nextSequenceNumber{0};
+    std::mutex clientRequestMtx;            // serialize leader request handling
 
     std::atomic<bool> running = false;
-
-    
 
     std::map<int, nlohmann::json> preprepareCache;
     std::atomic<bool> fillHolePending{false};
     int fillHoleFromSeq{0};
     int fillHoleToSeq{0};
     std::chrono::steady_clock::time_point fillHoleDeadline;
-    int fillHoleTimeoutMs{600}; // adjust as needed
+    int fillHoleTimeoutMs{600};
 
-    // Serialize message handling across TCP and gRPC
-    std::mutex eventMtx;
+    // Serializes message handling (see engineMutex()).
+    std::recursive_mutex eventMtx;
 
-    // gRPC server running inside this entity
+    // gRPC server hosted by this replica
     std::unique_ptr<NodeServiceImpl> grpcSvc_;
     std::unique_ptr<grpc::Server> grpcServer_;
     std::thread grpcThread_;
     void startGrpcServer();
     void stopGrpcServer();
 
-    // gRPC clients for inter-node messaging (peerId -> stub to port 15000+peerId)
-    std::mutex grpcStubsMtx_;
-    std::unordered_map<int, std::unique_ptr<bedrock::Node::Stub>> grpcStubs_;
-    void initGrpcStubs();             // create stubs for all peers and self
-    bedrock::Node::Stub* getStub(int peerId);
+    bedrock::AsyncSender sender_;
+    bedrock::ClientStreams clientStreams_;
 
-    // Learning agent (optional, per-node). The wall-clock learning cycle and
-    // all protocol-specific report/timeout handling live in AgentClient; the
-    // entity only feeds consensus samples and applies recommended timeouts.
-    int agentPort{-1};
-    bool agentEnabled_{false};        // forced on via the --agent CLI flag
-    bool agentConfigEnabled_{false};  // agent.enabled in the protocol config
-    AgentClientConfig agentConfig_;
+    // Learning agent (optional, per-node).
     std::unique_ptr<AgentClient> agentClient_;
 
-    // Applies a recommendation from the learning agent (learning thread).
-    void applyAgentTimeouts(const AgentTimeouts& timeouts);
+    // Periodic stats line.
+    std::thread statsThread_;
+    std::mutex statsMtx_;
+    std::condition_variable statsCv_;
+    void statsLoop();
+    std::atomic<uint64_t> committedTotal_{0};
+    std::atomic<uint64_t> committedTransactions_{0};
+    std::atomic<uint64_t> rejectedRequests_{0};
+    std::atomic<uint64_t> requestsReceived_{0};
+    std::atomic<uint64_t> repliesSent_{0};
+    std::atomic<uint64_t> viewChangesStarted_{0};
+    std::atomic<uint64_t> newViewsInstalled_{0};
+    std::atomic<uint64_t> fastPathTotal_{0};
+    std::atomic<uint64_t> slowPathTotal_{0};
+    std::atomic<uint64_t> delayedProposals_{0};
+    // Engine CPU accounting, reported as per-second microseconds in Stats.
+    // Consensus batches amortize messages, not per-request work, so this is
+    // where a batching throughput ceiling becomes visible.
+    std::atomic<uint64_t> proposeUs_{0};   // building, digesting and signing proposals
+    std::atomic<uint64_t> validateUs_{0};  // verifying incoming proposals
+    std::atomic<uint64_t> executeUs_{0};   // executing batches and replying to clients
+    std::atomic<uint64_t> admitUs_{0};     // admitting client requests into the pending pool
+    std::atomic<uint64_t> assembleUs_{0};  // selecting requests into the next batch
+    std::atomic<uint64_t> tickWaitUs_{0};  // proposal ticks waiting for the engine lock
 
+    // Sequence-state pruning: everything below pruneFloor_ has been released.
+    int highestCommittedSeq_{0};
+    int pruneFloor_{0};
+    void pruneSequenceState();
+
+    // ---- PBFT core state (all under eventMtx) ----
+    bedrock::PendingRequestTimer requestTimer_;
+    bedrock::TaskScheduler scheduler_;
+    std::optional<Clock::time_point> viewChangeWaitSince_;
+    uint64_t viewChangeWaitGeneration_{0};
+    unsigned viewChangeBackoff_{0};
+    std::chrono::milliseconds viewChangeWaitDuration() const;
+    void armViewChangeWait();
+    void cancelViewChangeWait();
+    void scheduleViewChangeWait();
+    void onViewChangeWaitExpired(uint64_t generation);
+    std::unique_ptr<bedrock::ProposalDelayController> proposalDelay_;
+    std::map<std::string, PendingRequest> pendingRequests_;      // key -> buffered client request
+    std::deque<std::string> proposalQueue_;
+    size_t pendingBytes_{0};
+    // One bounded relay batch per peer, separate from saturated client ingress.
+    std::map<int, std::deque<bedrock::ClientRequest>> forwardedRequests_;
+    int nextProposalSource_{0};
+    Clock::time_point lastRequestForward_{};
+    std::string lastForwardedKey_;
+    void forwardPendingRequests();
+    void acceptForwardedRequests(const nlohmann::json& message);
+    std::mutex ingressMtx_;
+    std::deque<std::pair<bedrock::ClientRequest, long long>> ingress_;
+    size_t ingressBytes_{0};
+    Clock::time_point nextProposalTick_{};
+    uint64_t proposalGeneration_{0};
+    Clock::time_point lastRecoveryRequest_{};
+    Clock::time_point lastConsensusProgress_{Clock::now()};
+    // Batch bodies this replica holds, by sequence. Consensus evidence
+    // names batches by digest; this is where the named bytes live.
+    std::map<int, bedrock::PrePrepare> batchIndex_;
+    std::map<int, Clock::time_point> lastBatchRequest_;
+    unsigned maintenanceTick_{0};
+    bedrock::ExecutedRequests executedRequests_;           // request keys executed locally
+    std::map<int, std::string> executedRequestBySeq_;            // for pruning executedRequests_
+    std::map<int, std::map<int, nlohmann::json>> viewChangeMsgs_; // view -> sender -> ViewChange
+    int lastNewViewSent_{-1};
+
+    // Drops queued delayed proposals (view moved on) and keeps the periodic
+    // leader observation of the failure spec alive.
+    void cancelDelayedProposals();
+    void scheduleLeaderObservation();
+    void scheduleProposalTick();
+    void proposeBatch();
+    void acceptClientRequest(const bedrock::ClientRequest& request, long long arrival);
+    void rebuildProposalQueue();
+    void scheduleProposal(const std::string& key);
+    void proposeRequest(const std::string& key);
+    void proposeBufferedRequests();
+    void tryBuildNewView(int view);
+    void installReProposal(const nlohmann::json& prePrepare, int view);
+
+    // Maintained PBFT/SBFT engine. All state is protected by eventMtx.
+    std::string consensusDomain_;
+    std::map<int, bedrock::ConsensusInstance> consensusInstances_;
+    std::map<int, nlohmann::json> preparedProofs_;
+    std::map<int, nlohmann::json> fastVoteProofs_;
+    std::map<int, nlohmann::json> committedProofs_;
+    std::map<int, int> readySequences_;
+    int lastExecuted_{0};
+    int stableCheckpoint_{0};
+    nlohmann::json stableCheckpointProof_;
+    nlohmann::json stableSnapshot_;
+    std::map<int, nlohmann::json> checkpointSnapshots_;
+    std::map<int, std::map<std::string, std::map<int, nlohmann::json>>> checkpointVotes_;
+    nlohmann::json pendingNewView_;
+    nlohmann::json lastNewView_;
+    bool drainingExecution_{false};
+
+    void initializeConsensus();
+    void signEnvelope(bedrock::ProtocolEnvelope& env);
+    bool verifyEnvelope(const bedrock::ProtocolEnvelope& env);
+    nlohmann::json signControl(nlohmann::json msg);
+    bool verifyControl(const nlohmann::json& msg);
+    // Accepts a proposal header, and its batch when one is attached.
+    // Evidence carries headers; voting and execution additionally require
+    // the batch the header's digest names.
+    bool validateProposal(const bedrock::ProtocolEnvelope& env);
+    // The digest this replica is bound to for seq, from its own evidence.
+    std::string digestFor(int seq) const;
+    // Fills env's batch from a locally held copy when the digest matches.
+    void attachLocalBody(bedrock::ProtocolEnvelope& env) const;
+    // Asks peers for the batch behind an accepted or certified sequence.
+    void requestBatch(int seq);
+    // Installs a body that hashes to the digest seq is bound to.
+    void installBatchBody(int seq, const bedrock::PrePrepare& body);
+    bool validateCertificate(const bedrock::ProtocolEnvelope& env, const std::string& phase, int quorum);
+    bool validatePreparedProof(const nlohmann::json& proof);
+    bool validateCommittedProof(const nlohmann::json& proof);
+    bool validateCheckpoint(const nlohmann::json& proof);
+    bool validateViewChange(const nlohmann::json& msg);
+    nlohmann::json selectNewView(const nlohmann::json& changes, int view);
+    void handleConsensusEnvelope(const bedrock::ProtocolEnvelope& env);
+    void handleConsensusControl(const nlohmann::json& msg);
+    void advanceConsensus(int seq);
+    void acceptProposal(const bedrock::ProtocolEnvelope& env);
+    void broadcastVote(bedrock::ProtocolEnvelope env, bool collectorOnly);
+    void rememberPrepared(int seq, const nlohmann::json& proof);
+    void learnCommitted(const nlohmann::json& proof, int path);
+    void drainExecution();
+    void finishNewView(const nlohmann::json& msg);
+    void makeCheckpoint();
+    void acceptCheckpoint(const nlohmann::json& msg);
+    void stabilizeCheckpoint(const nlohmann::json& proof);
+    void pruneCertifiedPrefix();
+    void requestRecovery();
+    void installRecovery(const nlohmann::json& msg);
+    void scheduleConsensusMaintenance();
 };
-

@@ -3,7 +3,8 @@
 // Protocol-agnostic learning-agent client for CppBedrock.
 //
 // Runs the wall-clock learning cycle against a per-node LearningAgent gRPC
-// service (proto/agent.proto):
+// service (proto/agent.proto, the repo-wide contract shared with SmartBFT,
+// Tendermint, and the Rust protocols):
 //   1. Feature stage  - collect consensus metrics for feature_duration_ms.
 //   2. Reply wait     - send the report, poll for a timeout recommendation.
 //   3. Warm-up        - apply the recommendation, discard metrics while the
@@ -29,7 +30,6 @@
 
 #include "proto/agent.grpc.pb.h"
 #include "proto/agent.pb.h"
-#include <iostream>
 
 // Timeouts a recommendation can adjust. electionMs drives the view-change
 // timer of every protocol; slowPathMs is only meaningful for SBFT.
@@ -42,13 +42,18 @@ struct AgentTimeouts {
 // Latencies are microseconds; use -1 when a value is unavailable.
 struct AgentConsensusSample {
     uint32_t sequence{0};
+    uint32_t transactions{1};
+    uint32_t batchSize{1};
     long long latencyUs{-1};
     long long phase1Us{-1};  // protocol phase slot 1 (e.g. pre-prepare)
     long long phase2Us{-1};  // protocol phase slot 2 (e.g. prepare)
     long long phase3Us{-1};  // protocol phase slot 3 (e.g. commit)
+    // Fast/slow path attribution for SBFT: -1 unknown, 0 slow, 1 fast.
+    int path{-1};
 };
 
-// Aggregated metrics for one learning window.
+// Aggregated metrics for one learning window. The base fields mirror the
+// PbftReport layout shared by every protocol report in agent.proto.
 struct AgentMetricsSnapshot {
     uint32_t totalTransactions{0};
     uint32_t totalConsensus{0};
@@ -57,10 +62,20 @@ struct AgentMetricsSnapshot {
     float p95LatencyMs{0.0f};
     float p99LatencyMs{0.0f};
     float throughputTps{0.0f};
+    float avgBatchSize{0.0f};
+    float p95BatchSize{0.0f};
+    uint32_t leaderChangeCount{0};
+    uint32_t regencyChangeCount{0};
+    float avgInterCommitGapMs{0.0f};
+    float p50InterCommitGapMs{0.0f};
+    float p95InterCommitGapMs{0.0f};
+    uint32_t viewChangeCount{0};
+    uint32_t noProgressViewChangeCount{0};
     float phase1AvgMs{0.0f};
     float phase2AvgMs{0.0f};
     float phase3AvgMs{0.0f};
-    uint32_t viewChangeCount{0};
+    uint32_t fastPathCount{0};
+    uint32_t slowPathCount{0};
 };
 
 // Protocol-specific mapping between the generic metrics/timeouts and the
@@ -77,7 +92,9 @@ public:
                            const AgentMetricsSnapshot& metrics,
                            const AgentTimeouts& timeouts) const = 0;
 
-    // Fill the protocol-specific reward oneof of a Reward.
+    // Fill the protocol-specific reward oneof of a Reward. timeoutsUsed must
+    // be echoed verbatim: the agent requires byte-identical timeout_used
+    // across nodes to accept a reward.
     virtual void fillReward(Reward& reward,
                             uint32_t episode,
                             const AgentMetricsSnapshot& metrics,
@@ -91,19 +108,19 @@ public:
 
 // Returns the adapter for a CppBedrock protocol name as it appears in the
 // protocol config YAML ("PBFT", "LinearPBFT", "SBFT", "Hotstuff", "Hotstuff2",
-// "ChainedHotstuff", "Zyzzyva"). Throws std::invalid_argument for unknown
-// names.
+// "ChainedHotstuff"). Throws std::invalid_argument for names without a report
+// message in agent.proto (e.g. "Zyzzyva").
 std::unique_ptr<ProtocolAgentAdapter> makeProtocolAgentAdapter(const std::string& protocolName);
 
 struct AgentClientConfig {
     int nodeId{0};
     int port{-1};
-    int featureDurationMs{8000};
+    int featureDurationMs{10000};
     int replyWaitMs{2000};
-    int warmupDurationMs{2000};
-    int rewardDurationMs{8000};
+    int warmupDurationMs{3000};
+    int rewardDurationMs{5000};
     int pollIntervalMs{50};
-    int rpcTimeoutMs{500};
+    int rpcTimeoutMs{2000};
 };
 
 class AgentClient {
@@ -127,17 +144,27 @@ public:
 
     // Hooks called by the protocol engine.
     void recordConsensus(const AgentConsensusSample& sample);
+    // A local view-change timer fired (an election was started).
     void recordViewChange();
+    // A new view was installed (leadership moved).
+    void recordNewView();
 
 private:
     enum class Stage { Idle, Feature, ReplyWait, Warmup, Reward };
 
     struct MetricsWindow {
         std::vector<long long> latenciesUs;
+        std::vector<long long> batchSizes;
+        uint32_t transactions{0};
         std::vector<long long> phase1Us;
         std::vector<long long> phase2Us;
         std::vector<long long> phase3Us;
+        std::vector<long long> interCommitGapsUs;
         uint32_t viewChanges{0};
+        uint32_t noProgressViewChanges{0};
+        uint32_t newViews{0};
+        uint32_t fastPath{0};
+        uint32_t slowPath{0};
         std::chrono::steady_clock::time_point windowStart{};
 
         void reset(std::chrono::steady_clock::time_point start);
@@ -151,7 +178,7 @@ private:
     void pollForTimeout(uint32_t episode);
     void startPolling(uint32_t episode);
     void stopPolling();
-    void logPrefix(std::ostream& os) const;
+    std::string logPrefix() const;
 
     AgentClientConfig config_;
     std::unique_ptr<ProtocolAgentAdapter> adapter_;
@@ -176,6 +203,9 @@ private:
     uint32_t episode_{1};
     uint32_t episodeStartTick_{0};
     uint32_t lastSequence_{0};
+    bool hasLastCommit_{false};
+    std::chrono::steady_clock::time_point lastCommitTime_{};
+    uint64_t commitsSinceViewChange_{0};
     AgentTimeouts currentTimeouts_{};
     AgentTimeouts lastTimeouts_{};  // timeouts active during the reward window
     bool decisionReady_{false};

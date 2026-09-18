@@ -1,2 +1,3 @@
-# CppBedrock# CppBedrock
 # CppBedrock
+
+A C++ BFT protocol emulator (PBFT, LinearPBFT, SBFT, HotStuff, HotStuff2, ChainedHotStuff, Zyzzyva) configured through YAML files in `config/`. PBFT/SBFT use an authenticated consensus engine with certified view changes, periodic request batching, ordered execution, and checkpoint state transfer; the other protocols retain their legacy YAML state machines. This fork runs one replica per process, uses a JSON committee, talks to benchmark clients over gRPC streams, and integrates with the adaptive-timer learning agent. See `adaptive_timers.MD` for build, run, and learning-agent instructions and limitations.

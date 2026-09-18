@@ -1,104 +1,44 @@
-#include "../../include/core/Entity.h"
-// RE-ENABLE TcpConnection for client replies
-#include "../../include/coordination/connections/TcpConnection.h"
-#include "../../include/core/events/EventFactory.h"
-#include "../../include/core/events/MessageHandler.h"
-#include "../../include/core/TimeKeeper.h"
+#include "core/Entity.h"
+#include "core/Log.h"
+#include "core/events/EventFactory.h"
+#include "core/events/MessageHandler.h"
+#include "core/events/ProtoMessage.h"
+#include "core/crypto/OpenSSLCryptoProvider.h"
 #include "coordination/grpc/NodeServiceImpl.h"
 #include "proto/bedrock.grpc.pb.h"
 #include "proto/bedrock.pb.h"
-#include "proto/agent.grpc.pb.h"
-#include "proto/agent.pb.h"
+
 #include <grpcpp/grpcpp.h>
-#include <iostream>
 #include <yaml-cpp/yaml.h>
 #include <nlohmann/json.hpp>
-#include <functional>
-#include <unordered_map>
-#include <memory>
-#include <cctype>
-#include <set>
-#include <fstream>
-#include <filesystem> // C++17
-#include "../../include/core/events/ProtoMessage.h"
-#include <chrono>
-#include <iomanip>
-#include <ctime>
-#include <tuple>           // for batching rows
+
 #include <algorithm>
+#include <cctype>
+#include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
-// Batch CSV buffers (per-process, keyed by node id)
-namespace {
-    using OpRow = std::tuple<int /*seq*/, long long /*ts_ms*/, std::string /*operation*/>;
-    std::mutex s_csvBatchMtx;
-    std::unordered_map<int, std::vector<OpRow>> s_csvBatches;
-    void flushCsvBatchUnlocked(int nodeId) {
-        auto it = s_csvBatches.find(nodeId);
-        if (it == s_csvBatches.end() || it->second.empty()) return;
-        // std::filesystem::create_directories("logs");
-        const std::string csvPath = "logs/node_" + std::to_string(nodeId) + "_ops.csv";
-        const bool exists = std::filesystem::exists(csvPath);
-        std::ofstream out(csvPath, std::ios::app);
-        if (!out) {
-            std::cerr << "[Node " << nodeId << "] Failed to open CSV: " << csvPath << "\n";
-            return;
-        }
-        if (!exists) out << "sequence,timestamp_ms,operation\n";
-        for (const auto& row : it->second) {
-            int seq; long long ts; std::string op;
-            std::tie(seq, ts, op) = row;
-            // escape commas if any in op (very unlikely)
-            for (char& c : op) if (c == ',') c = ';';
-            out << seq << "," << ts << "," << op << "\n";
-        }
-        out.flush();
-        it->second.clear();
-    }
-}
-
 using json = nlohmann::json;
 
-// ===================== Utility =====================
-// Fix: don't map 1000 to gRPC; only map valid node ids or legacy TCP ports
-static inline int grpcPortForPeer(int peerEntry) {
-    if (peerEntry == 1000) return -1;                 // special client marker
-    if (peerEntry >= 5001 && peerEntry <= 5999) return peerEntry + 10000; // legacy TCP -> +10000
-    if (peerEntry > 0 && peerEntry < 1000) return 15000 + peerEntry;      // node id
-    return -1; // invalid
-}
+namespace {
 
-// Helper: send to client via TCP using client_listen_port in payload
-static bool sendToClientViaTcp(const std::string& jsonPayload) {
-    try {
-        nlohmann::json j = nlohmann::json::parse(jsonPayload);
-        int clientPort;
-        if (!j.contains("client_listen_port")) {
-            clientPort = 6000;
-        }
-        else{
-            clientPort= j["client_listen_port"].get<int>();
-        }
-        
-        TcpConnection clientConn(clientPort, /*isServer*/ false);
-        clientConn.send(jsonPayload);
-        std::cout << "[Entity] Sent response to client on port " << clientPort << "\n";
-        clientConn.closeConnection();
-        return true;
-    } catch (const std::exception& e) {
-        std::cerr << "[ClientSend] Exception: " << e.what() << "\n";
-        return false;
-    }
-}
+// Number of committed sequences kept behind the newest commit before their
+// per-sequence bookkeeping is released. A view change re-proposes from the
+// retained prepares, so this also bounds what a new leader can recover.
+constexpr int kRetainedSequences = 2000;
+constexpr int kPruneEveryCommits = 500;
 
 // Helper: build typed envelope from a protocol JSON message for basic phases
-static bool buildEnvelopeFromJson(const std::string& jsonStr, bedrock::ProtocolEnvelope& env) {
+bool buildEnvelopeFromJson(const std::string& jsonStr, bedrock::ProtocolEnvelope& env) {
     try {
         nlohmann::json j = nlohmann::json::parse(jsonStr);
         if (!j.contains("type") || !j["type"].is_string()) return false;
@@ -110,16 +50,18 @@ static bool buildEnvelopeFromJson(const std::string& jsonStr, bedrock::ProtocolE
             m->set_sequence(j.value("sequence", 0));
             m->set_timestamp(j.value("timestamp", ""));
             m->set_operation(j.value("operation", ""));
-            if (j.contains("transaction")) {
+            if (j.contains("transaction") && j["transaction"].is_object()) {
                 const auto& txj = j["transaction"];
                 auto* tx = m->mutable_transaction();
                 tx->set_from(txj.value("from",""));
                 tx->set_to(txj.value("to",""));
                 tx->set_amount(txj.value("amount", 0));
             }
-            m->set_client_listen_port(j.value("client_listen_port", 0));
+            m->set_client_id(j.value("client_id", ""));
+            m->set_request_id(j.value("request_id", (uint64_t)0));
             m->set_signature(j.value("signature", ""));
-            m->set_message_sender_id(j.value("message_sender_id", getpid())); // fallback
+            m->set_message_sender_id(j.value("message_sender_id", -1));
+            m->set_type("PrePrepare");
             return true;
         }
         if (t == "Prepare") {
@@ -128,6 +70,7 @@ static bool buildEnvelopeFromJson(const std::string& jsonStr, bedrock::ProtocolE
             m->set_sequence(j.value("sequence", 0));
             m->set_operation(j.value("operation", ""));
             m->set_message_sender_id(j.value("message_sender_id", 0));
+            m->set_type("Prepare");
             return true;
         }
         if (t == "Commit") {
@@ -136,68 +79,100 @@ static bool buildEnvelopeFromJson(const std::string& jsonStr, bedrock::ProtocolE
             m->set_sequence(j.value("sequence", 0));
             m->set_operation(j.value("operation", ""));
             m->set_message_sender_id(j.value("message_sender_id", 0));
+            m->set_type("Commit");
             return true;
         }
     } catch (...) {}
     return false;
 }
 
-// ===================== Entity Methods =====================
-Entity::Entity(const std::string& role, int id, const std::vector<int>& peers, bool byzantine)
-    : _entityState(role, "Request", 0, 0),
-      nodeId(id),
-      peerPorts(peers),
-      isByzantine(byzantine),
-      connection(5000 + id, true),
-      processingThread(),
-      f(peers.size()/3),
-      prePrepareBroadcasted()
-{
-    nodeBench.reset("node_" + std::to_string(id) + "_w1");
-    EventFactory::getInstance().initialize();
-    // Load selected protocol from runtime.selection.yaml; fallback to SBFT.
-    std::string selectedConfig = "../config/config.sbft.yaml";
+// Parses the trailing "_<seq>" of a "<phase>_<seq>" aggregation key.
+bool keySequence(const std::string& key, int& seq) {
+    auto pos = key.rfind('_');
+    if (pos == std::string::npos || pos + 1 >= key.size()) return false;
     try {
-        YAML::Node runtime = YAML::LoadFile("../config/runtime.selection.yaml");
-        if (runtime && runtime["protocol"]) {
-            const std::string proto = runtime["protocol"].as<std::string>();
-            if (proto == "PBFT")              selectedConfig = "../config/config.pbft.yaml";
-            else if (proto == "LinearPBFT")   selectedConfig = "../config/config.linearpbft.yaml";
-            else if (proto == "Hotstuff")     selectedConfig = "../config/config.hotstuff.yaml";
-            else if (proto == "Hotstuff2")    selectedConfig = "../config/config.hotstuff2.yaml";
-            else if (proto == "SBFT")         selectedConfig = "../config/config.sbft.yaml";
-            else if (proto == "Zyzzyva")      selectedConfig = "../config/config.zyzzyva.yaml";
-            else if (proto == "ChainedHotstuff") selectedConfig = "../config/config.chainedhotstuff.yaml";
-            else throw std::runtime_error("unknown protocol in runtime.selection.yaml: " + proto);
-        }
-    } catch (const YAML::BadFile&) {
-        std::cout << "[Node " << id << "] runtime.selection.yaml not found; using " << selectedConfig << "\n";
+        seq = std::stoi(key.substr(pos + 1));
+        return true;
+    } catch (...) {
+        return false;
     }
-    loadProtocolConfig(selectedConfig);
-    std::cout << "[Node " << nodeId << "] Loaded protocol config: " << selectedConfig << "\n";
-    timeKeeper = std::make_unique<TimeKeeper>(viewChangeTimeoutMs, [this] {
-        this->onTimeout();
-    });
-    entityInfo["server_name"] = getNodeId();
+}
+
+}  // namespace
+
+// ===================== Entity Methods =====================
+Entity::Entity(const EntityOptions& options)
+    : options_(options),
+      nodeId(options.nodeId),
+      committee_(bedrock::Committee::loadFromFile(options.committeePath)),
+      _entityState("Replica", "Request", 0, 0),
+      sender_(options.nodeId),
+      requestTimer_(viewChangeTimeoutMs, [this](uint64_t generation) { onRequestTimerExpired(generation); })
+{
+    if (!committee_.contains(nodeId)) {
+        throw std::runtime_error("node id " + std::to_string(nodeId) + " is not in committee " +
+                                 options.committeePath);
+    }
+    for (const auto& r : committee_.replicas()) peerIds_.push_back(r.id);
+    f = committee_.f();
+
+    EventFactory::getInstance().initialize();
+    loadProtocolConfig(options.protocolConfigPath);
+    pbftCore_ = (protocolName_ == "PBFT" || protocolName_ == "SBFT");
+    if (options.initialElectionTimeoutMs > 0) viewChangeTimeoutMs = options.initialElectionTimeoutMs;
+    if (options.initialSlowPathTimeoutMs > 0) fastPathWaitMs = options.initialSlowPathTimeoutMs;
+    LOG_INFO("loaded protocol " << protocolName_ << " from " << options.protocolConfigPath
+             << " (n=" << committee_.size() << " f=" << f
+             << " election_timeout_ms=" << viewChangeTimeoutMs.load()
+             << " slow_path_timeout_ms=" << fastPathWaitMs.load() << ")");
+
+    timeKeeper = std::make_unique<TimeKeeper>(viewChangeTimeoutMs, [this] { this->onTimeout(); });
+    entityInfo["server_name"] = nodeId;
     entityInfo["view"] = 0;
     entityInfo["sequence"] = 0;
     entityInfo["server_status"] = 1;
-    cryptoProvider = std::make_unique<OpenSSLCryptoProvider>("../keys/server_" + std::to_string(id) + "_private.pem");
-    
-    // Example: in Entity constructor or init
-    std::string protocol = protocolConfig["protocol"] ? protocolConfig["protocol"].as<std::string>() : "";
-    if(protocol=="ChainedHotstuff"){
+
+    const std::string keyPath = options.keysDir + "/server_" + std::to_string(nodeId) + "_private.pem";
+    if (!std::filesystem::exists(keyPath)) {
+        throw std::runtime_error("replica private key not found: " + keyPath);
+    }
+    cryptoProvider = std::make_unique<OpenSSLCryptoProvider>(keyPath);
+    initializeConsensus();
+
+    if (!options.failureSpecPath.empty()) {
+        if (!pbftCore_) {
+            throw std::runtime_error("--failure-spec is only supported for PBFT and SBFT (protocol " + protocolName_ + ")");
+        }
+        std::string section = protocolName_;
+        std::transform(section.begin(), section.end(), section.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        proposalDelay_ = bedrock::ProposalDelayController::loadFile(options.failureSpecPath,
+                                                                    options.failureStartUnixMs, section);
+        LOG_INFO("loaded failure spec " << options.failureSpecPath << " section <" << section << ">: "
+                 << proposalDelay_->phases().size() << " proposal-delay phase(s), warm_up_ms="
+                 << proposalDelay_->warmUp().count() << ", start_unix_ms=" << options.failureStartUnixMs);
+    } else {
+        proposalDelay_ = std::make_unique<bedrock::ProposalDelayController>();
+    }
+
+    for (const auto& r : committee_.replicas()) {
+        if (r.id == nodeId) continue;
+        sender_.addPeer(r.id, r.address());
+    }
+
+    if (protocolName_ == "ChainedHotstuff") {
         auto event = EventFactory::getInstance().createEvent("periodicPiggybackBroadcast");
         if (event) event->execute(this, nullptr, nullptr);
     }
-    
-    // loadDelaysFromConfig("/Users/eswar/Downloads/CppBedrock/config/config.entities.yaml");
-    
 }
 
 Entity::~Entity() {
-    stop(); // Ensure thread is joined before destruction
-    //std::cout << "[Entity] Destructor called for role: " << _entityState.getRole() << std::endl;
+    stop();
+}
+
+long long Entity::nowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 int Entity::getMaxSpeculativeSeq() const {
@@ -225,16 +200,11 @@ void Entity::sendFillHole(int fromSeq, int toSeq, bool broadcast) {
     Message m(fh.dump());
     if (broadcast) {
         sendToAll(m);
-        std::cout << "[Node " << getNodeId() << "] Broadcast FillHole request for [" << fromSeq << "," << toSeq << "]\n";
+        LOG_DEBUG("Broadcast FillHole request for [" << fromSeq << "," << toSeq << "]");
     } else {
-        // current primary id determination: view % N mapping to peerPorts vector
-        if (!peerPorts.empty()) {
-            int n = (int)peerPorts.size();
-            int primaryId = peerPorts[entityInfo["view"].get<int>() % n];
-            sendTo(primaryId, m);
-            std::cout << "[Node " << getNodeId() << "] Sent FillHole to primary " << primaryId
-                      << " for [" << fromSeq << "," << toSeq << "]\n";
-        }
+        int primaryId = currentLeader();
+        sendTo(primaryId, m);
+        LOG_DEBUG("Sent FillHole to primary " << primaryId << " for [" << fromSeq << "," << toSeq << "]");
     }
     fillHolePending = true;
     fillHoleFromSeq = fromSeq;
@@ -248,65 +218,49 @@ void Entity::replayRangeTo(int fromSeq, int toSeq, int targetNodeId) {
         if (it == preprepareCache.end()) continue;
         Message resend(it->second.dump());
         sendTo(targetNodeId, resend);
-        std::cout << "[Node " << getNodeId() << "] Replay seq " << s << " to node " << targetNodeId << "\n";
+        LOG_DEBUG("Replay seq " << s << " to node " << targetNodeId);
     }
 }
 
 void Entity::tryHandleFillHoleTimeout() {
     if (!fillHolePending) return;
     if (std::chrono::steady_clock::now() < fillHoleDeadline) return;
-    // Escalate: broadcast fill-hole and start view change
     sendFillHole(fillHoleFromSeq, fillHoleToSeq, true);
-    std::cout << "[Node " << getNodeId() << "] FillHole timeout -> initiating view change\n";
+    LOG_INFO("FillHole timeout -> initiating view change");
     fillHolePending = false;
     initiateViewChange();
 }
 
 void Entity::onTimeout() {
+    std::lock_guard<std::recursive_mutex> engine(eventMtx);
     if (!timeKeeper) return;
-    // First check pending fill-hole escalation
     tryHandleFillHoleTimeout();
-    // If still pending we already escalated; optionally early return
     if (fillHolePending) return;
 
-    std::cout << "[Node " << getNodeId() << "] Timeout occurred! Initiating view change.\n";
     int newView = entityInfo["view"].get<int>() + 1;
+    LOG_INFO("Timeout occurred (" << viewChangeTimeoutMs.load() << " ms): initiating view change to view "
+             << newView);
     entityInfo["view"] = newView;
+    if (agentClient_) agentClient_->recordViewChange();
 
     inViewChange = true;
-    std::string protocol = protocolConfig["protocol"] ? protocolConfig["protocol"].as<std::string>() : "";
     nlohmann::json viewChangeMsg;
     viewChangeMsg["type"] = "ViewChange";
     viewChangeMsg["new_view"] = newView;
     viewChangeMsg["view"] = newView; // for Zyzzyva handlers
     viewChangeMsg["message_sender_id"] = getNodeId();
 
-    {
-        std::lock_guard<std::mutex> lk(latestPrepareMtx);
-        nlohmann::json prepareArray = nlohmann::json::array();
-        for (const auto& [seq, record] : latestPreparePerSeq) {
-            // optional: only send prepares for uncommitted sequences
-            // if (seq <= committedSeq) continue;
-            prepareArray.push_back(record);
-        }
-        viewChangeMsg["prepare_messages"] = std::move(prepareArray);
-    }
+    viewChangeMsg["prepare_messages"] = nlohmann::json::array();
 
-    if (protocol == "Zyzzyva") {
+    if (protocolName_ == "Zyzzyva") {
         viewChangeMsg["committed_seq"] = committedSeq;
         Message msg(viewChangeMsg.dump());
-        if (!peerPorts.empty()) {
-            int idx = newView % static_cast<int>(peerPorts.size());
-            int nextLeaderPeerId = peerPorts[idx];
-            sendTo(nextLeaderPeerId, msg);
-        } else {
-            sendToAll(msg);
-        }
+        sendTo(leaderForView(newView), msg);
         if (timeKeeper) timeKeeper->start();
         return;
     }
 
-    if (protocol == "Hotstuff") {
+    if (protocolName_ == "Hotstuff") {
         int lastSeq = -1;
         std::string lastOp;
         nlohmann::json lastQC;
@@ -336,11 +290,10 @@ void Entity::onTimeout() {
             ? nlohmann::json(sequenceStates[lastSeq].getLockedQC())
             : nlohmann::json{};
         Message msg(viewChangeMsg.dump());
-        int nextLeader = (newView + 1) % (peerPorts.size());
-        sendTo(nextLeader, msg);
+        sendTo(leaderForView(newView), msg);
     } else {
         Message msg(viewChangeMsg.dump());
-        std::cout << "[Node " << getNodeId() << "] Broadcasting ViewChange for new view " << newView << "\n";
+        LOG_DEBUG("Broadcasting ViewChange for new view " << newView);
         sendToAll(msg);
     }
 
@@ -354,163 +307,198 @@ void Entity::sendNewViewToNextLeader() {
     if (currentView == 0) currentView -= 1;
     currentView += 1;
     entityInfo["view"] = currentView;
-    int nextLeader = (currentView + 1) % peerPorts.size();
+    int nextLeader = leaderForView(currentView);
 
-    // Fast path: send typed ProtocolEnvelope over gRPC
-    // Use a lightweight PrePrepare envelope to carry NewView (type field set to "NewView")
+    // A lightweight PrePrepare envelope carries the NewView marker.
     bedrock::ProtocolEnvelope env;
     auto* m = env.mutable_pre_prepare();
     m->set_view(currentView);
-    m->set_sequence(currentView);                 // reuse view as sequence for routing
-    m->set_operation("NewViewforHotstuff");                 // operation marker
+    m->set_sequence(currentView);
+    m->set_operation("NewViewforHotstuff");
     m->set_message_sender_id(getNodeId());
-    m->set_type("NewViewforHotstuff");                      // requires proto field 'type' on PrePrepare
+    m->set_type("NewViewforHotstuff");
 
     sendProtocolTo(nextLeader, env);
-    std::cout << "[Node " << getNodeId() << "] Sent NewView (proto) to node " << nextLeader << "\n";
+    LOG_DEBUG("Sent NewView (proto) to node " << nextLeader);
 }
 
-void Entity::printDataStore() {
-    std::cout << "========== Data Store ==========\n";
-    std::cout << "[Entity] Commit Message Store:\n";
-    for (const auto& [seq, nodes] : commitMessages) {
-        std::cout << "  Sequence " << seq << ": { ";
-        for (int id : nodes) std::cout << id << " ";
-        std::cout << "}";
-        if (commitOperations.count(seq)) {
-            std::cout << " | operation: " << commitOperations.at(seq);
-        }
-        std::cout << "\n";
-    }
-    std::cout << "================================\n";
-}
 void Entity::start() {
-    std::cout << "[Entity] Starting entity with role: " << _entityState.getRole() << "\n";
     running = true;
-
-    // Truncate metrics CSV at startup so each run starts fresh (ops CSV is preserved)
-    std::filesystem::create_directories("logs");
-    std::ofstream("logs/node_" + std::to_string(getNodeId()) + "_metrics.csv", std::ios::trunc);
-
-    // No TCP listener
-    // connection.startListening();
-
-    // Start in-entity gRPC server and init client stubs
+    if (pbftCore_) requestTimer_.start();
+    scheduler_.start();
+    scheduleLeaderObservation();
+    scheduleConsensusMaintenance();
+    nextProposalTick_ = Clock::now() + std::chrono::milliseconds(options_.proposalIntervalMs);
+    scheduleProposalTick();
     startGrpcServer();
-    initGrpcStubs();
+    sender_.start();
 
-    if (agentEnabled_ || agentConfigEnabled_) {
-        if (agentPort <= 0) {
-            throw std::runtime_error(
-                "[Node " + std::to_string(getNodeId()) +
-                "] learning agent enabled but no port configured for this node "
-                "(expected agent.ports." + std::to_string(getNodeId()) + " in the protocol config)");
-        }
-        const std::string protocol =
-            protocolConfig["protocol"] ? protocolConfig["protocol"].as<std::string>() : "";
-        agentConfig_.nodeId = getNodeId();
-        agentConfig_.port = agentPort;
+    if (options_.agentPort > 0) {
+        AgentClientConfig cfg = options_.agentConfig;
+        cfg.nodeId = getNodeId();
+        cfg.port = options_.agentPort;
         agentClient_ = std::make_unique<AgentClient>(
-            agentConfig_,
-            makeProtocolAgentAdapter(protocol),
-            AgentTimeouts{viewChangeTimeoutMs, fastPathWaitMs},
+            cfg,
+            makeProtocolAgentAdapter(protocolName_),
+            AgentTimeouts{viewChangeTimeoutMs.load(), fastPathWaitMs.load()},
             [this](const AgentTimeouts& t) { applyAgentTimeouts(t); });
         agentClient_->start();
     }
 
-    processingThread = std::thread(&Entity::processMessages, this);
-    //std::this_thread::sleep_for(std::chrono::milliseconds(0)); 
-    std::string protocol = protocolConfig["protocol"] ? protocolConfig["protocol"].as<std::string>() : "";
-    if(protocol=="Hotstuff" || protocol=="ChainedHotstuff" || protocol=="Hotstuff2"){
+    if (options_.statsIntervalMs > 0) {
+        statsThread_ = std::thread(&Entity::statsLoop, this);
+    }
+
+    if (protocolName_ == "Hotstuff" || protocolName_ == "ChainedHotstuff" || protocolName_ == "Hotstuff2") {
+        std::lock_guard<std::recursive_mutex> engine(eventMtx);
         sendNewViewToNextLeader();
     }
-    
+    LOG_INFO("replica " << getNodeId() << " started: protocol=" << protocolName_
+             << " listen=" << committee_.replica(nodeId).address()
+             << " leader=" << currentLeader()
+             << " proposal_signing=" << (options_.proposalSigning ? "on" : "off")
+             << " proposal_interval_ms=" << options_.proposalIntervalMs
+             << " batch_max_requests=" << options_.batchMaxRequests
+             << " batch_max_bytes=" << options_.batchMaxBytes
+             << " max_inflight_batches=" << options_.maxInflightBatches);
 }
+
 void Entity::stop() {
-    std::cout << "[Entity] Stopping entity: " << _entityState.getRole() << "\n";
+    if (!running.exchange(false)) return;
+    LOG_INFO("stopping replica " << getNodeId());
     if (agentClient_) {
         agentClient_->stop();
     }
-    // Flush any remaining batched rows for this node before shutdown
     {
-        std::lock_guard<std::mutex> lk(s_csvBatchMtx);
-        flushCsvBatchUnlocked(getNodeId());
+        std::lock_guard<std::mutex> lk(statsMtx_);
     }
-    running = false;
-
-    // connection.stopListening();  // removed to avoid TCP use
-
+    statsCv_.notify_all();
+    if (statsThread_.joinable()) statsThread_.join();
+    requestTimer_.stop();
+    scheduler_.stop();
+    {
+        std::lock_guard<std::mutex> lk(timerMtx);
+        if (timeKeeper) timeKeeper->stop();
+    }
     stopGrpcServer();
-
-    if (processingThread.joinable() && std::this_thread::get_id() != processingThread.get_id()) {
-        processingThread.join();
-    }
+    sender_.shutdown();
 }
-void Entity::processMessages() {
-    // No TCP receive loop anymore. Keep thread lightweight or remove if unused.
+
+void Entity::statsLoop() {
+    uint64_t lastCommitted = 0;
+    uint64_t lastRequests = 0;
+    uint64_t lastPropose = 0, lastValidate = 0, lastExecute = 0;
+    uint64_t lastAdmit = 0, lastAssemble = 0, lastTickWait = 0;
+    std::unique_lock<std::mutex> lk(statsMtx_);
     while (running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (statsCv_.wait_for(lk, std::chrono::milliseconds(options_.statsIntervalMs),
+                              [this] { return !running.load(); })) {
+            break;
+        }
+        const uint64_t committed = committedTotal_.load();
+        const uint64_t requests = requestsReceived_.load();
+        size_t inflight = 0;
+        {
+            std::lock_guard<std::mutex> pl(prePrepareMtx);
+            inflight = prePrepareIndex.size();
+        }
+        int view = 0;
+        int leader = 0;
+        int executedSeq = 0;
+        int checkpoint = 0;
+        bool changing = false;
+        std::size_t pending = 0;
+        {
+            std::lock_guard<std::recursive_mutex> engine(eventMtx);
+            view = currentView();
+            leader = currentLeader();
+            executedSeq = lastExecuted_;
+            checkpoint = stableCheckpoint_;
+            changing = inViewChange;
+            pending = pendingRequests_.size();
+            if (pbftCore_) inflight = batchIndex_.size();
+        }
+        LOG_INFO("Stats view=" << view << " leader=" << leader << " view_changing=" << (changing ? 1 : 0)
+                 << " executed_seq=" << executedSeq << " stable_checkpoint=" << checkpoint
+                 << " committed_transactions=" << committedTransactions_.load()
+                 << " rejected=" << rejectedRequests_.load()
+                 << " committed_total=" << committed << " commits=" << (committed - lastCommitted)
+                 << " requests=" << (requests - lastRequests) << " inflight=" << inflight
+                 << " pending=" << pending << " timer_pending=" << requestTimer_.size()
+                 << " view_changes=" << viewChangesStarted_.load() << " new_views=" << newViewsInstalled_.load()
+                 << " fast_path=" << fastPathTotal_.load() << " slow_path=" << slowPathTotal_.load()
+                 << " delayed_proposals=" << delayedProposals_.load() << " scheduled=" << scheduler_.pending()
+                 << " clients=" << clientStreams_.size()
+                 << " replies=" << repliesSent_.load() << " reply_drops=" << clientStreams_.droppedReplies()
+                 << " sent=" << sender_.sent() << " send_inflight=" << sender_.inflight()
+                 << " send_failures=" << sender_.failed()
+                 << " propose_us=" << (proposeUs_.load() - lastPropose)
+                 << " validate_us=" << (validateUs_.load() - lastValidate)
+                 << " execute_us=" << (executeUs_.load() - lastExecute)
+                 << " admit_us=" << (admitUs_.load() - lastAdmit)
+                 << " assemble_us=" << (assembleUs_.load() - lastAssemble)
+                 << " tick_wait_us=" << (tickWaitUs_.load() - lastTickWait)
+                 << " election_timeout_ms=" << viewChangeTimeoutMs.load()
+                 << " slow_path_timeout_ms=" << fastPathWaitMs.load());
+        lastCommitted = committed;
+        lastRequests = requests;
+        lastPropose = proposeUs_.load();
+        lastValidate = validateUs_.load();
+        lastExecute = executeUs_.load();
+        lastAdmit = admitUs_.load();
+        lastAssemble = assembleUs_.load();
+        lastTickWait = tickWaitUs_.load();
     }
 }
-void Entity::loadProtocolConfig(const std::string& configFile) {
-    try {
-        protocolConfig = YAML::LoadFile(configFile);
-        if (protocolConfig["timers"]) {
-            const YAML::Node& timers = protocolConfig["timers"];
-            if (timers["view_change_ms"]) viewChangeTimeoutMs = timers["view_change_ms"].as<int>();
-            if (timers["fast_path_wait_ms"]) fastPathWaitMs = timers["fast_path_wait_ms"].as<int>();
-        }
-        if (protocolConfig["metrics"]) {
-            const YAML::Node& metrics = protocolConfig["metrics"];
-            if (metrics["window_size"]) windowSize = metrics["window_size"].as<int>();
-        }
-        if (protocolConfig["agent"]) {
-            const YAML::Node& agent = protocolConfig["agent"];
-            if (agent["enabled"]) agentConfigEnabled_ = agent["enabled"].as<bool>();
-            if (agent["ports"] && agent["ports"][nodeId]) {
-                agentPort = agent["ports"][nodeId].as<int>();
-            }
-            if (agent["feature_duration_ms"]) agentConfig_.featureDurationMs = agent["feature_duration_ms"].as<int>();
-            if (agent["reply_wait_ms"]) agentConfig_.replyWaitMs = agent["reply_wait_ms"].as<int>();
-            if (agent["warmup_duration_ms"]) agentConfig_.warmupDurationMs = agent["warmup_duration_ms"].as<int>();
-            if (agent["reward_duration_ms"]) agentConfig_.rewardDurationMs = agent["reward_duration_ms"].as<int>();
-            if (agent["poll_interval_ms"]) agentConfig_.pollIntervalMs = agent["poll_interval_ms"].as<int>();
-            if (agent["rpc_timeout_ms"]) agentConfig_.rpcTimeoutMs = agent["rpc_timeout_ms"].as<int>();
-        }
-        const YAML::Node& phases = protocolConfig["phases"];
-        if (!phases.IsMap()) {
-            std::cerr << "Error: 'phases' should be a map in YAML file" << std::endl;
-            return;
-        }
-        for (const auto& phase_pair : phases) {
-            std::string phaseName = phase_pair.first.as<std::string>();
-            const YAML::Node& phaseConfig = phase_pair.second;
-            if (phaseConfig["actions"] && phaseConfig["actions"].IsSequence()) {
-                for (const auto& actionNode : phaseConfig["actions"]) {
-                    std::string actionName;
-                    nlohmann::json params;
 
-                    if (actionNode.IsScalar()) {
-                        actionName = actionNode.as<std::string>();
-                    } else if (actionNode.IsMap()) {
-                        // Only one key-value pair per map node (the action and its params)
-                        auto it = actionNode.begin();
-                        actionName = it->first.as<std::string>();
-                        const YAML::Node& paramNode = it->second;
-                        for (const auto& param : paramNode) {
-                            params[param.first.as<std::string>()] = param.second.as<std::string>();
-                        }
+void Entity::loadProtocolConfig(const std::string& configFile) {
+    if (!std::filesystem::exists(configFile)) {
+        throw std::runtime_error("protocol config not found: " + configFile);
+    }
+    protocolConfig = YAML::LoadFile(configFile);
+    if (!protocolConfig["protocol"]) {
+        throw std::runtime_error("protocol config " + configFile + " has no 'protocol' key");
+    }
+    protocolName_ = protocolConfig["protocol"].as<std::string>();
+    if (protocolConfig["timers"]) {
+        const YAML::Node& timers = protocolConfig["timers"];
+        if (timers["view_change_ms"]) viewChangeTimeoutMs = timers["view_change_ms"].as<int>();
+        if (timers["fast_path_wait_ms"]) fastPathWaitMs = timers["fast_path_wait_ms"].as<int>();
+    }
+    const YAML::Node& phases = protocolConfig["phases"];
+    if (!phases || !phases.IsMap()) {
+        throw std::runtime_error("protocol config " + configFile + ": 'phases' must be a map");
+    }
+    for (const auto& phase_pair : phases) {
+        const YAML::Node& phaseConfig = phase_pair.second;
+        if (phaseConfig["actions"] && phaseConfig["actions"].IsSequence()) {
+            for (const auto& actionNode : phaseConfig["actions"]) {
+                std::string actionName;
+                nlohmann::json params;
+
+                if (actionNode.IsScalar()) {
+                    actionName = actionNode.as<std::string>();
+                } else if (actionNode.IsMap()) {
+                    // Copy the nodes: yaml-cpp iterators hand out proxies, so
+                    // a reference into it->second would dangle.
+                    auto it = actionNode.begin();
+                    actionName = it->first.as<std::string>();
+                    YAML::Node paramNode = it->second;
+                    for (const auto& param : paramNode) {
+                        params[param.first.as<std::string>()] = param.second.as<std::string>();
                     }
-                    std::unique_ptr<BaseEvent> event = EventFactory::getInstance().createEvent(actionName, params);
-                    if (event) actions[actionName] = std::move(event);
-                    else std::cerr << "Unknown event: " << actionName << std::endl;
                 }
+                std::unique_ptr<BaseEvent> event = EventFactory::getInstance().createEvent(actionName, params);
+                if (!event) {
+                    throw std::runtime_error("protocol config " + configFile + ": unknown action '" +
+                                             actionName + "' in phase " + phase_pair.first.as<std::string>());
+                }
+                actions[actionName] = std::move(event);
             }
         }
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to load configuration: " << e.what() << std::endl;
     }
 }
+
 YAML::Node Entity::getPhaseConfigInsensitive(const std::string& phase) const {
     auto phases = protocolConfig["phases"];
     if (!phases || !phases.IsMap()) return YAML::Node();
@@ -526,41 +514,23 @@ YAML::Node Entity::getPhaseConfigInsensitive(const std::string& phase) const {
 void Entity::handleEvent(const Event* event, EntityState* context) {
     if (auto p = dynamic_cast<const ProtoMessage*>(event)) {
         try {
-            std::string messageType = p->phase();
-            messageType = p->explicit_type();
-            // if(getNodeId()==2){
-            //     std::cout << "[Node " << getNodeId() << "] Handling ProtoMessage of type: " << messageType << "\n";
-            // }
-            std::cout << "[Node " << getNodeId() << "] Handling ProtoMessage of type: " << messageType << "\n";
+            if (pbftCore_) {
+                handleConsensusEnvelope(p->envelope());
+                return;
+            }
+            std::string messageType = p->explicit_type();
+            LOG_DEBUG("Handling ProtoMessage of type: " << messageType << " seq=" << p->sequence()
+                      << " from=" << p->sender_id());
             if (messageType.empty()) return;
 
             int seq = p->sequence();
-            
-            // === FAST-PATH: cache Prepare for view-change ===
-            if (messageType == "Prepare" || messageType == "prepare") {
-                nlohmann::json filtered;
-                filtered["sequence"] = seq;
-                filtered["message_sender_id"] = p->sender_id();
-                // If you carry operation/timestamp in proto, capture them:
-                filtered["operation"] = p->operation();  // if available
-                filtered["timestamp"] = p->timestamp();  // if available
 
-                {
-                    std::lock_guard<std::mutex> lk(latestPrepareMtx);
-                    latestPreparePerSeq[seq] = std::move(filtered);
-                }
-            }
-            // === END FAST-PATH ===
-
-            // Ensure per-sequence state exists
             if (sequenceStates.find(seq) == sequenceStates.end()) {
                 sequenceStates.emplace(
                     seq,
                     EntityState(getState().getRole(), "Request", getState().getViewNumber(), seq)
                 );
             }
-
-            // IMPORTANT: align sequence state with actual incoming phase
             sequenceStates[seq].setState(messageType);
 
             YAML::Node phaseConfig = getPhaseConfigInsensitive(messageType);
@@ -575,17 +545,14 @@ void Entity::handleEvent(const Event* event, EntityState* context) {
                     } else if (actionNode.IsMap()) {
                         auto it = actionNode.begin();
                         actionName = it->first.as<std::string>();
-                        const YAML::Node& paramNode = it->second;
-                        for (auto pit = paramNode.begin(); pit != paramNode.end(); ++pit) {
-                            params[pit->first.as<std::string>()] = pit->second.as<std::string>();
+                        YAML::Node paramNode = it->second;
+                        for (const auto& param : paramNode) {
+                            params[param.first.as<std::string>()] = param.second.as<std::string>();
                         }
                     }
                     auto evt = EventFactory::getInstance().createEvent(actionName, params);
                     if (evt) {
                         const Message* msgPtr = dynamic_cast<const Message*>(event);
-                        // if(getNodeId()==2){
-                        std::cout << "[Node " << getNodeId() << "] Preparing to execute " << actionName << " for ProtoMessage: " << messageType << std::endl;
-                        // }
                         if (!evt->execute(this, msgPtr, &sequenceStates[seq])) {
                             actionsSucceeded = false;
                             break;
@@ -597,10 +564,10 @@ void Entity::handleEvent(const Event* event, EntityState* context) {
                     context->setState(phaseConfig["next_state"].as<std::string>());
                 }
             } else {
-                std::cerr << "[Node " << getNodeId() << "] No phaseConfig for " << messageType << "\n";
+                LOG_WARN("No phase configuration for message type " << messageType);
             }
         } catch (const std::exception& e) {
-            std::cerr << "[Node " << getNodeId() << "] Typed handleEvent error: " << e.what() << "\n";
+            LOG_ERROR("Typed handleEvent error: " << e.what());
         }
         return;
     }
@@ -609,115 +576,47 @@ void Entity::handleEvent(const Event* event, EntityState* context) {
         try {
             json j = json::parse(message->getContent());
             std::string messageType = j["type"].get<std::string>();
-
-            // Handle TriggerViewChange from the client
-            if (messageType == "TriggerViewChange") {
-                std::cout << "[Node " << getNodeId() << "] Received TriggerViewChange from client.\n";
-                initiateViewChange();
+            if (messageType == "Request") requestsReceived_.fetch_add(1);
+            if (pbftCore_ && messageType != "Request" && messageType != "QueryBalances") {
+                handleConsensusControl(j);
                 return;
             }
 
-            if(j["type"]=="changeServerStatus"){
-                if(j.contains("server_status")) {
-                    entityInfo["server_status"] = j["server_status"].get<int>();
-                    std::cout << "[Node " << getNodeId() << "] Server status changed to: " << entityInfo["server_status"] << "\n";
-                } else {
-                    std::cerr << "[Node " << getNodeId() << "] Invalid changeServerStatus message: missing server_status field.\n";
-                }
-                return;
-            }
-            if(entityInfo["server_status"]!=1) {
-                // std::cout << "[Node " << getNodeId() << "] Ignoring message while server is down.\n";
-                return;
-            }
-
-            else if (messageType == "FillHole") {
+            if (messageType == "FillHole") {
                 auto ev = EventFactory::getInstance().createEvent("fillHoleRequest");
                 if (ev) ev->execute(this, message, &_entityState);
                 return;
             }
 
-            // // --- Special handling for QueryBalances ---
-            // if (messageType == "QueryBalances" && j.contains("client_listen_port")) {
-            //     int clientPort = j["client_listen_port"];
-            //     json response = {
-            //         {"type", "BalancesReply"},
-            //         {"balances", balances} // or whatever your balances map is called
-            //     };
-            //     std::string respStr = response.dump();
-
-            //     // Connect to client and send response
-            //     TcpConnection clientConn(clientPort, false);
-            //     clientConn.send(respStr);
-            //     clientConn.closeConnection(); // If you have this method
-            //     std::cout << "[Node " << getNodeId() << "] Sent balances to client on port " << clientPort << std::endl;
-            //     return;
-            // }
-            // // --- End special handling ---
-
             int seq = assignSequenceNumber();
-            if(j.contains("sequence")) {
+            if (j.contains("sequence")) {
                 seq = j["sequence"].get<int>();
             }
-            // if (inViewChange && messageType != "ViewChange" && messageType != "NewView") {
-            //     std::cout << "  [IGNORED] Node " << getNodeId() << "in view change\n";
-            //     return;
-            // }
-            
-            // if(inViewChange && messageType == "NewView") {
-            //     //std::lock_guard<std::mutex> lock(timerMtx);
-            //     if (timeKeeper) {
-            //         timeKeeper->stop();
-            //     }
-            // }
 
-            // --- PiggybackBroadcast handling ---
             if (messageType == "PiggybackBroadcast" && j.contains("piggyback") && j["piggyback"].is_array()) {
-                // std::cout << "[Node " << getNodeId() << "] PiggybackBroadcast received. Types in piggyback:\n";
-                // for (const auto& piggyMsg : j["piggyback"]) {
-                //     if (piggyMsg.contains("type")) {
-                //         std::cout << "  - " << piggyMsg["type"].get<std::string>() << " seq -" << piggyMsg["sequence"] << "\n";
-                //     } else {
-                //         std::cout << "  - (no type field)\n";
-                //     }
-                // }
                 for (const auto& piggyMsg : j["piggyback"]) {
                     Message protocolMsg(piggyMsg.dump());
                     handleEvent(&protocolMsg, context);
                 }
                 return;
             }
-            // --- End PiggybackBroadcast handling ---
 
-            std::string phase = messageType;
-            
-            // std::cout << "[Node " << getNodeId() << "] Processing message of type: " << messageType << " for seq: " << seq << "\n";
-            
-            YAML::Node phaseConfig = getPhaseConfig(phase);
+            YAML::Node phaseConfig = getPhaseConfig(messageType);
             if (phaseConfig && phaseConfig["actions"] && phaseConfig["actions"].IsSequence()) {
-                // std::cout << "  Phase Configuration found for: " << phase << std::endl;
-                // std::cout << "  Executing actions:" << std::endl;
                 bool actionsSucceeded = true;
-                // Execute all actions
-                bool quorumMet = false;
                 for (const auto& actionNode : phaseConfig["actions"]) {
-                    
                     std::string actionName;
                     nlohmann::json params;
-
                     if (actionNode.IsScalar()) {
                         actionName = actionNode.as<std::string>();
                     } else if (actionNode.IsMap()) {
-                        // Only one key-value pair per map node (the action and its params)
                         auto it = actionNode.begin();
                         actionName = it->first.as<std::string>();
-                        const YAML::Node& paramNode = it->second;
-                        for (auto paramIt = paramNode.begin(); paramIt != paramNode.end(); ++paramIt) {
-                            params[paramIt->first.as<std::string>()] = paramIt->second.as<std::string>();
+                        YAML::Node paramNode = it->second;
+                        for (const auto& param : paramNode) {
+                            params[param.first.as<std::string>()] = param.second.as<std::string>();
                         }
-                        //std::cout << "[Node " << getNodeId() << "] Executing action: "  << actionName << " with params: " << params.dump() << "\n";
                     }
-                    // std::cout << "[Node " << getNodeId() << "] Executing action: " << actionName << " for seq " << seq << "type: " << j["type"] << "\n";
                     auto eventPtr = EventFactory::getInstance().createEvent(actionName, params);
                     if (eventPtr) {
                         bool shouldContinue = eventPtr->execute(this, message, &sequenceStates[seq]);
@@ -727,99 +626,55 @@ void Entity::handleEvent(const Event* event, EntityState* context) {
                         }
                     }
                 }
-
-                // Transition state only if all actions succeeded
                 if (actionsSucceeded && phaseConfig["next_state"] && context) {
                     std::string nextState = phaseConfig["next_state"].as<std::string>();
                     sequenceStates[seq].setState(nextState);
-                    // std::cout << "\n[Node " << getNodeId() << "] " << "Transitioning to state: " << nextState << std::endl;
                 }
-                
             } else {
-                std::cout << " No phase configuration found for: " << phase << std::endl;
+                LOG_WARN("No phase configuration for message type " << messageType);
             }
 
-            
-            // For protocol messages, ensure sequence state exists
             if (j.contains("sequence")) {
-                
-                int seq = j["sequence"].get<int>();
-                if (sequenceStates.find(seq) == sequenceStates.end()) {
-                    std::cout << "  Creating new sequence state for seq: " << seq << std::endl;
-                    sequenceStates.emplace(seq, EntityState(getState().getRole(), "Request", getState().getViewNumber(), seq));
+                int s = j["sequence"].get<int>();
+                if (sequenceStates.find(s) == sequenceStates.end()) {
+                    sequenceStates.emplace(s, EntityState(getState().getRole(), "Request", getState().getViewNumber(), s));
                 }
             }
-            
         } catch (const json::exception& e) {
-            std::cerr << "[Node " << getNodeId() << "] JSON parsing error: " << e.what() << "\n";
+            LOG_ERROR("JSON parsing error: " << e.what());
         }
     }
 }
+
 void Entity::sendToAll(const Message& message) {
-    // Broadcast to all peers (skip self)
-    for (int peer : peerPorts) {
-        if (peer == nodeId || peer == (5000 + nodeId)) continue;
-        if (grpcPortForPeer(peer) < 0) continue;
+    for (int peer : peerIds_) {
+        if (peer == nodeId) continue;
         sendTo(peer, message);
     }
 }
+
 void Entity::sendTo(int peer, const Message& message) {
-    if (peer == 1000) return;
-    if(peer==6000){
-        sendToClientViaTcp(message.getContent());
+    if (peer == nodeId) return;
+    if (!committee_.contains(peer)) {
+        LOG_ERROR("sendTo: unknown replica id " << peer);
         return;
     }
-    if (peer == nodeId || peer == (5000 + nodeId)) return;
-    if (grpcPortForPeer(peer) < 0) return;
-
-    // Capture message content by value for the async thread
-    std::string content = message.getContent();
-
-    std::thread([this, peer, content]() {
-        // Apply delay between nodes
-        auto delayIt = nodeDelays.find({nodeId, peer});
-        if (delayIt != nodeDelays.end() && delayIt->second > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delayIt->second));
-        }
-
-        bedrock::ProtocolEnvelope env;
-        const bool isTyped = buildEnvelopeFromJson(content, env);
-
-        try {
-            auto* stub = getStub(peer);
-            if (!stub) {
-                std::cerr << "[Node " << getNodeId() << "] No gRPC stub for peer " << peer << "\n";
-                return;
-            }
-            grpc::ClientContext ctx;
-            bedrock::Ack ack;
-
-            if (isTyped) {
-                auto status = stub->SendProtocol(&ctx, env, &ack);
-                if (!status.ok() || !ack.ok()) {
-                    std::cerr << "[Node " << getNodeId() << "] gRPC SendProtocol to peer "
-                              << peer << " failed: " << status.error_code() << " "
-                              << status.error_message() << " | ack=" << ack.msg() << "\n";
-                }
-            } else {
-                bedrock::RawJson req;
-                req.set_json(content);
-                bedrock::RawJson resp;
-                auto status = stub->SendRawJson(&ctx, req, &resp);
-                if (!status.ok()) {
-                    std::cerr << "[Node " << getNodeId() << "] gRPC SendRawJson to peer "
-                              << peer << " failed: " << status.error_code() << " "
-                              << status.error_message() << "\n";
-                }
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "[Node " << getNodeId() << "] gRPC send exception to peer "
-                      << peer << ": " << e.what() << "\n";
-        }
-    }).detach();
+    const std::string content = message.getContent();
+    if (options_.controlTransport) {
+        options_.controlTransport(peer, content);
+        return;
+    }
+    bedrock::ProtocolEnvelope env;
+    if (buildEnvelopeFromJson(content, env)) {
+        sender_.sendProtocol(peer, env);
+    } else {
+        sender_.sendRawJson(peer, content);
+    }
 }
+
 EntityState& Entity::getState() { return _entityState; }
 YAML::Node Entity::getPhaseConfig(const std::string& phase) const { return protocolConfig["phases"][phase]; }
+
 void Entity::removeSequenceState(int seq) {
     sequenceStates.erase(seq);
     prePrepareMessages.erase(seq);
@@ -829,240 +684,185 @@ void Entity::removeSequenceState(int seq) {
     prepareOperations.erase(seq);
     commitOperations.erase(seq);
 }
-void Entity::markOperationProcessed(int seq) {
+
+bool Entity::hasProcessedOperation(int seq) const {
     std::lock_guard<std::mutex> g(processedMtx);
-    auto [it, inserted] = processedOperations.insert(seq);
-    if (inserted && seq%1==0) {
-        auto now = std::chrono::system_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % std::chrono::seconds(1);
-        std::time_t tt = std::chrono::system_clock::to_time_t(now);
-        std::tm tm{};
-        localtime_r(&tt, &tm); // thread-safe on macOS
+    if (pbftCore_) return seq > 0 && seq <= lastExecuted_;
+    if (seq < pruneFloor_) return true;
+    return processedOperations.find(seq) != processedOperations.end();
+}
 
-        std::cout << "[Node " << getNodeId() << "] Marked operation as processed: " << seq
-                  << " at " << std::put_time(&tm, "%F %T") << '.'
-                  << std::setw(3) << std::setfill('0') << ms.count()
-                  << "\n";
+void Entity::noteFirstSeen(int seq, long long firstSeen) {
+    std::lock_guard<std::mutex> lk(phaseTsMtx);
+    firstSeenUs.emplace(seq, firstSeen);
+}
 
-        // Store every operation; flush to CSV when (seq % 99) == 0
-        std::string opStr;
-        if (commitOperations.count(seq)) opStr = commitOperations.at(seq);
-        try {
-            const auto ts_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                   std::chrono::system_clock::now().time_since_epoch()).count();
-            {   std::lock_guard<std::mutex> lk(s_csvBatchMtx);
-                s_csvBatches[getNodeId()].emplace_back(seq, ts_ms, opStr);
-                if (seq % 99 == 0) {
-                    flushCsvBatchUnlocked(getNodeId());
-                }
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "[Node " << getNodeId() << "] CSV batch error: " << e.what() << "\n";
+void Entity::markOperationProcessed(int seq, int path, uint32_t transactions, uint32_t batchSize) {
+    bool inserted = false;
+    {
+        std::lock_guard<std::mutex> g(processedMtx);
+        if (seq < pruneFloor_) return;
+        inserted = processedOperations.insert(seq).second;
+    }
+    if (!inserted) return;
+
+    const uint64_t committedTotal = committedTotal_.fetch_add(1) + 1;
+    committedTransactions_ += transactions;
+    if (path == 1) fastPathTotal_.fetch_add(1);
+    else if (path == 0) slowPathTotal_.fetch_add(1);
+    LOG_DEBUG("Committed seq " << seq << (path == 1 ? " (fast path)" : path == 0 ? " (slow path)" : ""));
+
+    const long long now = nowUs();
+    long long e2eLatUs = -1;
+    long long ppLatUs = -1, prLatUs = -1, coLatUs = -1;
+    {
+        std::lock_guard<std::mutex> lk(phaseTsMtx);
+        auto it_fs = firstSeenUs.find(seq);
+        if (it_fs != firstSeenUs.end() && now > it_fs->second) e2eLatUs = now - it_fs->second;
+        auto it_pp = phaseTs_preprepare.find(seq);
+        auto it_pr = phaseTs_prepare.find(seq);
+        auto it_co = phaseTs_commit.find(seq);
+        if (it_pp != phaseTs_preprepare.end() && it_pr != phaseTs_prepare.end()) {
+            long long ppUs = it_pr->second - it_pp->second;
+            if (ppUs > 0) ppLatUs = ppUs;
         }
-
-        // Windowed throughput & latency metrics
-        try {
-            long long nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-
-            // Compute end-to-end latency from client-embedded timestamp (format: "ms_idx")
-            // reuse opStr already read above
-            long long e2eLatUs = -1;
-            long long ppLatUs = -1, prLatUs = -1, coLatUs = -1;
-            if (!opStr.empty()) {
-                auto sep = opStr.find('_');
-                if (sep != std::string::npos) {
-                    long long clientMs = std::stoll(opStr.substr(0, sep));
-                    long long latUs = nowUs - clientMs * 1000LL;
-                    if (latUs > 0) {
-                        nodeBench.record(latUs);
-                        e2eLatUs = latUs;
-                        ++windowTxCount; // only count txns with valid latency
-                    }
-                }
-            }
-
-            // Phase-wise latencies
-            {
-                std::lock_guard<std::mutex> lk(phaseTsMtx);
-                auto it_pp = phaseTs_preprepare.find(seq);
-                auto it_pr = phaseTs_prepare.find(seq);
-                auto it_co = phaseTs_commit.find(seq);
-                if (it_pp != phaseTs_preprepare.end() && it_pr != phaseTs_prepare.end()) {
-                    long long ppUs = it_pr->second - it_pp->second;
-                    if (ppUs > 0) { phaseBench_preprepare.record(ppUs); ppLatUs = ppUs; }
-                }
-                if (it_pr != phaseTs_prepare.end() && it_co != phaseTs_commit.end()) {
-                    long long prUs = it_co->second - it_pr->second;
-                    if (prUs > 0) { phaseBench_prepare.record(prUs); prLatUs = prUs; }
-                }
-                if (it_co != phaseTs_commit.end()) {
-                    long long coUs = nowUs - it_co->second;
-                    if (coUs > 0) { phaseBench_commit.record(coUs); coLatUs = coUs; }
-                }
-                phaseTs_preprepare.erase(seq);
-                phaseTs_prepare.erase(seq);
-                phaseTs_commit.erase(seq);
-
-                // Purge stale entries for sequences that never completed (TTL = 30s)
-                constexpr long long kStaleTtlUs = 30'000'000LL;
-                for (auto it = phaseTs_preprepare.begin(); it != phaseTs_preprepare.end(); )
-                    it = (nowUs - it->second > kStaleTtlUs) ? phaseTs_preprepare.erase(it) : std::next(it);
-                for (auto it = phaseTs_prepare.begin(); it != phaseTs_prepare.end(); )
-                    it = (nowUs - it->second > kStaleTtlUs) ? phaseTs_prepare.erase(it) : std::next(it);
-                for (auto it = phaseTs_commit.begin(); it != phaseTs_commit.end(); )
-                    it = (nowUs - it->second > kStaleTtlUs) ? phaseTs_commit.erase(it) : std::next(it);
-            }
-
-            // Feed the learning agent with this consensus sample (wall-clock
-            // windows are managed inside AgentClient).
-            if (agentClient_) {
-                AgentConsensusSample sample;
-                sample.sequence = seq > 0 ? static_cast<uint32_t>(seq) : 0;
-                sample.latencyUs = e2eLatUs;
-                sample.phase1Us = ppLatUs;
-                sample.phase2Us = prLatUs;
-                sample.phase3Us = coLatUs;
-                agentClient_->recordConsensus(sample);
-            }
-
-            int half   = windowSize / 2;
-            int eighty = windowSize * 4 / 5;
-
-            auto logWindowMetrics = [&](const std::string& checkpoint) {
-                auto s   = nodeBench.stats();
-                auto spp = phaseBench_preprepare.stats();
-                auto spr = phaseBench_prepare.stats();
-                auto sco = phaseBench_commit.stats();
-                // Use bench-tracked count (reflects slice size after any mid-window reset)
-                const size_t sliceTxCount = s.completed;
-                std::cout << "[Node " << getNodeId() << "] Window " << windowId
-                          << " @" << checkpoint
-                          << " txns=" << sliceTxCount
-                          << " throughput=" << s.throughput << " ops/sec"
-                          << " avg=" << s.avg << "us"
-                          << " preprepare_avg=" << spp.avg << "us"
-                          << " prepare_avg=" << spr.avg << "us"
-                          << " commit_avg=" << sco.avg << "us\n";
-
-                std::filesystem::create_directories("logs");
-                const std::string csvPath = "logs/node_" + std::to_string(getNodeId()) + "_metrics.csv";
-                const bool needsHeader = !std::filesystem::exists(csvPath) ||
-                                         std::filesystem::file_size(csvPath) == 0;
-                std::ofstream out(csvPath, std::ios::app);
-                if (needsHeader) out << "window_id,checkpoint,tx_count,throughput_ops_sec,avg_latency_us,"
-                                        "avg_preprepare_phase_us,avg_prepare_phase_us,avg_commit_phase_us\n";
-                out << windowId << "," << checkpoint << "," << sliceTxCount << ","
-                    << s.throughput << "," << s.avg << ","
-                    << spp.avg << "," << spr.avg << "," << sco.avg << "\n";
-            };
-
-            if (windowTxCount == half) {
-                logWindowMetrics("50pct");
-            } else if (windowTxCount == eighty) {
-                logWindowMetrics("80pct");
-            } else if (windowTxCount >= windowSize) {
-                logWindowMetrics("100pct");
-
-                ++windowId;
-                windowTxCount = 0;
-                nodeBench.reset("node_" + std::to_string(getNodeId()) + "_w" + std::to_string(windowId));
-                phaseBench_preprepare.reset("preprepare_phase_w" + std::to_string(windowId));
-                phaseBench_prepare.reset("prepare_phase_w" + std::to_string(windowId));
-                phaseBench_commit.reset("commit_phase_w" + std::to_string(windowId));
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "[Node " << getNodeId() << "] Metrics error: " << e.what() << "\n";
+        if (it_pr != phaseTs_prepare.end() && it_co != phaseTs_commit.end()) {
+            long long prUs = it_co->second - it_pr->second;
+            if (prUs > 0) prLatUs = prUs;
         }
+        if (it_co != phaseTs_commit.end()) {
+            long long coUs = now - it_co->second;
+            if (coUs > 0) coLatUs = coUs;
+        }
+        firstSeenUs.erase(seq);
+        phaseTs_preprepare.erase(seq);
+        phaseTs_prepare.erase(seq);
+        phaseTs_commit.erase(seq);
+    }
+
+    if (agentClient_) {
+        AgentConsensusSample sample;
+        sample.sequence = seq > 0 ? static_cast<uint32_t>(seq) : 0;
+        sample.latencyUs = e2eLatUs;
+        sample.phase1Us = ppLatUs;
+        sample.phase2Us = prLatUs;
+        sample.phase3Us = coLatUs;
+        sample.path = path;
+        sample.transactions = transactions;
+        sample.batchSize = batchSize;
+        agentClient_->recordConsensus(sample);
+    }
+
+    if (seq > highestCommittedSeq_) highestCommittedSeq_ = seq;
+    if (!pbftCore_ && committedTotal % kPruneEveryCommits == 0) {
+        pruneSequenceState();
     }
 }
-void Entity::printCommittedMessages() {
-    std::cout << "\n========== Committed Messages ==========\n";
-    std::cout << "[Node " << getNodeId() << "] Processed Operations:\n";
-    for (const auto& op : processedOperations) {
-        std::cout << "  - " << op << "\n";
+
+// Releases per-sequence bookkeeping far behind the newest commit. Runs on
+// the engine thread (markOperationProcessed is reached from handleEvent
+// under eventMtx), so the unlocked maps are safe to touch here.
+void Entity::pruneSequenceState() {
+    const int floor = highestCommittedSeq_ - kRetainedSequences;
+    if (floor <= pruneFloor_) return;
+
+    sequenceStates.erase(sequenceStates.begin(), sequenceStates.lower_bound(floor));
+    allMessagesBySeq.erase(allMessagesBySeq.begin(), allMessagesBySeq.lower_bound(floor));
+    auto pruneIntMap = [floor](auto& m) {
+        for (auto it = m.begin(); it != m.end();) {
+            it = (it->first < floor) ? m.erase(it) : std::next(it);
+        }
+    };
+    pruneIntMap(prePrepareMessages);
+    pruneIntMap(prepareMessages);
+    pruneIntMap(commitMessages);
+    pruneIntMap(prePrepareOperations);
+    pruneIntMap(prepareOperations);
+    pruneIntMap(commitOperations);
+    pruneIntMap(receivedMessages);
+    pruneIntMap(preparePhaseTimerRunning);
+    pruneIntMap(preprepareCache);
+    for (auto it = executedRequestBySeq_.begin(); it != executedRequestBySeq_.end() && it->first < floor;) {
+        executedRequests_.erase(it->second);
+        it = executedRequestBySeq_.erase(it);
     }
-    
-    std::cout << "====================================\n\n";
+    {
+        std::lock_guard<std::mutex> lk(prePrepareMtx);
+        pruneIntMap(prePrepareIndex);
+    }
+    {
+        std::lock_guard<std::mutex> lk(phaseTsMtx);
+        pruneIntMap(phaseTs_preprepare);
+        pruneIntMap(phaseTs_prepare);
+        pruneIntMap(phaseTs_commit);
+        pruneIntMap(firstSeenUs);
+    }
+    {
+        std::lock_guard<std::mutex> lk(senderIdsMtx);
+        for (auto it = keyToSenderIds.begin(); it != keyToSenderIds.end();) {
+            int s = 0;
+            it = (keySequence(it->first, s) && s < floor) ? keyToSenderIds.erase(it) : std::next(it);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(quorumTriggeredMtx);
+        for (auto it = quorumTriggered.begin(); it != quorumTriggered.end();) {
+            int s = 0;
+            it = (keySequence(*it, s) && s < floor) ? quorumTriggered.erase(it) : std::next(it);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> g(processedMtx);
+        processedOperations.erase(processedOperations.begin(), processedOperations.lower_bound(floor));
+        pruneFloor_ = floor;
+    }
+    LOG_DEBUG("pruned sequence state below " << floor);
 }
+
 bool Entity::runVerification(const std::string& verifyType, const json& msg, EntityState* context) {
     if (verifyType == "none") return true;
     if (verifyType == "view_match") {
         int expected = context->getViewNumber();
         int actual = msg.contains("view") ? msg["view"].get<int>() : -1;
         if (!msg.contains("view") || actual != expected) {
-            std::cout << "[Node " << getNodeId() << "] view_match failed: expected " << expected << ", got " << actual << "\n";
+            LOG_DEBUG("view_match failed: expected " << expected << ", got " << actual);
             return false;
         }
         return true;
     }
-    if (verifyType == "valid_signature") return true;
-    if (verifyType == "unique_digest") return true;
-    if (verifyType == "preprepare_exists") return true;
-    if (verifyType == "prepare_exists") return true;
     return true;
 }
 
-void Entity::loadOrInitDataset() {
-    std::string filename = "entity_info_" + std::to_string(getNodeId()) + ".json";
-    nlohmann::json info;
-
-    if (std::filesystem::exists(filename)) {
-        std::ifstream in(filename);
-        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        in.close();
-        if (!content.empty()) {
-            try {
-                info = nlohmann::json::parse(content);
-            } catch (const nlohmann::json::parse_error& e) {
-                std::cerr << "[Node " << getNodeId() << "] Failed to parse JSON from " << filename << ": " << e.what() << std::endl;
-                info["server_name"] = getNodeId();
-                info["view"] = 0;
-                info["sequence"] = 0;
-                info["server_status"] = 1;
-                //saveEntityInfo();
-            }
-        }
-    } else {
-        info["server_name"] = getNodeId();
-        info["view"] = 0;
-        info["sequence"] = 0;
-        info["server_status"] = 1;
-        //saveEntityInfo();
+void Entity::replyToClient(const std::string& clientId, uint64_t requestId, const std::string& result) {
+    if (clientId.empty()) return;
+    bedrock::ClientReply reply;
+    reply.set_client_id(clientId);
+    reply.set_request_id(requestId);
+    reply.set_view(currentView());
+    reply.set_replica_id(nodeId);
+    reply.set_leader_id(currentLeader());
+    reply.set_result(result);
+    if (clientStreams_.reply(clientId, reply)) {
+        repliesSent_.fetch_add(1);
     }
-    this->entityInfo = info;
-}
-
-void Entity::updateEntityInfoField(const std::string& key, const nlohmann::json& value) {
-    entityInfo[key] = value;
-}
-
-void Entity::saveEntityInfo() {
-    std::string filename = "entity_info_" + std::to_string(getNodeId()) + ".json";
-    std::string tmpFilename = filename + ".tmp";
-    {
-        std::ofstream out(tmpFilename, std::ios::trunc);
-        out << entityInfo.dump(4) << std::endl;
-    }
-    std::filesystem::rename(tmpFilename, filename);
 }
 
 void Entity::applyAgentTimeouts(const AgentTimeouts& timeouts) {
-    if (timeouts.electionMs > 0 && timeouts.electionMs != viewChangeTimeoutMs) {
+    std::lock_guard<std::recursive_mutex> engine(eventMtx);
+    if (timeouts.electionMs > 0) {
         viewChangeTimeoutMs = timeouts.electionMs;
-        std::lock_guard<std::mutex> lk(timerMtx);
-        if (timeKeeper) {
-            timeKeeper->stop();
-            timeKeeper = std::make_unique<TimeKeeper>(viewChangeTimeoutMs, [this] { onTimeout(); });
-        }
     }
     if (timeouts.slowPathMs > 0) {
         fastPathWaitMs = timeouts.slowPathMs;
     }
+    requestTimer_.timeoutChanged();
+    if (viewChangeWaitSince_ && timeouts.electionMs > 0) scheduleViewChangeWait();
+    LOG_INFO("applied timeouts: election_timeout_ms=" << viewChangeTimeoutMs.load()
+             << " slow_path_timeout_ms=" << fastPathWaitMs.load());
 }
 
 void Entity::initiateViewChange() {
-    std::cout << "[Node " << getNodeId() << "] Initiating view change.\n";
+    LOG_INFO("Initiating view change.");
     if (agentClient_) {
         agentClient_->recordViewChange();
     }
@@ -1074,15 +874,15 @@ void Entity::initiateViewChange() {
     nlohmann::json viewChangeMsg;
     viewChangeMsg["type"] = "ViewChange";
     viewChangeMsg["view"] = newView;
+    viewChangeMsg["new_view"] = newView;
     viewChangeMsg["message_sender_id"] = getNodeId();
     viewChangeMsg["committed_seq"] = committedSeq;
 
-    // Collect speculative log for sequences > committed_seq
     nlohmann::json speculativeLogArray = nlohmann::json::array();
-    nlohmann::json prepareMsgs = nlohmann::json::array(); // NEW
+    nlohmann::json prepareMsgs = nlohmann::json::array();
     {
         std::lock_guard<std::mutex> lock(speculativeLogMtx);
-        for (const auto& [seq, entry] : speculativeLog) { // Use structured bindings for std::map
+        for (const auto& [seq, entry] : speculativeLog) {
             if (seq > committedSeq) {
                 nlohmann::json logEntry = {
                     {"sequence", seq},
@@ -1093,7 +893,6 @@ void Entity::initiateViewChange() {
                 };
                 speculativeLogArray.push_back(logEntry);
 
-                // Zyzzyva VC status entry compatible with leader logic
                 nlohmann::json pm = {
                     {"sequence", seq},
                     {"timestamp", entry.txnId},
@@ -1102,27 +901,20 @@ void Entity::initiateViewChange() {
                         {"to", entry.to},
                         {"amount", entry.amount}
                     }},
-                    {"operation", entry.txnId} // optional
+                    {"operation", entry.txnId}
                 };
                 prepareMsgs.push_back(pm);
             }
         }
     }
     viewChangeMsg["speculative_log"] = speculativeLogArray;
-    viewChangeMsg["prepare_messages"] = prepareMsgs; // NEW
+    viewChangeMsg["prepare_messages"] = prepareMsgs;
 
-    // Send ViewChange to the next leader
-    if (!peerPorts.empty()) {
-        int nextLeader = newView % peerPorts.size();
-        Message msg(viewChangeMsg.dump());
-        sendTo(peerPorts[nextLeader], msg);
-        std::cout << "[Node " << getNodeId() << "] Sent ViewChange(view=" << newView
-                  << ", committed_seq=" << committedSeq << ") to next leader (Node " << peerPorts[nextLeader] << ").\n";
-    } else {
-        sendToAll(Message(viewChangeMsg.dump()));
-        std::cout << "[Node " << getNodeId() << "] Broadcasted ViewChange(view=" << newView
-                  << ", committed_seq=" << committedSeq << ").\n";
-    }
+    int nextLeader = leaderForView(newView);
+    Message msg(viewChangeMsg.dump());
+    sendTo(nextLeader, msg);
+    LOG_DEBUG("Sent ViewChange(view=" << newView << ", committed_seq=" << committedSeq
+              << ") to next leader (Node " << nextLeader << ").");
 }
 
 int Entity::allocateNextSequence() {
@@ -1135,215 +927,70 @@ int Entity::allocateNextSequence() {
 
 bool Entity::processJsonFromGrpc(const std::string& jsonPayload) {
     try {
-        std::lock_guard<std::mutex> lk(eventMtx);
+        std::lock_guard<std::recursive_mutex> lk(eventMtx);
         Message msg(jsonPayload);
         handleEvent(&msg, &_entityState);
         return true;
-    } catch (...) {
+    } catch (const std::exception& e) {
+        static std::atomic<uint64_t> failures{0};
+        const uint64_t count = failures.fetch_add(1) + 1;
+        if (count == 1 || count % 1000 == 0) {
+            LOG_ERROR("processJsonFromGrpc failed (" << count << " so far): " << e.what());
+        }
         return false;
     }
 }
 
 void Entity::startGrpcServer() {
-    int grpcPort = 15000 + nodeId;
-    grpcSvc_ = std::make_unique<NodeServiceImpl>(*this);  // changed to pass Entity&
+    const auto& self = committee_.replica(nodeId);
+    grpcSvc_ = std::make_unique<NodeServiceImpl>(*this);
 
     grpc::ServerBuilder builder;
-    std::string addr = "0.0.0.0:" + std::to_string(grpcPort);
+    // Bind on all interfaces at the committee port so the address the peers
+    // dial (the namespace IP) and loopback both work.
+    std::string addr = "0.0.0.0:" + std::to_string(self.port);
     builder.AddListeningPort(addr, grpc::InsecureServerCredentials());
+    builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
+    builder.SetMaxSendMessageSize(64 * 1024 * 1024);
     builder.RegisterService(grpcSvc_.get());
     grpcServer_ = builder.BuildAndStart();
     if (!grpcServer_) {
-        std::cerr << "[Node " << getNodeId() << "] Failed to start gRPC server on " << addr << "\n";
-        grpcSvc_.reset();
-        return;
+        throw std::runtime_error("failed to start gRPC server on " + addr);
     }
-    grpcThread_ = std::thread([this, grpcPort]{
-        std::cout << "[Node " << getNodeId() << "] gRPC listening on " << grpcPort << "\n";
+    grpcThread_ = std::thread([this, addr]{
+        LOG_INFO("gRPC listening on " << addr);
         grpcServer_->Wait();
     });
 }
 
 void Entity::stopGrpcServer() {
-    if (grpcServer_) grpcServer_->Shutdown();
+    if (grpcServer_) {
+        grpcServer_->Shutdown(std::chrono::system_clock::now() + std::chrono::seconds(2));
+    }
     if (grpcThread_.joinable()) grpcThread_.join();
     grpcServer_.reset();
     grpcSvc_.reset();
 }
 
-// Create gRPC stubs to peers (skip self and invalid entries)
-void Entity::initGrpcStubs() {
-    std::lock_guard<std::mutex> lk(grpcStubsMtx_);
-    grpcStubs_.clear();
-
-    auto makeStub = [&](int idOrPort) {
-        int port = grpcPortForPeer(idOrPort);
-        if (port < 0) {
-            std::cerr << "[Node " << getNodeId() << "] Skipping invalid peer entry " << idOrPort << "\n";
-            return;
-        }
-        const std::string address = "127.0.0.1:" + std::to_string(port);
-        auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
-        grpcStubs_[idOrPort] = bedrock::Node::NewStub(channel);
-    };
-
-    for (int peer : peerPorts) {
-        if (peer == nodeId) continue;            // skip self by nodeId form
-        if (peer == (5000 + nodeId)) continue;   // skip self by TCP form
-        if (grpcStubs_.find(peer) == grpcStubs_.end()) {
-            makeStub(peer);
-        }
-    }
-}
-
-bedrock::Node::Stub* Entity::getStub(int peer) {
-    std::lock_guard<std::mutex> lk(grpcStubsMtx_);
-    auto it = grpcStubs_.find(peer);
-    if (it != grpcStubs_.end()) return it->second.get();
-
-    int port = grpcPortForPeer(peer);
-    if (port < 0) {
-        std::cerr << "[Node " << getNodeId() << "] Invalid peer " << peer << " (no gRPC mapping)\n";
-        return nullptr;
-    }
-    const std::string address = "127.0.0.1:" + std::to_string(port);
-    auto channel = grpc::CreateChannel(address, grpc::InsecureChannelCredentials());
-    grpcStubs_[peer] = bedrock::Node::NewStub(channel);
-    return grpcStubs_[peer].get();
-}
-
 void Entity::processProtocolEnvelope(const bedrock::ProtocolEnvelope& env) {
+    std::lock_guard<std::recursive_mutex> lk(eventMtx);
     ProtoMessage pmsg(env);
     handleEvent(&pmsg, &_entityState);
 }
 
 void Entity::sendProtocolToAll(const bedrock::ProtocolEnvelope& env) {
-    for (int peer : peerPorts) {
-        if (peer == nodeId || peer == (5000 + nodeId) || peer == 1000) continue;
-        if (grpcPortForPeer(peer) < 0) continue;
+    for (int peer : peerIds_) {
+        if (peer == nodeId) continue;
         sendProtocolTo(peer, env);
     }
 }
 
 void Entity::sendProtocolTo(int peer, const bedrock::ProtocolEnvelope& env) {
-    if (peer == nodeId || peer == (5000 + nodeId) || peer == 1000) return;
-    if (grpcPortForPeer(peer) < 0) {
+    if (peer == nodeId) return;
+    if (!committee_.contains(peer)) {
+        LOG_ERROR("sendProtocolTo: unknown replica id " << peer);
         return;
     }
-
-    // Launch async so delays don't block the sender sequentially
-    std::thread([this, peer, env]() {
-        // Apply delay between nodes
-        auto delayIt = nodeDelays.find({nodeId, peer});
-        if (delayIt != nodeDelays.end() && delayIt->second > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(delayIt->second));
-        }
-
-        try {
-            auto* stub = getStub(peer);
-            if (!stub) {
-                std::cerr << "[Node " << getNodeId() << "] No gRPC stub for peer " << peer << "\n";
-                return;
-            }
-            grpc::ClientContext ctx;
-            bedrock::Ack ack;
-            auto status = stub->SendProtocol(&ctx, env, &ack);
-            if (!status.ok() || !ack.ok()) {
-                std::cerr << "[Node " << getNodeId() << "] gRPC SendProtocol to peer "
-                          << peer << " failed: " << status.error_code() << " "
-                          << status.error_message() << " | ack=" << ack.msg() << "\n";
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "[Node " << getNodeId() << "] gRPC send exception to peer "
-                      << peer << ": " << e.what() << "\n";
-        }
-    }).detach();
+    if (options_.protocolTransport) options_.protocolTransport(peer, env);
+    else sender_.sendProtocol(peer, env);
 }
-
-// ---- Byzantine schedule helpers ----
-
-static int byzParseSeconds(const std::string& s) {
-    // "10s" -> 10
-    return std::stoi(s.substr(0, s.find('s')));
-}
-static int byzParseMs(const std::string& s) {
-    // "200ms" -> 200
-    return std::stoi(s.substr(0, s.find('m')));
-}
-
-void Entity::loadByzantineSchedule(const std::string& configFile) {
-    try {
-        if (!std::filesystem::exists(configFile)) return;
-        YAML::Node config = YAML::LoadFile(configFile);
-        if (!config["schedule"] || !config["schedule"].IsSequence()) return;
-        for (const auto& entry : config["schedule"]) {
-            ByzantineScheduleEntry e;
-            e.atSeconds = byzParseSeconds(entry["at"].as<std::string>());
-            for (const auto& nodePair : entry["nodes"]) {
-                int nid = nodePair.first.as<int>();
-                ByzantineNodeState st;
-                const auto& nb = nodePair.second;
-                if (nb["proposal_delay"])  st.proposalDelayMs      = byzParseMs(nb["proposal_delay"].as<std::string>());
-                if (nb["skip_fast_path"])  st.skipFastPath         = nb["skip_fast_path"].as<bool>();
-                if (nb["delay_fast_path"]) st.fastPathExtraDelayMs = byzParseMs(nb["delay_fast_path"].as<std::string>());
-                e.nodes[nid] = st;
-            }
-            byzantineSchedule.push_back(std::move(e));
-        }
-        std::sort(byzantineSchedule.begin(), byzantineSchedule.end(),
-                  [](const auto& a, const auto& b){ return a.atSeconds < b.atSeconds; });
-        byzantineStartTime = std::chrono::steady_clock::now();
-        std::cout << "[Node " << getNodeId() << "] Loaded byzantine schedule ("
-                  << byzantineSchedule.size() << " entries) from " << configFile << "\n";
-    } catch (const std::exception& ex) {
-        std::cerr << "[Node " << getNodeId() << "] byzantine schedule load error: " << ex.what() << "\n";
-    }
-}
-
-Entity::ByzantineNodeState Entity::getActiveByzantineState() const {
-    if (byzantineSchedule.empty()) return {};
-    ByzantineNodeState snapshot;
-    bool stateChanged = false;
-    int elapsed = 0;
-    {
-        std::lock_guard<std::mutex> lk(byzantineMtx);
-        elapsed = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - byzantineStartTime).count());
-        // Advance through any newly-elapsed entries; O(1) amortised.
-        while (nextByzScheduleIdx < byzantineSchedule.size() &&
-               byzantineSchedule[nextByzScheduleIdx].atSeconds <= elapsed) {
-            const auto& entry = byzantineSchedule[nextByzScheduleIdx];
-            auto it = entry.nodes.find(nodeId);
-            if (it != entry.nodes.end()) {
-                activeByzantineState = it->second;
-                stateChanged = true;
-            }
-            ++nextByzScheduleIdx;
-        }
-        snapshot = activeByzantineState;
-    } // lock released here
-    if (stateChanged)
-        std::cout << "[Node " << nodeId << "] Byzantine state updated at t+" << elapsed
-                  << "s: proposalDelay=" << snapshot.proposalDelayMs
-                  << "ms skipFastPath=" << snapshot.skipFastPath
-                  << " fastPathExtra=" << snapshot.fastPathExtraDelayMs << "ms\n";
-    return snapshot;
-}
-
-void Entity::loadDelaysFromConfig(const std::string& configFile) {
-    try {
-        YAML::Node config = YAML::LoadFile(configFile);
-        if (config["delays"]) {
-            for (const auto& delayEntry : config["delays"]) {
-                int from = delayEntry["from"].as<int>();
-                int to = delayEntry["to"].as<int>();
-                int delay = delayEntry["delay"].as<int>();
-                nodeDelays[{from, to}] = delay;
-            }
-        }
-    } catch (const std::exception& e) {
-        std::cerr << "[Node " << getNodeId() << "] Failed to load delays from config: " << e.what() << "\n";
-    }
-}
-

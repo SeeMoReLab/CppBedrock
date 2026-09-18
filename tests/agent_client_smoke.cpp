@@ -1,14 +1,15 @@
 // Live smoke test for the protocol-agnostic learning-agent client.
 //
 // Requires a learning agent listening on 127.0.0.1:<port> (default 50190):
-//   python3 learning_agent/main.py --node-id 1 --protocol pbft \
+//   python3 learning_agent/main.py --node-id 0 --protocol pbft \
 //     --host 127.0.0.1 --port 50190 --signing false --model-type random
 //
 // Usage: agent_client_smoke [protocol] [port] [seconds]
 //   protocol: PBFT | LinearPBFT | SBFT | Hotstuff | Hotstuff2 |
-//             ChainedHotstuff | Zyzzyva (default PBFT)
+//             ChainedHotstuff (default PBFT)
 
 #include "core/agent/AgentClient.h"
+#include "core/Log.h"
 
 #include <atomic>
 #include <chrono>
@@ -24,8 +25,9 @@ int main(int argc, char** argv) {
     int port = argc > 2 ? std::atoi(argv[2]) : 50190;
     int seconds = argc > 3 ? std::atoi(argv[3]) : 12;
 
+    bedrock::logging::setComponent("smoke");
     AgentClientConfig cfg;
-    cfg.nodeId = 1;
+    cfg.nodeId = 0;
     cfg.port = port;
     cfg.featureDurationMs = 2000;
     cfg.replyWaitMs = 1000;

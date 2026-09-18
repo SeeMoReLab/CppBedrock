@@ -5,13 +5,12 @@
 
 class Entity;
 
+// gRPC service hosted by every replica: replica-to-replica messages are
+// processed before acknowledgement. Client streams use bounded ingress
+// separate from consensus processing, and separate writers for replies.
 class NodeServiceImpl final : public bedrock::Node::Service {
 public:
     explicit NodeServiceImpl(Entity& entity);
-
-    grpc::Status SubmitRequest(grpc::ServerContext*,
-                               const bedrock::ClientRequest*,
-                               bedrock::Ack*) override;
 
     grpc::Status SendRawJson(grpc::ServerContext*,
                              const bedrock::RawJson*,
@@ -20,6 +19,9 @@ public:
     grpc::Status SendProtocol(grpc::ServerContext*,
                               const bedrock::ProtocolEnvelope*,
                               bedrock::Ack*) override;
+
+    grpc::Status ClientStream(grpc::ServerContext*,
+                              grpc::ServerReaderWriter<bedrock::ClientReply, bedrock::ClientRequest>*) override;
 
 private:
     Entity& entity_;

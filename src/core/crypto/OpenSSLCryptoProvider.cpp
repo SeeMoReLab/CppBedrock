@@ -32,6 +32,7 @@ OpenSSLCryptoProvider::OpenSSLCryptoProvider(const std::string& privateKeyPath) 
 
 OpenSSLCryptoProvider::~OpenSSLCryptoProvider() {
     if (pkey) EVP_PKEY_free((EVP_PKEY*)pkey);
+    for (auto& [path, key] : publicKeys_) EVP_PKEY_free(static_cast<EVP_PKEY*>(key));
 }
 
 std::string OpenSSLCryptoProvider::sign(const std::string& data) {
@@ -52,11 +53,23 @@ std::string OpenSSLCryptoProvider::sign(const std::string& data) {
 }
 
 bool OpenSSLCryptoProvider::verify(const std::string& data, const std::string& signature, const std::string& pubkeyPath) {
-    FILE* fp = fopen(pubkeyPath.c_str(), "r");
-    if (!fp) return false;
-    EVP_PKEY* pubkey = PEM_read_PUBKEY(fp, nullptr, nullptr, nullptr);
-    fclose(fp);
-    if (!pubkey) return false;
+    if (signature.empty() || signature.size() % 2) return false;
+    for (unsigned char c : signature)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    EVP_PKEY* pubkey = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(keysMutex_);
+        auto found = publicKeys_.find(pubkeyPath);
+        if (found == publicKeys_.end()) {
+            FILE* fp = fopen(pubkeyPath.c_str(), "r");
+            if (!fp) return false;
+            pubkey = PEM_read_PUBKEY(fp, nullptr, nullptr, nullptr);
+            fclose(fp);
+            if (!pubkey) return false;
+            publicKeys_.emplace(pubkeyPath, pubkey);
+        } else pubkey = static_cast<EVP_PKEY*>(found->second);
+        EVP_PKEY_up_ref(pubkey);
+    }
 
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     if (!ctx) { EVP_PKEY_free(pubkey); return false; }

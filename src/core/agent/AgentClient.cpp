@@ -1,12 +1,10 @@
-#include "../../../include/core/agent/AgentClient.h"
+#include "core/agent/AgentClient.h"
 
 #include <grpcpp/grpcpp.h>
 #include <google/protobuf/empty.pb.h>
 
 #include <algorithm>
-#include <iostream>
 #include <numeric>
-#include <sstream>
 #include <stdexcept>
 #include <chrono>
 #include <cstdint>
@@ -16,6 +14,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include "core/Log.h"
 
 namespace {
 
@@ -32,6 +32,34 @@ float avgMs(const std::vector<long long>& us) {
     if (us.empty()) return 0.0f;
     long long sum = std::accumulate(us.begin(), us.end(), 0LL);
     return (float)((double)sum / (double)us.size() / 1000.0);
+}
+
+float percentileMs(std::vector<long long> us, double p) {
+    if (us.empty()) return 0.0f;
+    std::sort(us.begin(), us.end());
+    return (float)((double)percentile(us, p) / 1000.0);
+}
+
+// Fills the 16 base fields shared by PbftReport, SbftReport, and
+// HotstuffReport (identical setter names in every generated class).
+template <typename ReportT>
+void fillBaseReport(ReportT& rep, const AgentMetricsSnapshot& m, const AgentTimeouts& t) {
+    rep.set_total_transactions(m.totalTransactions);
+    rep.set_total_consensus_instances(m.totalConsensus);
+    rep.set_avg_consensus_latency_ms(m.avgLatencyMs);
+    rep.set_p50_consensus_latency_ms(m.p50LatencyMs);
+    rep.set_p95_consensus_latency_ms(m.p95LatencyMs);
+    rep.set_throughput_tps(m.throughputTps);
+    rep.set_avg_batch_size(m.avgBatchSize);
+    rep.set_p95_batch_size(m.p95BatchSize);
+    rep.set_leader_change_count(m.leaderChangeCount);
+    rep.set_regency_change_count(m.regencyChangeCount);
+    rep.set_timeout_ms((uint32_t)std::max(0, t.electionMs));
+    rep.set_avg_inter_commit_gap_ms(m.avgInterCommitGapMs);
+    rep.set_p50_inter_commit_gap_ms(m.p50InterCommitGapMs);
+    rep.set_p95_inter_commit_gap_ms(m.p95InterCommitGapMs);
+    rep.set_view_change_count(m.viewChangeCount);
+    rep.set_no_progress_view_change_count(m.noProgressViewChangeCount);
 }
 
 // ---- Adapters -------------------------------------------------------------
@@ -69,15 +97,7 @@ private:
     static void buildReport(PbftReport& rep,
                             const AgentMetricsSnapshot& m,
                             const AgentTimeouts& t) {
-        rep.set_total_transactions(m.totalTransactions);
-        rep.set_total_consensus_instances(m.totalConsensus);
-        rep.set_avg_consensus_latency_ms(m.avgLatencyMs);
-        rep.set_p50_consensus_latency_ms(m.p50LatencyMs);
-        rep.set_p95_consensus_latency_ms(m.p95LatencyMs);
-        rep.set_p99_consensus_latency_ms(m.p99LatencyMs);
-        rep.set_throughput_tps(m.throughputTps);
-        rep.set_view_change_count(m.viewChangeCount);
-        rep.set_timeout_ms((uint32_t)std::max(0, t.electionMs));
+        fillBaseReport(rep, m, t);
         rep.set_pre_prepare_latency_ms(m.phase1AvgMs);
         rep.set_prepare_latency_ms(m.phase2AvgMs);
         rep.set_commit_latency_ms(m.phase3AvgMs);
@@ -92,8 +112,7 @@ public:
     void fillState(ReportLocal& report,
                    const AgentMetricsSnapshot& m,
                    const AgentTimeouts& t) const override {
-        (void)t;
-        buildReport(*report.mutable_sbft_state(), m);
+        buildReport(*report.mutable_sbft_state(), m, t);
     }
 
     void fillReward(Reward& reward,
@@ -102,7 +121,7 @@ public:
                     const AgentTimeouts& t) const override {
         auto* r = reward.mutable_sbft();
         r->set_episode(episode);
-        buildReport(*r->mutable_report(), m);
+        buildReport(*r->mutable_report(), m, t);
         auto* used = r->mutable_timeout_used();
         used->set_election_timeout_milliseconds((uint32_t)std::max(0, t.electionMs));
         used->set_slow_path_timeout_milliseconds((uint32_t)std::max(0, t.slowPathMs));
@@ -116,17 +135,16 @@ public:
     }
 
 private:
-    static void buildReport(SbftReport& rep, const AgentMetricsSnapshot& m) {
-        rep.set_total_transactions(m.totalTransactions);
-        rep.set_total_consensus_instances(m.totalConsensus);
-        rep.set_avg_consensus_latency_ms(m.avgLatencyMs);
-        rep.set_p95_consensus_latency_ms(m.p95LatencyMs);
-        rep.set_p99_consensus_latency_ms(m.p99LatencyMs);
-        rep.set_throughput_tps(m.throughputTps);
-        rep.set_leader_change_count(m.viewChangeCount);
+    static void buildReport(SbftReport& rep,
+                            const AgentMetricsSnapshot& m,
+                            const AgentTimeouts& t) {
+        fillBaseReport(rep, m, t);
         rep.set_pre_prepare_latency_ms(m.phase1AvgMs);
         rep.set_prepare_latency_ms(m.phase2AvgMs);
         rep.set_commit_latency_ms(m.phase3AvgMs);
+        rep.set_slow_path_timeout_ms((uint32_t)std::max(0, t.slowPathMs));
+        rep.set_fast_path_count(m.fastPathCount);
+        rep.set_slow_path_count(m.slowPathCount);
     }
 };
 
@@ -138,7 +156,7 @@ public:
     void fillState(ReportLocal& report,
                    const AgentMetricsSnapshot& m,
                    const AgentTimeouts& t) const override {
-        buildReport(*report.mutable_hotstuff_state(), m, t);
+        fillBaseReport(*report.mutable_hotstuff_state(), m, t);
     }
 
     void fillReward(Reward& reward,
@@ -147,80 +165,16 @@ public:
                     const AgentTimeouts& t) const override {
         auto* r = reward.mutable_hotstuff();
         r->set_episode(episode);
-        buildReport(*r->mutable_report(), m, t);
-        r->mutable_timeout_used()->set_new_view_timeout_milliseconds(
+        fillBaseReport(*r->mutable_report(), m, t);
+        r->mutable_timeout_used()->set_timeout_delay_milliseconds(
             (uint32_t)std::max(0, t.electionMs));
     }
 
     bool extractTimeouts(const Timeout& timeout, AgentTimeouts& out) const override {
         if (!timeout.has_hotstuff()) return false;
-        out.electionMs = (int)timeout.hotstuff().new_view_timeout_milliseconds();
+        out.electionMs = (int)timeout.hotstuff().timeout_delay_milliseconds();
         out.slowPathMs = 0;
         return true;
-    }
-
-private:
-    static void buildReport(HotStuffReport& rep,
-                            const AgentMetricsSnapshot& m,
-                            const AgentTimeouts& t) {
-        rep.set_total_transactions(m.totalTransactions);
-        rep.set_total_consensus_instances(m.totalConsensus);
-        rep.set_avg_consensus_latency_ms(m.avgLatencyMs);
-        rep.set_p50_consensus_latency_ms(m.p50LatencyMs);
-        rep.set_p95_consensus_latency_ms(m.p95LatencyMs);
-        rep.set_p99_consensus_latency_ms(m.p99LatencyMs);
-        rep.set_throughput_tps(m.throughputTps);
-        rep.set_new_view_count(m.viewChangeCount);
-        rep.set_timeout_ms((uint32_t)std::max(0, t.electionMs));
-        rep.set_prepare_latency_ms(m.phase1AvgMs);
-        rep.set_pre_commit_latency_ms(m.phase2AvgMs);
-        rep.set_commit_latency_ms(m.phase3AvgMs);
-    }
-};
-
-class ZyzzyvaAgentAdapter : public ProtocolAgentAdapter {
-public:
-    Protocol protocol() const override { return PROTOCOL_ZYZZYVA; }
-    std::string name() const override { return "Zyzzyva"; }
-
-    void fillState(ReportLocal& report,
-                   const AgentMetricsSnapshot& m,
-                   const AgentTimeouts& t) const override {
-        buildReport(*report.mutable_zyzzyva_state(), m, t);
-    }
-
-    void fillReward(Reward& reward,
-                    uint32_t episode,
-                    const AgentMetricsSnapshot& m,
-                    const AgentTimeouts& t) const override {
-        auto* r = reward.mutable_zyzzyva();
-        r->set_episode(episode);
-        buildReport(*r->mutable_report(), m, t);
-        r->mutable_timeout_used()->set_election_timeout_milliseconds(
-            (uint32_t)std::max(0, t.electionMs));
-    }
-
-    bool extractTimeouts(const Timeout& timeout, AgentTimeouts& out) const override {
-        if (!timeout.has_zyzzyva()) return false;
-        out.electionMs = (int)timeout.zyzzyva().election_timeout_milliseconds();
-        out.slowPathMs = 0;
-        return true;
-    }
-
-private:
-    static void buildReport(ZyzzyvaReport& rep,
-                            const AgentMetricsSnapshot& m,
-                            const AgentTimeouts& t) {
-        rep.set_total_transactions(m.totalTransactions);
-        rep.set_total_consensus_instances(m.totalConsensus);
-        rep.set_avg_consensus_latency_ms(m.avgLatencyMs);
-        rep.set_p50_consensus_latency_ms(m.p50LatencyMs);
-        rep.set_p95_consensus_latency_ms(m.p95LatencyMs);
-        rep.set_p99_consensus_latency_ms(m.p99LatencyMs);
-        rep.set_throughput_tps(m.throughputTps);
-        rep.set_view_change_count(m.viewChangeCount);
-        rep.set_timeout_ms((uint32_t)std::max(0, t.electionMs));
-        rep.set_speculative_execute_latency_ms(m.phase1AvgMs);
     }
 };
 
@@ -237,29 +191,47 @@ std::unique_ptr<ProtocolAgentAdapter> makeProtocolAgentAdapter(const std::string
         protocolName == "ChainedHotstuff") {
         return std::make_unique<HotStuffAgentAdapter>();
     }
-    if (protocolName == "Zyzzyva") {
-        return std::make_unique<ZyzzyvaAgentAdapter>();
-    }
-    throw std::invalid_argument("no learning-agent adapter for protocol '" + protocolName + "'");
+    throw std::invalid_argument("no learning-agent report is defined in proto/agent.proto for protocol '" +
+                                protocolName + "'");
 }
 
 // ---- MetricsWindow --------------------------------------------------------
 
 void AgentClient::MetricsWindow::reset(std::chrono::steady_clock::time_point start) {
     latenciesUs.clear();
+    batchSizes.clear();
+    transactions = 0;
     phase1Us.clear();
     phase2Us.clear();
     phase3Us.clear();
+    interCommitGapsUs.clear();
     viewChanges = 0;
+    noProgressViewChanges = 0;
+    newViews = 0;
+    fastPath = 0;
+    slowPath = 0;
     windowStart = start;
 }
 
 AgentMetricsSnapshot AgentClient::MetricsWindow::snapshot(
     std::chrono::steady_clock::time_point end) const {
     AgentMetricsSnapshot s;
-    s.totalTransactions = (uint32_t)latenciesUs.size();
-    s.totalConsensus = (uint32_t)latenciesUs.size();
+    s.totalTransactions = transactions;
+    s.totalConsensus = static_cast<uint32_t>(batchSizes.size());
+    if (!batchSizes.empty()) {
+        std::vector<long long> sorted = batchSizes;
+        std::sort(sorted.begin(), sorted.end());
+        long long total = 0;
+        for (auto size : batchSizes) total += size;
+        s.avgBatchSize = static_cast<float>(total) / batchSizes.size();
+        s.p95BatchSize = static_cast<float>(percentile(sorted, 0.95));
+    }
     s.viewChangeCount = viewChanges;
+    s.noProgressViewChangeCount = noProgressViewChanges;
+    s.leaderChangeCount = newViews;
+    s.regencyChangeCount = newViews;
+    s.fastPathCount = fastPath;
+    s.slowPathCount = slowPath;
     s.phase1AvgMs = avgMs(phase1Us);
     s.phase2AvgMs = avgMs(phase2Us);
     s.phase3AvgMs = avgMs(phase3Us);
@@ -271,9 +243,12 @@ AgentMetricsSnapshot AgentClient::MetricsWindow::snapshot(
         s.p95LatencyMs = (float)((double)percentile(sorted, 0.95) / 1000.0);
         s.p99LatencyMs = (float)((double)percentile(sorted, 0.99) / 1000.0);
     }
+    s.avgInterCommitGapMs = avgMs(interCommitGapsUs);
+    s.p50InterCommitGapMs = percentileMs(interCommitGapsUs, 0.50);
+    s.p95InterCommitGapMs = percentileMs(interCommitGapsUs, 0.95);
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - windowStart).count();
     if (elapsedMs > 0) {
-        s.throughputTps = (float)((double)latenciesUs.size() * 1000.0 / (double)elapsedMs);
+        s.throughputTps = (float)((double)transactions * 1000.0 / (double)elapsedMs);
     }
     return s;
 }
@@ -295,38 +270,30 @@ AgentClient::AgentClient(AgentClientConfig config,
 
 AgentClient::~AgentClient() { stop(); }
 
-void AgentClient::logPrefix(std::ostream& os) const {
-    os << "[Node " << config_.nodeId << "][agent:" << adapter_->name() << "] ";
+std::string AgentClient::logPrefix() const {
+    return "[agent:" + adapter_->name() + "] ";
 }
 
 void AgentClient::start() {
     auto channel = grpc::CreateChannel("127.0.0.1:" + std::to_string(config_.port),
                                        grpc::InsecureChannelCredentials());
     stub_ = LearningAgent::NewStub(channel);
-    {
-        std::ostringstream os;
-        logPrefix(os);
-        os << "connected on port " << config_.port
-           << " wall-clock windows: feature=" << config_.featureDurationMs
-           << "ms reply_wait=" << config_.replyWaitMs
-           << "ms warmup=" << config_.warmupDurationMs
-           << "ms reward=" << config_.rewardDurationMs << "ms\n";
-        std::cout << os.str();
-    }
+    LOG_INFO(logPrefix() << "connected on port " << config_.port
+             << " wall-clock windows: feature=" << config_.featureDurationMs
+             << "ms reply_wait=" << config_.replyWaitMs
+             << "ms warmup=" << config_.warmupDurationMs
+             << "ms reward=" << config_.rewardDurationMs << "ms");
 
     grpc::ClientContext ctx;
     ctx.set_deadline(std::chrono::system_clock::now() +
                      std::chrono::milliseconds(config_.rpcTimeoutMs));
     google::protobuf::Empty req, resp;
     auto st = stub_->Reset(&ctx, req, &resp);
-    std::ostringstream os;
-    logPrefix(os);
     if (st.ok()) {
-        os << "agent reset OK\n";
+        LOG_INFO(logPrefix() << "agent reset OK");
     } else {
-        os << "agent reset failed (agent may not be running): " << st.error_message() << "\n";
+        LOG_WARN(logPrefix() << "agent reset failed (agent may not be running): " << st.error_message());
     }
-    std::cout << os.str();
 
     loopThread_ = std::thread(&AgentClient::run, this);
 }
@@ -334,9 +301,6 @@ void AgentClient::start() {
 void AgentClient::stop() {
     {
         std::lock_guard<std::mutex> lk(stopMtx_);
-        if (stopRequested_) {
-            // stop() may be called twice (explicitly and from the destructor).
-        }
         stopRequested_ = true;
     }
     stopCv_.notify_all();
@@ -348,26 +312,48 @@ void AgentClient::recordConsensus(const AgentConsensusSample& sample) {
     bool notify = false;
     {
         std::lock_guard<std::mutex> lk(mtx_);
+        const auto now = std::chrono::steady_clock::now();
         lastSequence_ = sample.sequence;
+        ++commitsSinceViewChange_;
         if (!sawFirstSample_) {
             sawFirstSample_ = true;
-            firstSampleTime_ = std::chrono::steady_clock::now();
+            firstSampleTime_ = now;
             notify = true;
         }
         if (stage_ == Stage::Feature || stage_ == Stage::Reward) {
+            metrics_.transactions += sample.transactions;
+            metrics_.batchSizes.push_back(sample.batchSize);
             if (sample.latencyUs >= 0) metrics_.latenciesUs.push_back(sample.latencyUs);
             if (sample.phase1Us >= 0) metrics_.phase1Us.push_back(sample.phase1Us);
             if (sample.phase2Us >= 0) metrics_.phase2Us.push_back(sample.phase2Us);
             if (sample.phase3Us >= 0) metrics_.phase3Us.push_back(sample.phase3Us);
+            if (hasLastCommit_) {
+                metrics_.interCommitGapsUs.push_back(
+                    std::chrono::duration_cast<std::chrono::microseconds>(now - lastCommitTime_).count());
+            }
+            if (sample.path == 1) ++metrics_.fastPath;
+            else if (sample.path == 0) ++metrics_.slowPath;
         }
+        hasLastCommit_ = true;
+        lastCommitTime_ = now;
     }
     if (notify) stopCv_.notify_all();
 }
 
 void AgentClient::recordViewChange() {
     std::lock_guard<std::mutex> lk(mtx_);
+    const bool noProgress = commitsSinceViewChange_ == 0;
+    commitsSinceViewChange_ = 0;
     if (stage_ == Stage::Feature || stage_ == Stage::Reward) {
         ++metrics_.viewChanges;
+        if (noProgress) ++metrics_.noProgressViewChanges;
+    }
+}
+
+void AgentClient::recordNewView() {
+    std::lock_guard<std::mutex> lk(mtx_);
+    if (stage_ == Stage::Feature || stage_ == Stage::Reward) {
+        ++metrics_.newViews;
     }
 }
 
@@ -442,17 +428,11 @@ void AgentClient::run() {
                 std::lock_guard<std::mutex> lk(mtx_);
                 currentTimeouts_ = next;
             }
-            std::ostringstream os;
-            logPrefix(os);
-            os << "applied recommendation: episode=" << episode
-               << " election " << previous.electionMs << "->" << next.electionMs << "ms"
-               << " slow_path " << previous.slowPathMs << "->" << next.slowPathMs << "ms\n";
-            std::cout << os.str();
+            LOG_INFO(logPrefix() << "applied recommendation: episode=" << episode
+                     << " election " << previous.electionMs << "->" << next.electionMs << "ms"
+                     << " slow_path " << previous.slowPathMs << "->" << next.slowPathMs << "ms");
         } else {
-            std::ostringstream os;
-            logPrefix(os);
-            os << "reply deadline reached without recommendation: episode=" << episode << "\n";
-            std::cout << os.str();
+            LOG_WARN(logPrefix() << "reply deadline reached without recommendation: episode=" << episode);
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -478,12 +458,10 @@ void AgentClient::run() {
             adapter_->fillReward(pendingReward_, episode_, snap, lastTimeouts_);
             hasPendingReward_ = true;
 
-            std::ostringstream os;
-            logPrefix(os);
-            os << "captured reward: episode=" << episode_
-               << " total_consensus=" << snap.totalConsensus
-               << " throughput_tps=" << snap.throughputTps << "\n";
-            std::cout << os.str();
+            LOG_INFO(logPrefix() << "captured reward: episode=" << episode_
+                     << " total_consensus=" << snap.totalConsensus
+                     << " throughput_tps=" << snap.throughputTps
+                     << " view_changes=" << snap.viewChangeCount);
 
             ++episode_;
             episodeStartTick_ = lastSequence_;
@@ -517,17 +495,14 @@ void AgentClient::sendReport(uint32_t episode) {
                      std::chrono::milliseconds(config_.rpcTimeoutMs));
     google::protobuf::Empty resp;
     auto st = stub_->SendReport(&ctx, report, &resp);
-    std::ostringstream os;
-    logPrefix(os);
     if (st.ok()) {
-        os << "sent report: episode=" << episode
-           << " start_tick=" << report.start_tick()
-           << " report_seq=" << report.report_seq()
-           << (report.has_reward() ? " with_reward=1" : " with_reward=0") << "\n";
+        LOG_INFO(logPrefix() << "sent report: episode=" << episode
+                 << " start_tick=" << report.start_tick()
+                 << " report_seq=" << report.report_seq()
+                 << (report.has_reward() ? " with_reward=1" : " with_reward=0"));
     } else {
-        os << "SendReport failed: episode=" << episode << " err=" << st.error_message() << "\n";
+        LOG_WARN(logPrefix() << "SendReport failed: episode=" << episode << " err=" << st.error_message());
     }
-    std::cout << os.str();
 }
 
 void AgentClient::startPolling(uint32_t episode) {
@@ -560,12 +535,9 @@ void AgentClient::pollForTimeout(uint32_t episode) {
                     decision_ = out;
                     decisionReady_ = true;
                 }
-                std::ostringstream os;
-                logPrefix(os);
-                os << "timeout READY: episode=" << episode
-                   << " election=" << out.electionMs << "ms"
-                   << " slow_path=" << out.slowPathMs << "ms\n";
-                std::cout << os.str();
+                LOG_INFO(logPrefix() << "timeout READY: episode=" << episode
+                         << " election=" << out.electionMs << "ms"
+                         << " slow_path=" << out.slowPathMs << "ms");
                 return;
             }
         }

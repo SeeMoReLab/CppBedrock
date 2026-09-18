@@ -253,7 +253,6 @@ void Entity::scheduleConsensusMaintenance() {
 void Entity::maintainConsensus() {
     std::lock_guard<std::recursive_mutex> lock(eventMtx);
     if (!pbftCore_) return;
-    ++maintenanceTick_;
     if (inViewChange) {
         auto view = viewChangeMsgs_.find(currentView());
         if (view != viewChangeMsgs_.end() && view->second.count(nodeId))
@@ -263,23 +262,38 @@ void Entity::maintainConsensus() {
         // Certified decisions remain valid and must be recovered while waiting.
         requestRecovery();
     } else {
+        // Retransmission recovers lost messages. A sequence whose first round
+        // trip is still in the air has lost nothing, and resending into a
+        // pipeline that is merely deep is how a busy replica is made slower:
+        // one proposal is half a megabyte. Nudge only sequences that have been
+        // outstanding long enough for a reply to be overdue, and send to the
+        // peers whose own vote has not arrived, since a live peer that had the
+        // message would have answered it.
+        const auto now = Clock::now();
+        const auto grace = std::max(std::chrono::milliseconds(250),
+                                    std::chrono::milliseconds(viewChangeTimeoutMs.load() / 8));
         for (const auto& [seq, instance] : consensusInstances_) {
             if (seq <= lastExecuted_) continue;
-            // A batch is orders of magnitude larger than a vote. Resend it
-            // only to replicas whose vote is missing, and not every tick.
-            if (isCurrentLeader() && instance.proposal.has_pre_prepare() && maintenanceTick_ % 4 == 0)
-                for (int peer : peerIds_)
-                    if (peer != nodeId && !instance.prepares.count(peer))
-                        sendProtocolTo(peer, instance.proposal);
             if (!bedrock::carriesBody(instance.proposal)) requestBatch(seq);
+            if (now - instance.acceptedAt < grace) continue;
+            const auto missing = [&](const std::map<int, bedrock::ProtocolEnvelope>& votes) {
+                std::vector<int> peers;
+                for (int peer : peerIds_)
+                    if (peer != nodeId && !votes.count(peer)) peers.push_back(peer);
+                return peers;
+            };
+            if (isCurrentLeader() && instance.proposal.has_pre_prepare())
+                for (int peer : missing(instance.prepares)) sendProtocolTo(peer, instance.proposal);
             const auto prepare = instance.prepares.find(nodeId);
             if (prepare != instance.prepares.end()) {
-                if (protocolName_ == "PBFT") sendProtocolToAll(prepare->second);
+                if (protocolName_ == "PBFT")
+                    for (int peer : missing(instance.prepares)) sendProtocolTo(peer, prepare->second);
                 else if (!isCurrentLeader()) sendProtocolTo(currentLeader(), prepare->second);
             }
             if (protocolName_ == "PBFT") {
                 const auto commit = instance.commits.find(nodeId);
-                if (commit != instance.commits.end()) sendProtocolToAll(commit->second);
+                if (commit != instance.commits.end())
+                    for (int peer : missing(instance.commits)) sendProtocolTo(peer, commit->second);
             } else {
                 if (isCurrentLeader()) {
                     if (instance.certificate.has_commit()) sendProtocolToAll(instance.certificate);

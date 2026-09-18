@@ -453,6 +453,8 @@ private:
     std::atomic<uint64_t> assembleUs_{0};  // selecting requests into the next batch
     std::atomic<uint64_t> handleUs_{0};    // all consensus message handling, including the two above
     std::atomic<uint64_t> tickWaitUs_{0};  // proposal ticks waiting for the engine lock
+    std::atomic<uint64_t> proposalTicks_{0};   // cadence opportunities that fired
+    std::atomic<uint64_t> batchesProposed_{0}; // ticks that produced a batch
 
     // Sequence-state pruning: everything below pruneFloor_ has been released.
     int highestCommittedSeq_{0};
@@ -494,7 +496,6 @@ private:
     // names batches by digest; this is where the named bytes live.
     std::map<int, bedrock::PrePrepare> batchIndex_;
     std::map<int, Clock::time_point> lastBatchRequest_;
-    unsigned maintenanceTick_{0};
     bedrock::ExecutedRequests executedRequests_;           // request keys executed locally
     std::map<int, std::string> executedRequestBySeq_;            // for pruning executedRequests_
     std::map<int, std::map<int, nlohmann::json>> viewChangeMsgs_; // view -> sender -> ViewChange

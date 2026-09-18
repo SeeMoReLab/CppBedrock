@@ -87,6 +87,7 @@ void Entity::scheduleProposalTick() {
 void Entity::proposalTick() {
     std::lock_guard<std::recursive_mutex> lock(eventMtx);
     if (!pbftCore_) return;
+    ++proposalTicks_;
     std::deque<std::pair<bedrock::ClientRequest, long long>> incoming;
     {
         std::lock_guard<std::mutex> ingressLock(ingressMtx_);
@@ -165,6 +166,7 @@ void Entity::proposeBatch() {
     }
     assembleUs_ += static_cast<uint64_t>(nowUs() - assembleStart);
     if (proposal->requests().empty()) return;
+    ++batchesProposed_;
     const auto proposeStart = nowUs();
     const int seq = allocateNextSequence();
     proposal->set_view(currentView()); proposal->set_sequence(seq);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "proto/bedrock.pb.h"
+#include <chrono>
 #include <map>
 #include <string>
 #include <nlohmann/json.hpp>
@@ -23,6 +24,10 @@ constexpr int kMaxBatchBytes = 512 * 1024;
 // One instance in one view. Cleared on view installation; evidence needed
 // across views lives separately in the prepared/committed proof logs.
 struct ConsensusInstance {
+    // When this replica first learned of the sequence. Retransmission is a
+    // loss recovery measure, so it must not fire while the first round trip
+    // is still in the air.
+    std::chrono::steady_clock::time_point acceptedAt{std::chrono::steady_clock::now()};
     ProtocolEnvelope proposal;
     std::map<int, ProtocolEnvelope> prepares;
     std::map<int, ProtocolEnvelope> commits;

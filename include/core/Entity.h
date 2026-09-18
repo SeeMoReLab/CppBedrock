@@ -445,6 +445,7 @@ private:
     std::atomic<uint64_t> executeUs_{0};   // executing batches and replying to clients
     std::atomic<uint64_t> admitUs_{0};     // admitting client requests into the pending pool
     std::atomic<uint64_t> assembleUs_{0};  // selecting requests into the next batch
+    std::atomic<uint64_t> handleUs_{0};    // all consensus message handling, including the two above
     std::atomic<uint64_t> tickWaitUs_{0};  // proposal ticks waiting for the engine lock
 
     // Sequence-state pruning: everything below pruneFloor_ has been released.
@@ -464,7 +465,9 @@ private:
     void scheduleViewChangeWait();
     void onViewChangeWaitExpired(uint64_t generation);
     std::unique_ptr<bedrock::ProposalDelayController> proposalDelay_;
-    std::map<std::string, PendingRequest> pendingRequests_;      // key -> buffered client request
+    // Hashed, not ordered: the pool holds tens of thousands of entries under
+    // load and nothing iterates it in key order.
+    std::unordered_map<std::string, PendingRequest> pendingRequests_;  // key -> buffered client request
     std::deque<std::string> proposalQueue_;
     size_t pendingBytes_{0};
     // One bounded relay batch per peer, separate from saturated client ingress.
@@ -546,6 +549,7 @@ private:
     bool validateViewChange(const nlohmann::json& msg);
     nlohmann::json selectNewView(const nlohmann::json& changes, int view);
     void handleConsensusEnvelope(const bedrock::ProtocolEnvelope& env);
+    void handleEnvelope(const bedrock::ProtocolEnvelope& env);
     void handleConsensusControl(const nlohmann::json& msg);
     void advanceConsensus(int seq);
     void acceptProposal(const bedrock::ProtocolEnvelope& env);

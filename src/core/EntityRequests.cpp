@@ -225,7 +225,7 @@ bool Entity::completeSequence(int seq, int path) {
         completed.reserve(batch.requests_size() + 1);
         for (const auto& r : batch.requests()) {
             const auto key = requestKey(r.client_id(), r.request_id());
-            if (executedRequests_.insert(key).second) {
+            if (executedRequests_.insert(r.client_id(), r.request_id()).second) {
                 const auto& tx = r.transaction();
                 if (!tx.from().empty() && !tx.to().empty() && tx.amount() > 0)
                     updateBalances(tx.from(), tx.to(), tx.amount());

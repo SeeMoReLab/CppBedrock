@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <optional>
 #include <string>
 #include <thread>
@@ -70,7 +71,9 @@ private:
     const Callback onExpire_;
     mutable std::mutex mtx_;
     std::condition_variable cv_;
-    std::map<std::string, Clock::time_point> byKey_;
+    // Hashed: only byTime_ needs an order, and byKey_ holds an entry per
+    // pending client request.
+    std::unordered_map<std::string, Clock::time_point> byKey_;
     std::multimap<Clock::time_point, std::string> byTime_;
     std::optional<std::string> watchedKey_;
     Clock::time_point watchedSince_{};

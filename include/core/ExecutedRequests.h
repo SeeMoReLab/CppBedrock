@@ -24,15 +24,24 @@ class ExecutedRequests {
         return {key.substr(0, split), id};
     }
 public:
-    size_t count(const std::string& key) const {
-        const auto [client, id] = parse(key);
+    // The request path holds the client ID and request ID separately. Taking
+    // them directly keeps a joined key, and the split that undoes it, off the
+    // hot path; the string overloads serve recovery and the legacy protocols.
+    size_t count(const std::string& client, uint64_t id) const {
         auto found = clients_.find(client);
         if (found == clients_.end()) return 0;
         auto next = found->second.upper_bound(id);
         return next != found->second.begin() && std::prev(next)->second >= id;
     }
+    size_t count(const std::string& key) const {
+        const auto [client, id] = parse(key);
+        return count(client, id);
+    }
     std::pair<int, bool> insert(const std::string& key) {
         const auto [client, id] = parse(key);
+        return insert(client, id);
+    }
+    std::pair<int, bool> insert(const std::string& client, uint64_t id) {
         auto& ranges = clients_[client];
         auto next = ranges.upper_bound(id);
         auto start = id, end = id;

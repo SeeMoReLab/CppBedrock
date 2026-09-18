@@ -152,7 +152,7 @@ void Entity::installRecovery(const json& msg) {
         entityInfo["sequence"] = std::max(entityInfo["sequence"].get<int>(), cp);
         std::vector<std::string> completed;
         for (auto it = pendingRequests_.begin(); it != pendingRequests_.end();) {
-            if (!executedRequests_.count(it->first)) { ++it; continue; }
+            if (!executedRequests_.count(it->second.clientId, it->second.requestId)) { ++it; continue; }
             completed.push_back(it->first);
             replyToClient(it->second.clientId, it->second.requestId, "success");
             pendingBytes_ -= it->second.bytes;

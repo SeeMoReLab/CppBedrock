@@ -259,6 +259,12 @@ void Entity::acceptProposal(const ProtocolEnvelope& env) {
 }
 
 void Entity::handleConsensusEnvelope(const ProtocolEnvelope& env) {
+    const auto handleStart = nowUs();
+    handleEnvelope(env);
+    handleUs_ += static_cast<uint64_t>(nowUs() - handleStart);
+}
+
+void Entity::handleEnvelope(const ProtocolEnvelope& env) {
     if (inViewChange) return;
     ProtoMessage p(env);
     if (p.view() != currentView() || p.sequence() <= stableCheckpoint_ ||

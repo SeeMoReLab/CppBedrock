@@ -42,7 +42,7 @@ void Entity::acceptClientRequest(const bedrock::ClientRequest& request, long lon
         replyToClient(request.client_id(), request.request_id(), "invalid_request");
         return;
     }
-    if (executedRequests_.count(key)) {
+    if (executedRequests_.count(request.client_id(), request.request_id())) {
         replyToClient(request.client_id(), request.request_id(), "success");
         return;
     }
@@ -67,7 +67,11 @@ void Entity::scheduleProposalTick() {
     if (!pbftCore_ || !running) return;
     const auto generation = proposalGeneration_;
     scheduler_.schedule(nextProposalTick_, [this, generation] {
+        // The engine lock is recursive, so this is the only place the tick can
+        // observe how long it waited for it.
+        const auto waitStart = nowUs();
         std::lock_guard<std::recursive_mutex> lock(eventMtx);
+        tickWaitUs_ += static_cast<uint64_t>(nowUs() - waitStart);
         if (!running || generation != proposalGeneration_) return;
         proposalTick();
         const auto period = std::chrono::milliseconds(options_.proposalIntervalMs);
@@ -81,9 +85,7 @@ void Entity::scheduleProposalTick() {
 }
 
 void Entity::proposalTick() {
-    const auto waitStart = nowUs();
     std::lock_guard<std::recursive_mutex> lock(eventMtx);
-    tickWaitUs_ += static_cast<uint64_t>(nowUs() - waitStart);
     if (!pbftCore_) return;
     std::deque<std::pair<bedrock::ClientRequest, long long>> incoming;
     {
@@ -147,7 +149,8 @@ void Entity::proposeBatch() {
             while (!requests.empty() && proposal->requests_size() < options_.batchMaxRequests) {
                 const auto& request = requests.front();
                 const auto key = requestKey(request.client_id(), request.request_id());
-                if (executedRequests_.count(key) || pendingRequests_.count(key) || proposed.count(key)) {
+                if (executedRequests_.count(request.client_id(), request.request_id()) ||
+                    pendingRequests_.count(key) || proposed.count(key)) {
                     requests.pop_front(); continue;
                 }
                 const auto size = request.ByteSizeLong() + 8;
@@ -256,7 +259,8 @@ void Entity::acceptForwardedRequests(const nlohmann::json& message) {
             !request.has_transaction() || bytes > static_cast<size_t>(options_.batchMaxBytes)) return;
         const auto key = requestKey(request.client_id(), request.request_id());
         if (!keys.insert(key).second) return;
-        if (!executedRequests_.count(key) && !pendingRequests_.count(key)) requests.push_back(request);
+        if (!executedRequests_.count(request.client_id(), request.request_id()) &&
+            !pendingRequests_.count(key)) requests.push_back(request);
     }
     if (!requests.empty()) forwardedRequests_.emplace(sender, std::move(requests));
 }

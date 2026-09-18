@@ -388,7 +388,7 @@ void Entity::statsLoop() {
     uint64_t lastCommitted = 0;
     uint64_t lastRequests = 0;
     uint64_t lastPropose = 0, lastValidate = 0, lastExecute = 0;
-    uint64_t lastAdmit = 0, lastAssemble = 0, lastTickWait = 0;
+    uint64_t lastAdmit = 0, lastAssemble = 0, lastTickWait = 0, lastHandle = 0;
     std::unique_lock<std::mutex> lk(statsMtx_);
     while (running) {
         if (statsCv_.wait_for(lk, std::chrono::milliseconds(options_.statsIntervalMs),
@@ -437,6 +437,7 @@ void Entity::statsLoop() {
                  << " execute_us=" << (executeUs_.load() - lastExecute)
                  << " admit_us=" << (admitUs_.load() - lastAdmit)
                  << " assemble_us=" << (assembleUs_.load() - lastAssemble)
+                 << " handle_us=" << (handleUs_.load() - lastHandle)
                  << " tick_wait_us=" << (tickWaitUs_.load() - lastTickWait)
                  << " election_timeout_ms=" << viewChangeTimeoutMs.load()
                  << " slow_path_timeout_ms=" << fastPathWaitMs.load());
@@ -448,6 +449,7 @@ void Entity::statsLoop() {
         lastAdmit = admitUs_.load();
         lastAssemble = assembleUs_.load();
         lastTickWait = tickWaitUs_.load();
+        lastHandle = handleUs_.load();
     }
 }
 

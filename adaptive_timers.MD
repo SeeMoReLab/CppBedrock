@@ -179,6 +179,46 @@ Getting the first two regimes there took six fixes. The first run at 40,000 offe
 
 Two couplings were removed along the way, and the rule is worth stating: **nothing in the retransmission or relay path should derive its timing from the election timeout.** An earlier retransmission gate used an eighth of it, harmless at the 8 s default, but once the timeout was calibrated down to 2 s it cost 7,000 TPS and thirteen elections. The relay grace still uses a quarter of it, which is why relaying becomes routine at 150 ms once the timeout is tuned below roughly 2.5 s. A learning agent that lowers the election timeout must not thereby make the system slower.
 
+### Calibrated timeouts and proposal delays
+
+The election timeout is a watchdog on *execution*, not on request latency: `PendingRequestTimer::selectWatchLocked` sets `watchedSince_` when an entry becomes watched, and the deadline is `watchedSince_ + timeout`, so a fresh deadline is armed every time the watched entry executes. It therefore measures how long ordering stalls. While the pipeline keeps up a 5 ms link and a 50 ms link look identical to it - both hold full cadence and execute a batch every 100 ms - so **network delay alone does not separate a small timeout from a medium one**. Good pipelining and a delay-sensitive election timeout are in tension. The separation comes from proposal delay, which stalls execution by a controllable amount, and this is why the failure spec needs its `<proposalDelay>` phases.
+
+The ladder, measured at 40,000 requests/s:
+
+| Election timeout | 5 ms | 5 + 50 ms | 5 + 150 ms |
+| ---: | --- | --- | --- |
+| 350 ms | 39,396 tps, no elections | 39,731 tps, no elections | collapses |
+| 500 ms | 39,918 tps, no elections | 39,697 tps, no elections | 5,822 tps, 95 elections |
+| 1,000 ms | - | 39,846 tps, no elections | 24,391 tps, 52 elections |
+| 2,000 ms | - | 39,735 tps, no elections | 36,300 to 39,600 tps, 0 to 3 elections |
+| 4,000 ms | - | - | 39,491 tps, no elections, 100 of 100 full-cadence seconds |
+
+The 150 ms column also explains the bistability recorded above: the bad state was *triggered* by elections. At 4,000 ms there are none and the regime is stable at full cadence, so the instability was the timeout provoking view changes on a healthy leader, not a capacity wall.
+
+Proposal delays, injected on the leader and re-resolved every 20 seconds so each run contains several episodes. `delayed` is the count of proposals actually held back, and it is the diagnostic that makes the result readable: a high count with no elections means the delay was absorbed, while a low count with elections means the first episode elected and the delay then stopped applying, because the new leader is not the targeted one.
+
+| Proposal delay | 350 ms timeout | 1,000 ms timeout | 4,000 ms timeout |
+| ---: | --- | --- | --- |
+| 300 ms | 4 elections, 4 delayed | **absorbed**: no elections, 623 delayed, p50 148 to 461 ms | - |
+| 450 ms | - | 11 elections, 149 delayed | (2,000 ms: 3 elections) |
+| 600 ms | - | 3 elections, 223 delayed | (2,000 ms: 3 elections) |
+| 1,000 ms | - | 4 elections, 9 delayed | **absorbed**: no elections, 537 delayed |
+
+The stall a proposal delay causes is larger than the delay itself, because the pipeline drains before the held proposal lands, and `proposeBatch` allocates the sequence number before applying the delay, so a held proposal occupies a consensus-window slot while it waits. With a 2,000 ms large timeout no delay separated medium from large - 450, 600 and 1,000 ms all produced about three elections, one per re-targeting episode. Widening the large timeout to 4,000 ms resolves it, and costs nothing at 150 ms where 4,000 ms is the best-performing value anyway.
+
+So the calibration is:
+
+| | Value | Verified by |
+| --- | ---: | --- |
+| Small timeout | 350 ms | Clean at 5 ms; elects under a 300 ms proposal delay that the medium absorbs |
+| Medium timeout | 1,000 ms | Clean at 5+50 ms; absorbs a 300 ms proposal delay; elects at 5+150 ms and under a 1,000 ms proposal delay |
+| Large timeout | 4,000 ms | Clean at 5+150 ms at full cadence; absorbs a 1,000 ms proposal delay at both 5 ms and 5+50 ms |
+| P1, absorbed by medium | 300 ms | No elections and 623 delayed proposals at 1,000 ms; 4 elections at 350 ms |
+| P2, elects at medium only | 1,000 ms | 4 elections at 1,000 ms; no elections and 537 delayed at 4,000 ms |
+| P3, absorbed by large at 50 ms | 1,000 ms | No elections and 488 delayed proposals at 4,000 ms with a 50 ms link |
+
+One requirement is **not** met: a small timeout that keeps electing under a 50 ms link with no proposal delay. No value does this, because the replica cannot distinguish 5 ms from 50 ms while the pipeline absorbs both. The small-versus-medium distinction is available only through proposal delay.
+
 ### CloudLab validation under injected network delay
 
 Four replicas in network namespaces on one 32-core host, broadcast client, `config/pbft/failure_spec.xml` (5 ms base one-way delay, rising to 55 ms at t=60 s), 150-second runs.

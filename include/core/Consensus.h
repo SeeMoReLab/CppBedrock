@@ -1,7 +1,6 @@
 #pragma once
 
 #include "proto/bedrock.pb.h"
-#include <chrono>
 #include <map>
 #include <string>
 #include <nlohmann/json.hpp>
@@ -18,16 +17,15 @@ constexpr int kCheckpointInterval = 2;
 // no longer has to be kept tiny. --max-inflight-batches selects how much of
 // it a run actually uses; the default stays conservative.
 constexpr int kConsensusWindow = 16;
+// How often a replica checks for stalled sequences and retransmits. It also
+// bounds how long execution may stall before retransmission starts.
+constexpr int kMaintenanceIntervalMs = 250;
 constexpr int kMaxBatchRequests = 8192;
 constexpr int kMaxBatchBytes = 512 * 1024;
 
 // One instance in one view. Cleared on view installation; evidence needed
 // across views lives separately in the prepared/committed proof logs.
 struct ConsensusInstance {
-    // When this replica first learned of the sequence. Retransmission is a
-    // loss recovery measure, so it must not fire while the first round trip
-    // is still in the air.
-    std::chrono::steady_clock::time_point acceptedAt{std::chrono::steady_clock::now()};
     ProtocolEnvelope proposal;
     std::map<int, ProtocolEnvelope> prepares;
     std::map<int, ProtocolEnvelope> commits;

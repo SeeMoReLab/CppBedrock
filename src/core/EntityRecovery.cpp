@@ -242,7 +242,7 @@ void Entity::handleConsensusControl(const json& msg) {
 
 void Entity::scheduleConsensusMaintenance() {
     if (!pbftCore_ || !running) return;
-    scheduler_.scheduleAfter(std::chrono::milliseconds(250), [this] {
+    scheduler_.scheduleAfter(std::chrono::milliseconds(bedrock::kMaintenanceIntervalMs), [this] {
         std::lock_guard<std::recursive_mutex> lock(eventMtx);
         if (!running) return;
         maintainConsensus();
@@ -262,20 +262,19 @@ void Entity::maintainConsensus() {
         // Certified decisions remain valid and must be recovered while waiting.
         requestRecovery();
     } else {
-        // Retransmission recovers lost messages. A sequence whose first round
-        // trip is still in the air has lost nothing, and resending into a
-        // pipeline that is merely deep is how a busy replica is made slower:
-        // one proposal is half a megabyte. Nudge only sequences that have been
-        // outstanding long enough for a reply to be overdue, and send to the
-        // peers whose own vote has not arrived, since a live peer that had the
-        // message would have answered it.
-        const auto now = Clock::now();
-        const auto grace = std::max(std::chrono::milliseconds(250),
-                                    std::chrono::milliseconds(viewChangeTimeoutMs.load() / 8));
+        // Retransmission recovers lost messages, and one proposal is half a
+        // megabyte, so resending into a pipeline that is merely deep is how a
+        // busy replica is made slower. Execution is in sequence order, so a
+        // message this replica needs and never received stops lastExecuted_
+        // from advancing: while it keeps advancing, nothing is missing and
+        // there is nothing to resend. A missing batch body is the exception,
+        // because fetching it is what unblocks execution in the first place.
+        const auto flowing = Clock::now() - lastConsensusProgress_ <
+                             std::chrono::milliseconds(bedrock::kMaintenanceIntervalMs);
         for (const auto& [seq, instance] : consensusInstances_) {
             if (seq <= lastExecuted_) continue;
             if (!bedrock::carriesBody(instance.proposal)) requestBatch(seq);
-            if (now - instance.acceptedAt < grace) continue;
+            if (flowing) continue;
             const auto missing = [&](const std::map<int, bedrock::ProtocolEnvelope>& votes) {
                 std::vector<int> peers;
                 for (int peer : peerIds_)

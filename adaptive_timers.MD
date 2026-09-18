@@ -68,7 +68,7 @@ PBFT and SBFT propose at a fixed, configurable cadence. Arrivals never trigger a
 | `--proposal-interval` | 100 ms | Fixed cadence, separate from election and SBFT timers |
 | `--batch-max-requests` | 8192 | Maximum requests in a proposal; hard maximum 8192 |
 | `--batch-max-bytes` | 524288 | Conservative encoded request-byte budget; hard maximum 512 KiB |
-| `--max-inflight-batches` | 4 | Maximum proposed but unexecuted batches; hard maximum 16 |
+| `--max-inflight-batches` | 16 | Maximum proposed but unexecuted batches; hard maximum 16, the consensus window. Keeping the cadence at a 150 ms one-way delay needs about six, since a decision takes roughly four one-way trips |
 | `--max-pending-requests` | 32768 | Maximum requests in each of the ingress and pending queues |
 | `--max-pending-bytes` | 16777216 | Maximum request bytes in each of those queues |
 
@@ -132,19 +132,41 @@ Watchdog regression: with 10,000 offered requests/s, 128 requests per 100 ms bat
 
 Broadcast overload validation is separate from the earlier leader-targeted benchmarks. With 10,000 offered requests/s, 128 requests per batch, a 512-request pending limit, and a 1,000 ms watchdog, the final 15-second broadcast regression completed 19,912 requests in PBFT and 19,886 in SBFT, about 1,273 and 1,255 successful TPS including drain. Excess requests were explicitly rejected, with zero timeouts or view changes and matching replica/client transaction totals. The CloudLab run `20260916_203931` exposed divergent local admission: backups watched requests rejected by the leader, while the client classified some later-committed requests as rejected after only `n-f` rejection replies. The regression now defaults to broadcast routing, checks that replica transaction totals match client successes, and rejects runs with unexpected view changes or client timeouts. A local 60-second broadcast attempt configured for 40,000 requests/s submitted and completed 1,486,500 requests with zero errors, about 24,616 successful TPS including drain; it failed the offered-rate check and does not establish 40k broadcast capacity.
 
-### Where the throughput ceiling is
+### Sustaining 40,000 requests/s
 
-Measured on the host above at 40,000 offered requests/s, batches of about 5,500 requests (the 512 KiB budget binds well before the 8,192 count):
+Four replicas in network namespaces on one 32-core CloudLab host (`amd244.utah.cloudlab.us`), broadcast client on the same host, 100-second runs at 40,000 offered requests/s. `full cadence` counts the seconds in which the leader reported `ticks=10 batches=10`, which is what separates a healthy run from a saturated one.
 
-| Quantity | Value |
-| --- | ---: |
-| Batches executed per second | 5.5 of the 10 the cadence allows |
-| Average batches in flight | 2.6 of 16 permitted |
-| Engine time per second, leader | 45 ms propose, 77 ms validate, 203 ms execute |
-| Measured serialized engine work per request | 10.7 microseconds |
-| Host CPU | client about 700 percent, each replica about 330 percent, of 3200 percent |
+| One-way delay | Election timeout | Successful TPS | p50 | p99 | max | Peak pending | Full cadence | Elections |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 5 ms | 500 ms | 39,806 to 39,918 | 151 ms | 205 ms | 244 ms | 4,300 | 101 of 101 | 0 |
+| 5 + 50 ms | 1,000 ms | 39,837 to 39,869 | 313 ms | 367 ms | 396 ms | 12,132 | 99 of 100 | 0 |
+| 5 + 150 ms | 500 to 8,000 ms | 29,668 to 37,450 | 660 to 1,200 ms | 1,671 to 9,650 ms | up to 10,000 ms | at the 32,768 cap | 13 to 34 of 100 | 1 to 3 |
 
-Neither the protocol nor the pipeline is the limit: the cadence permits about 55,000 requests/s, and raising `--max-inflight-batches` from 4 to 16 left the pipeline averaging 2.6 and throughput near 30,000. The limit is per-request CPU inside the engine lock. Batching amortizes messages and signatures over a batch, but every request still costs a request-key string allocation, ordered-map insertions and erasures keyed by that string, a balance update behind its own mutex, and an individual client reply, on every replica. The proposal tick shares the single scheduler thread and the same lock and deliberately does not replay missed ticks, so lock contention directly costs proposal opportunities, which is why only 5.5 of 10 ticks produce a batch. The load generator on the same host takes another seven cores. Raising throughput means reducing per-request work, not changing the consensus.
+The first two regimes are reproducible across three runs each. **The 150 ms regime is not.** One run reached 39,737 TPS with no elections and has never reproduced: eight later runs across election timeouts of 500, 2,000, 3,000, 4,000 and 8,000 ms, pending caps of 32,768, 40,960 and 131,072, and batch caps of 4,096 and 8,192 all landed between 29,668 and 37,450 with one to three elections. The election timeout does not order the results - 2,000 ms beat 8,000 ms in one pair and lost to it in another - so the spread is run-to-run bistability rather than a timeout effect, and any single run in this regime is one sample of a wide distribution.
+
+The mechanism is a feedback loop at the cadence boundary. Requests in flight are the offered rate times the time to order one, so they scale with delay: about 4,300 at 5 ms, 12,100 at 55 ms, 24,800 at 155 ms. At 155 ms that is 76 percent of the 32,768 pending cap, and batches become byte-limited at about 5,500 requests where the cadence only needs 4,000. The leader's proposal tick then costs 73 to 81 ms of its 100 ms budget. Lose one tick and the backlog grows, which makes batches larger, which makes the tick slower, which loses more ticks; the pool reaches its cap, admission diverges between replicas because each rejects a different subset, and a backup ends up watching a request the leader rejected and never ordered, which eventually elects a healthy leader out of office.
+
+Raising the pending cap does not break the loop, it only changes which end fails: 131,072 let a replica queue 3.3 seconds of traffic instead of shedding it, giving 21,573 TPS with ten elections, and 40,960 filled to its own cap. Capping the batch at 4,096 requests so the cadence rather than the byte budget governs gave 33,918 TPS and 34 of 100 full-cadence seconds, inside the same band.
+
+Leader engine time per second at 155 ms shows how little headroom is left: 205 ms admitting, 187 ms executing, 90 ms assembling, 87 ms validating, 57 ms signing, about 831 ms of every second inside the single engine lock, against roughly 660 ms at 5 ms one-way. The load generator on the same host takes another seven of the 32 cores. Four replicas plus the client on one host is at its limit here. The untried levers are a second host for the client, dropping the leader's redundant validation of its own proposal (87 ms/s spent re-digesting a batch it just digested and re-verifying its own signature), reducing per-request admission cost further, or a lower target rate at 150 ms.
+
+Getting the first two regimes there took six fixes. The first run at 40,000 offered managed 25,256 TPS at 5 ms and 6,949 TPS at 155 ms.
+
+**Per-request bookkeeping in ordered maps of strings** (25,256 to 39,856 TPS at 5 ms). The leader held the engine lock 657 ms of every second: 224 ms admitting, 237 ms executing, 77 ms assembling, 74 ms validating, 45 ms signing. The pending pool sits at its cap whenever offered load exceeds capacity, so each request walked an ordered map of strings roughly 75 times across the pool, the watchdog's two indexes and the replay filter, which also split a key the caller had just joined. The pool and the watchdog's key index are hashed, and `ExecutedRequests` takes the client ID and request ID directly. Cadence went from 5.5 to 11 batches/s.
+
+**A digest recomputed on the hot path.** `carriesBody()` recomputed the batch digest, so it was linear in the batch, and `advanceConsensus()` calls it once per arriving vote. `bodyMatchesDigest()` is now the authoritative check, used where an incoming proposal is validated and where a fetched batch is installed; `carriesBody()` answers in constant time from the invariant validation establishes, that a stored proposal with a non-empty request list has already been checked against its digest.
+
+**Missing TCP tuning in the harness** (6,949 to 14,853 TPS at 155 ms). `scripts/cloudlab/lib_bedrock.sh` did not apply the namespace socket-buffer tuning that `lib_rustbft.sh` already applied for this regime: at 100 to 200 ms one-way the default send buffer caps a stream well below what batch dissemination needs, and slow start after idle re-throttles it between proposal ticks.
+
+**netem jitter** (14,853 to 30,865 TPS at 155 ms). The applier defaults to 20 percent jitter, so a 150 ms phase ran as `delay 155ms 31ms`. Jitter reorders packets and TCP treats reordering as loss; a 512 KiB batch is hundreds of packets. `scripts/apply_network_failures.py` says so in its own comment. High-throughput specs must set `<globalNetworkDelay><jitterRatio>0</jitterRatio>`.
+
+**Per-batch work done per request** (30,582 to 39,869 TPS at 55 ms). Execution replied to each request separately, and each reply cost a registry lookup, two mutex acquisitions and a condition-variable wake; `ClientStreams` now takes a batch of replies for one client. The balance lock was taken per transaction although execution already runs under the engine lock, and is now taken per batch. `validateProposal` built a set of heap-allocated request keys to reject a batch naming the same request twice, and now sorts string views into the batch's own bytes.
+
+**Retransmission that fired when nothing was lost.** Maintenance resent every vote for every unexecuted sequence every 250 ms, and the leader resent the full proposal to every peer whose prepare had not arrived. At 150 ms a prepare for a batch proposed 100 ms ago has not arrived because nothing was lost, so the leader pushed megabytes of batches a second into a link already carrying the real traffic. Retransmission is now gated on execution having stalled: execution is in sequence order, so a message a replica needs and never received stops `lastExecuted_` advancing. Votes go only to peers whose own vote is missing, since a live peer that had the message would have answered it. Fetching a missing batch body stays unconditional, because that is what unblocks execution.
+
+**A scan of every in-flight request, per tick.** `acceptProposal` did not mark the requests a batch carries as in flight, although `installBatchBody` and `installReProposal` both did, so a replica could not tell a request waiting its turn in the leader's queue from one the leader never received except by walking every unexecuted batch and building a key per request. `forwardPendingRequests` paid that per relay decision and `proposeBatch` paid it on every tick for as long as any relayed batch was outstanding. `acceptProposal` now marks its batch like the other two paths.
+
+Two couplings were removed along the way, and the rule is worth stating: **nothing in the retransmission or relay path should derive its timing from the election timeout.** An earlier retransmission gate used an eighth of it, harmless at the 8 s default, but once the timeout was calibrated down to 2 s it cost 7,000 TPS and thirteen elections. The relay grace still uses a quarter of it, which is why relaying becomes routine at 150 ms once the timeout is tuned below roughly 2.5 s. A learning agent that lowers the election timeout must not thereby make the system slower.
 
 ### CloudLab validation under injected network delay
 

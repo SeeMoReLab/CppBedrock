@@ -239,6 +239,39 @@ At PBFT 40,000 the offered load is roughly twice capacity, so the queues stay fu
 - A re-proposal installed without its batch was recorded as an empty batch and could then execute as empty, diverging from the committee. One replica detected this as `local state disagrees with a certified checkpoint`. Only a body verified against the signed digest now enters the log, and execution re-checks that digest before running a batch.
 - Backups relayed a full batch to the leader every 250 ms whenever the watched entry was older than that. Under the injected delay every batch exceeded 250 ms, so relaying became continuous, stalled the leader, and fed back into itself. Relaying now waits a quarter of the election timeout and sends a given watched entry once.
 
+## SBFT timer calibration
+
+SBFT has two timers and they are not independent. Measured at 40,000 requests/s, four replicas in namespaces on one 48-core CloudLab host.
+
+**The slow-path timeout** is how long the collector waits for the `n`-th prepare once it holds `2f+1`. Waiting costs the spread between those prepares; not waiting costs two extra message delays. So the winner is decided by the spread against the round trip, and a straggler - one replica whose outgoing packets are slow - is the knob that sets the spread:
+
+| Regime | 500 ms wait | 20 ms wait | Winner |
+| --- | --- | --- | ---: |
+| 5 ms, no straggler | 39,908 tps, 100 percent fast | 39,940 tps, 96 percent fast | neither, identical |
+| 5+50 ms, no straggler | 39,847 tps, 100 percent | 39,838 tps, 97 percent | neither |
+| 5+150 ms symmetric | 37,429 tps, p50 659 ms, 95 percent | 33,796 tps, p50 1,088 ms, 27 percent | high |
+| 5 ms, straggler +300 | 32,968 tps | 34,398 tps, 10 percent fast | low |
+
+At 5 ms the round trip is 10 ms, below the 20 ms low setting itself, so no straggler can make the high value win at base delay. The crossover at 150 ms sits between a +350 straggler (high still won, 30,644 against 27,282) and +500 (low won, 29,040 against 24,199), so it is above `2d` rather than at it.
+
+**The election timeout** is the same execution-stall watchdog as PBFT, but its floor is set by how long a view change takes to recover rather than by request latency. 350 ms and 1,000 ms cascade, re-firing during their own recovery: at 5+150 ms with no fault, 350 ms gave 4,338 tps with 122 elections and 1,000 ms gave 18,431 with 52, against 37,429 and no elections at 8,000 ms. Elections cost SBFT twice, because the fast path needs all `n` prepares and does not survive a view change. The usable ladder is 2,000 / 4,000 / 8,000.
+
+Five of the six pairs have a regime where they win outright:
+
+| Election | Slow path | Regime | Winner | Runner-up |
+| ---: | ---: | --- | ---: | --- |
+| 2,000 | 20 | 5 ms, straggler +300, leader stalled 5 s | 34,398 | 31,870 at 4,000; 9,429 at 8,000; 32,968 at 500 |
+| 2,000 | 500 | 5+50 ms, straggler +45, leader stalled 5 s | 32,926 | 26,125 at 4,000; 9,184 at 8,000; 31,205 at 20 |
+| 4,000 | 20 | 5+150 ms, straggler +500, leader stalled 5 s | 19,950 | 15,398 at 2,000; 14,660 at 8,000; 18,806 at 500 |
+| 4,000 | 500 | 5+250 ms, straggler +100, leader stalled 5 s | 23,481 | 12,660 at 2,000; 13,235 at 8,000; 16,691 at 20 |
+| 8,000 | 500 | 5+150 ms symmetric, no fault | 37,429 | 24,125 at 4,000; 18,431 at 1,000; 33,796 at 20 |
+
+The shape is the familiar one. A short election timeout wins where a real fault must be caught and stall noise is low; a long one wins where noise would cause spurious elections and there is no fault to catch; the middle value wins where both are present. The straggler magnitude tunes the two dimensions separately, because above the crossover it flips the slow-path winner while below it leaves the high value winning, and it adds election noise either way.
+
+**The sixth pair, 8,000 with 20, has no regime where it wins.** Seven scenario shapes were tried: base with a severe +2,000 straggler (every election timeout tied at about 39,400 to 39,900 with one election each), 5+150 ms with +350 and with +500, 5+250 ms with +600 and with +800, and a burst of +5,000 ms for 2 s every 20 s. In all of them 4,000 matched or beat 8,000. The reason is structural rather than a gap in the search: a high election timeout earns its keep by avoiding elections, and elections hurt SBFT mainly because they break the fast path, so once the slow-path timeout is low enough to abandon the fast path there is little left for the high timeout to protect. A learning agent should be expected to discover that this corner is dominated.
+
+Run-to-run spread in the stressed regimes is wide, so single runs mislead. Repeats of 5+150 ms with a +500 straggler gave 30,821 and 28,658 at 4,000 against 29,040 and 30,902 at 8,000 - fully overlapping, and an earlier reading of that pair as a 4,000 win was noise.
+
 ## SBFT fast and slow paths
 
 SBFT uses `n=3f+1` (`c=0`) with the primary as collector and individually verifiable RSA votes. Certificates carry the votes explicitly; they are not constant-size threshold signatures.

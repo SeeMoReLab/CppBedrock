@@ -137,7 +137,7 @@ void Entity::proposeRequest(const std::string& key) {
     const int view = currentView();
     if (pr.proposedInView == view) return;
     if (pbftCore_ && static_cast<int64_t>(nextSequenceNumber.load()) >=
-        static_cast<int64_t>(stableCheckpoint_) + bedrock::kConsensusWindow) return;
+        static_cast<int64_t>(stableCheckpoint_) + consensusWindow()) return;
     pr.proposedInView = view;
 
     const int seq = allocateNextSequence();

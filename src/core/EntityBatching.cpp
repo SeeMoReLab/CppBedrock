@@ -108,7 +108,7 @@ void Entity::proposalTick() {
 
 void Entity::proposeBatch() {
     if (!isCurrentLeader() || inViewChange ||
-        nextSequenceNumber.load() >= stableCheckpoint_ + bedrock::kConsensusWindow ||
+        nextSequenceNumber.load() >= stableCheckpoint_ + consensusWindow() ||
         nextSequenceNumber.load() - lastExecuted_ >= options_.maxInflightBatches) return;
     const auto assembleStart = nowUs();
     bedrock::ProtocolEnvelope env;
@@ -225,7 +225,7 @@ void Entity::forwardPendingRequests() {
     bedrock::ProtocolEnvelope payload;
     auto* batch = payload.mutable_pre_prepare();
     size_t bytes = 0;
-    for (const auto& key : requestTimer_.oldestKeys(options_.batchMaxRequests + bedrock::kConsensusWindow)) {
+    for (const auto& key : requestTimer_.oldestKeys(options_.batchMaxRequests + consensusWindow())) {
         const auto found = pendingRequests_.find(key);
         if (found == pendingRequests_.end() || found->second.proposedInView == currentView()) continue;
         if (bytes + found->second.bytes > static_cast<size_t>(options_.batchMaxBytes) ||

@@ -19,7 +19,7 @@ bool Entity::validateCheckpoint(const json& proof) {
         const json genesis{{"balances", json::object()}, {"executed", json::object()}};
         return proof["votes"].empty() && digest == computeSHA256(genesis.dump());
     }
-    if (seq < 0 || seq > std::numeric_limits<int>::max() - bedrock::kConsensusWindow ||
+    if (seq < 0 || seq > std::numeric_limits<int>::max() - consensusWindow() ||
         seq % bedrock::kCheckpointInterval || digest.size() != 64 ||
         proof["votes"].size() < static_cast<size_t>(2 * f + 1) ||
         proof["votes"].size() > static_cast<size_t>(committeeSize())) return false;
@@ -52,7 +52,7 @@ void Entity::acceptCheckpoint(const json& msg) {
     const int seq = msg.at("sequence"), sender = msg.at("message_sender_id");
     const std::string digest = msg.at("digest");
     if (seq <= stableCheckpoint_ || seq % bedrock::kCheckpointInterval || digest.size() != 64 ||
-        static_cast<int64_t>(seq) > static_cast<int64_t>(stableCheckpoint_) + bedrock::kConsensusWindow) return;
+        static_cast<int64_t>(seq) > static_cast<int64_t>(stableCheckpoint_) + consensusWindow()) return;
     auto& byDigest = checkpointVotes_[seq];
     for (const auto& [otherDigest, votes] : byDigest)
         if (otherDigest != digest && votes.count(sender)) return;
@@ -120,7 +120,7 @@ void Entity::installRecovery(const json& msg) {
     const auto& checkpoint = msg.at("checkpoint");
     const auto& snapshot = msg.at("snapshot");
     const auto& proofs = msg.at("committed");
-    if (!validateCheckpoint(checkpoint) || !proofs.is_array() || proofs.size() > bedrock::kConsensusWindow) return;
+    if (!validateCheckpoint(checkpoint) || !proofs.is_array() || proofs.size() > consensusWindow()) return;
     const int cp = checkpoint.at("sequence");
     const bool needsSnapshot = cp > lastExecuted_;
     if (needsSnapshot || !snapshot.is_null()) {
@@ -130,7 +130,7 @@ void Entity::installRecovery(const json& msg) {
     std::set<int> sequences;
     for (const auto& proof : proofs) {
         const int seq = decodeEnvelope(proof.at("proposal")).pre_prepare().sequence();
-        if (seq <= cp || static_cast<int64_t>(seq) > static_cast<int64_t>(cp) + bedrock::kConsensusWindow ||
+        if (seq <= cp || static_cast<int64_t>(seq) > static_cast<int64_t>(cp) + consensusWindow() ||
             !sequences.insert(seq).second) return;
         // Replies may have queued during a pause. Already executed decisions
         // are neither installed again nor allowed to hold up fresh evidence.

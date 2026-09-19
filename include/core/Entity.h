@@ -94,9 +94,13 @@ struct EntityOptions {
     int batchMaxBytes{512 * 1024};
     // Keeping the cadence at a 150 ms one-way delay needs roughly six batches
     // in flight, since a decision takes about four one-way trips. Evidence
-    // names batches by digest, so the window costs kilobytes: default to all
-    // of it rather than to a figure that silently caps throughput.
-    int maxInflightBatches{bedrock::kConsensusWindow};
+    // names batches by digest, so the window costs kilobytes rather than
+    // megabytes, and a run under added network delay needs it deep: 16
+    // batches stall execution for seconds at a time at 150 ms one way,
+    // because one late sequence blocks the rest and the leader then stops
+    // proposing. The default stays modest so a large committee fits the
+    // recovery message budget; raise it with --max-inflight-batches.
+    int maxInflightBatches{bedrock::kDefaultConsensusWindow};
     int maxPendingRequests{32768};
     int maxPendingBytes{16 * 1024 * 1024};
     // Optional transport injection for deterministic protocol tests. The
@@ -472,6 +476,16 @@ private:
     void pruneSequenceState();
 
     // ---- PBFT core state (all under eventMtx) ----
+    // Sequences the log and view-change evidence may span above the stable
+    // checkpoint. It never falls below the default, so a run that keeps only
+    // a batch or two in flight still has room for the checkpoint interval,
+    // and it follows --max-inflight-batches upward so a deeper pipeline is
+    // not clipped by the log. Every replica in a committee must derive the
+    // same value, since it bounds the evidence each will accept.
+    int consensusWindow() const {
+        return std::max(options_.maxInflightBatches, bedrock::kDefaultConsensusWindow);
+    }
+
     bedrock::PendingRequestTimer requestTimer_;
     bedrock::TaskScheduler scheduler_;
     std::optional<Clock::time_point> viewChangeWaitSince_;

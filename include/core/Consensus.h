@@ -14,9 +14,14 @@ constexpr int kCheckpointInterval = 2;
 // Sequences the log may hold above the stable checkpoint, and so the most
 // batches that can be in flight. Evidence names batches by digest, so this
 // window costs kilobytes of view-change evidence rather than megabytes, and
-// no longer has to be kept tiny. --max-inflight-batches selects how much of
-// it a run actually uses; the default stays conservative.
-constexpr int kConsensusWindow = 16;
+// no longer has to be kept tiny. The window a run actually uses is
+// --max-inflight-batches: it bounds the log, the in-flight proposals and the
+// evidence every replica will accept, so every replica in a committee must
+// be given the same value. The ceiling here only bounds what may be asked
+// for; a committee large enough to exceed the recovery message budget at the
+// requested window is rejected at startup.
+constexpr int kMaxConsensusWindow = 256;
+constexpr int kDefaultConsensusWindow = 16;
 // How often a replica checks for stalled sequences and retransmits. It also
 // bounds how long execution may stall before retransmission starts.
 constexpr int kMaintenanceIntervalMs = 250;

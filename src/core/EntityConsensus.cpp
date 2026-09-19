@@ -33,12 +33,12 @@ void Entity::initializeConsensus() {
     if (options_.proposalIntervalMs <= 0 || options_.batchMaxRequests <= 0 ||
         options_.batchMaxRequests > bedrock::kMaxBatchRequests || options_.batchMaxBytes <= 0 ||
         options_.batchMaxBytes > bedrock::kMaxBatchBytes || options_.maxInflightBatches <= 0 ||
-        options_.maxInflightBatches > bedrock::kConsensusWindow || options_.maxPendingRequests <= 0 ||
+        options_.maxInflightBatches > bedrock::kMaxConsensusWindow || options_.maxPendingRequests <= 0 ||
         options_.maxPendingBytes < options_.batchMaxBytes)
         throw std::runtime_error("invalid batching or admission limits");
     // View-change evidence names batches by digest, so its size depends on
     // the committee and the window, never on the batch size.
-    if (uint64_t(4 * f + 3) * bedrock::kConsensusWindow *
+    if (uint64_t(4 * f + 3) * consensusWindow() *
         uint64_t(committeeSize()) * 16384 > 56 * 1024 * 1024)
         throw std::runtime_error("committee too large for the recovery message budget");
     std::string keys;
@@ -66,7 +66,7 @@ void Entity::signEnvelope(ProtocolEnvelope& env) {
 bool Entity::verifyEnvelope(const ProtocolEnvelope& env) {
     ProtoMessage p(env);
     if (!committee_.contains(p.sender_id()) || p.view() < 0 || p.sequence() <= 0 ||
-        p.sequence() > std::numeric_limits<int>::max() - bedrock::kConsensusWindow ||
+        p.sequence() > std::numeric_limits<int>::max() - consensusWindow() ||
         env.digest().size() != 64 || env.signature().empty()) return false;
     return cryptoProvider->verify(consensusDomain_ + "phase/" + bedrock::signedHeaderBytes(env),
         env.signature(), options_.keysDir + "/server_" + std::to_string(p.sender_id()) + "_public.pem");
@@ -289,7 +289,7 @@ void Entity::handleEnvelope(const ProtocolEnvelope& env, bool selfBuilt) {
     if (inViewChange) return;
     ProtoMessage p(env);
     if (p.view() != currentView() || p.sequence() <= stableCheckpoint_ ||
-        static_cast<int64_t>(p.sequence()) > static_cast<int64_t>(stableCheckpoint_) + bedrock::kConsensusWindow ||
+        static_cast<int64_t>(p.sequence()) > static_cast<int64_t>(stableCheckpoint_) + consensusWindow() ||
         (!selfBuilt && !verifyEnvelope(env))) return;
     const auto phase = p.explicit_type();
     if (env.has_pre_prepare()) {

@@ -98,17 +98,17 @@ bool Entity::validateViewChange(const json& msg) {
     const int low = msg["checkpoint"].at("sequence");
     // Header-only evidence: three proof kinds over the window, each a
     // signed header plus at most one vote per replica.
-    const uint64_t maxBytes = 3 * uint64_t(bedrock::kConsensusWindow) *
+    const uint64_t maxBytes = 3 * uint64_t(consensusWindow()) *
         (4096 + uint64_t(committeeSize()) * 8192) + 65536;
     if (msg.dump().size() > maxBytes) return false;
     std::set<int> uncommitted;
     for (const std::string kind : {"prepared", "fast_votes", "committed"}) {
-        if (!msg.contains(kind) || !msg[kind].is_array() || msg[kind].size() > bedrock::kConsensusWindow) return false;
+        if (!msg.contains(kind) || !msg[kind].is_array() || msg[kind].size() > consensusWindow()) return false;
         if (kind == "fast_votes" && protocolName_ != "SBFT" && !msg[kind].empty()) return false;
         std::set<int> sequences;
         for (const auto& proof : msg[kind]) {
             const int seq = proofSequence(proof);
-            if (seq <= low || static_cast<int64_t>(seq) > static_cast<int64_t>(low) + bedrock::kConsensusWindow ||
+            if (seq <= low || static_cast<int64_t>(seq) > static_cast<int64_t>(low) + consensusWindow() ||
                 proofView(proof) >= view || !sequences.insert(seq).second) return false;
             if (kind == "committed" && uncommitted.count(seq)) return false;
             if (kind != "committed") uncommitted.insert(seq);
@@ -197,7 +197,7 @@ json Entity::selectNewView(const json& changes, int view) {
             maxSeq = std::max(maxSeq, proofSequence(proof));
         }
     }
-    if (static_cast<int64_t>(maxSeq) > static_cast<int64_t>(low) + bedrock::kConsensusWindow)
+    if (static_cast<int64_t>(maxSeq) > static_cast<int64_t>(low) + consensusWindow())
         throw std::invalid_argument("NewView exceeds the certified sequence window");
     json proposals = json::array();
     for (int seq = low + 1; seq <= maxSeq; ++seq) {

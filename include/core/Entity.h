@@ -516,6 +516,14 @@ private:
     uint64_t proposalGeneration_{0};
     Clock::time_point lastRecoveryRequest_{};
     Clock::time_point lastConsensusProgress_{Clock::now()};
+    // Execution advances here and nowhere else. State transfer is progress
+    // just as ordering is, and callers that ask whether this replica is
+    // executing - the retransmission gate and the election watchdog - are
+    // wrong if a checkpoint install leaves the mark stale.
+    void advanceExecuted(int seq) {
+        lastExecuted_ = seq;
+        lastConsensusProgress_ = Clock::now();
+    }
     // Batch bodies this replica holds, by sequence. Consensus evidence
     // names batches by digest; this is where the named bytes live.
     std::map<int, bedrock::PrePrepare> batchIndex_;

@@ -146,7 +146,7 @@ void Entity::installRecovery(const json& msg) {
         }
         executedRequests_ = std::move(restoredExecuted);
         committedTransactions_.store(executedRequests_.size());
-        lastExecuted_ = cp;
+        advanceExecuted(cp);
         highestCommittedSeq_ = cp;
         nextSequenceNumber.store(std::max(nextSequenceNumber.load(), cp));
         entityInfo["sequence"] = std::max(entityInfo["sequence"].get<int>(), cp);

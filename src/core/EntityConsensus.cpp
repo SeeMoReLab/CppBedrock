@@ -484,8 +484,7 @@ void Entity::drainExecution() {
                 throw std::runtime_error("stored batch does not match the certified digest");
             if (!completeSequence(seq, path)) throw std::runtime_error("certified request missing at execution");
             readySequences_.erase(seq);
-            lastExecuted_ = seq;
-            lastConsensusProgress_ = Clock::now();
+            advanceExecuted(seq);
             if (seq % bedrock::kCheckpointInterval == 0) makeCheckpoint();
         }
     } catch (...) { drainingExecution_ = false; throw; }

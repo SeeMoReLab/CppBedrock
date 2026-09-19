@@ -20,6 +20,23 @@ int proofView(const json& proof) { return decodeEnvelope(proof.at("proposal")).p
 void Entity::onRequestTimerExpired(std::uint64_t generation) {
     std::lock_guard<std::recursive_mutex> engine(eventMtx);
     if (!running || !pbftCore_ || inViewChange || !requestTimer_.expired(generation)) return;
+    // PBFT stops this timer when the request it is timing executes and restarts
+    // it while others are still pending, which in a healthy system means it is
+    // restarted continuously. That rests on the primary being obliged to order
+    // every request a backup holds. This engine admits into a bounded pool and
+    // sheds the rest, so a request the leader's own admission dropped is never
+    // proposed, never executes, and never leaves this replica's queue: it sits
+    // at the head of the watch order and is handed a fresh timeout forever,
+    // until one of them elapses and a replica executing in lockstep with the
+    // quorum calls a view change nobody joins. With load shedding, one specific
+    // request is not a meaningful unit, so restart on any execution: re-date
+    // the watch to the last one, leaving the deadline exactly one timeout after
+    // it. A leader that has actually stopped executes nothing, so the deadline
+    // still arrives on schedule.
+    if (const auto watch = requestTimer_.watch(); watch && lastConsensusProgress_ > watch->since) {
+        requestTimer_.rearm(lastConsensusProgress_);
+        return;
+    }
     if (currentView() == std::numeric_limits<int>::max()) throw std::runtime_error("view number exhausted");
     startViewChange(currentView() + 1, "watched request deadline expired");
 }

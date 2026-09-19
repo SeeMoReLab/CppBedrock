@@ -51,6 +51,9 @@ public:
     void clear();
     // Install a pending set with a fresh watch (e.g. after a new view).
     void reset(const std::vector<Entry>& entries);
+    // Re-watch the oldest entry as of `since`, so the next deadline falls one
+    // timeout after that moment rather than a full timeout from now.
+    void rearm(Clock::time_point since);
     // Recompute from watchedSince, without granting a fresh timeout.
     void timeoutChanged();
 

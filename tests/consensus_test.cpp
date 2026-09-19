@@ -536,8 +536,11 @@ void watchedRequestTimers(Fixture& fixture) {
         unicast.flush(); unicast.checkExecuted(1);
         CHECK(!Access::timer(*unicast.nodes[3]).watch());
 
-        // Only replica 3 knows this request. The leader commits other requests
-        // successfully, but that progress must not postpone replica 3's watch.
+        // Only replica 3 knows this request, so the leader never proposes it.
+        // That is what a request lost to admission shedding looks like from a
+        // follower, and electing cannot serve it, so execution elsewhere
+        // re-dates the watch to the last executed sequence. Only a window with
+        // no execution in it at all is a stalled leader, and elects.
         Network skipped(fixture, protocol);
         const json request{{"type", "Request"}, {"client_id", "ignored"}, {"request_id", 1},
             {"operation", "transfer"}, {"timestamp", "1"},
@@ -550,6 +553,14 @@ void watchedRequestTimers(Fixture& fixture) {
         CHECK_EQ(Access::timer(follower).watch()->generation, watched.generation);
         AgentTimeouts shorter; shorter.electionMs = 1;
         follower.applyAgentTimeouts(shorter);
+        std::this_thread::sleep_for(3ms);
+        // Sequence 1 executed inside this window, so the watch keeps its key
+        // and is re-dated to that execution rather than calling a view change.
+        Access::requestExpiry(follower, Access::timer(follower).watch()->generation);
+        CHECK_EQ(follower.currentView(), 0);
+        CHECK_EQ(Access::timer(follower).watch()->key, std::string("ignored/1"));
+        CHECK(Access::timer(follower).watch()->generation != watched.generation);
+        // Nothing has executed since, so this window is a real stall.
         std::this_thread::sleep_for(3ms);
         Access::requestExpiry(follower, Access::timer(follower).watch()->generation);
         CHECK_EQ(follower.currentView(), 1);

@@ -94,6 +94,15 @@ void PendingRequestTimer::reset(const std::vector<Entry>& entries) {
     cv_.notify_all();
 }
 
+void PendingRequestTimer::rearm(Clock::time_point since) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        selectWatchLocked();
+        if (watchedKey_) watchedSince_ = since;
+    }
+    cv_.notify_all();
+}
+
 void PendingRequestTimer::timeoutChanged() {
     {
         std::lock_guard<std::mutex> lk(mtx_);

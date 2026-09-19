@@ -213,13 +213,21 @@ void Entity::forwardPendingRequests() {
     // retransmission and certified recovery cover it from here.
     if (watched->second.proposedInView == currentView()) return;
     const auto now = Clock::now();
-    // Otherwise give the leader a quarter of the election timeout, and relay a
-    // given watched entry once, retrying only if it stays stuck. Relaying on
-    // every tick sends a batch several times a second to a leader that is
-    // already behind, which is how a slow leader becomes a stopped one.
-    const auto grace = std::chrono::milliseconds(std::max(1, viewChangeTimeoutMs.load() / 4));
+    // Otherwise wait for execution to have stalled, and relay a given watched
+    // entry once, retrying only if it stays stuck. Relaying on every tick
+    // sends a batch several times a second to a leader that is already
+    // behind, which is how a slow leader becomes a stopped one.
+    //
+    // These deadlines are deliberately not derived from the election timeout.
+    // That timeout is the quantity the learning agent varies, and keying relay
+    // aggressiveness to it makes one action change two things at once, so the
+    // effect of the timeout alone stops being identifiable. The maintenance
+    // interval is the engine's existing answer to "how long may execution
+    // stall before a replica acts", and the retransmission gate already uses
+    // it for the same judgement.
+    const auto grace = std::chrono::milliseconds(bedrock::kMaintenanceIntervalMs);
     if (now - watch->since < grace) return;
-    const auto retry = std::chrono::milliseconds(std::max(1, viewChangeTimeoutMs.load() / 2));
+    const auto retry = std::chrono::milliseconds(2 * bedrock::kMaintenanceIntervalMs);
     if (watch->key == lastForwardedKey_ && lastRequestForward_ != Clock::time_point{} &&
         now - lastRequestForward_ < retry) return;
     bedrock::ProtocolEnvelope payload;

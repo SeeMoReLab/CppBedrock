@@ -461,12 +461,15 @@ void broadcastAdmission(Fixture& fixture) {
         Network net(fixture, protocol, 4, [](auto& options) {
             options.batchMaxRequests = 1;
             options.maxPendingRequests = 1;
-            options.initialElectionTimeoutMs = 4;
+            // Long enough that the watchdog stays out of the way: relaying is
+            // timed by the maintenance interval, not by the election timeout,
+            // so this test waits out the former and must not trip the latter.
+            options.initialElectionTimeoutMs = 60000;
         });
         net.request(1, false, false); // Fill the leader, leaving backup pools empty.
         net.request(2, true, false);  // Leader rejects; every backup accepts.
         CHECK_EQ(net.nodes[0]->pendingRequestCount(), 1u);
-        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        std::this_thread::sleep_for(std::chrono::milliseconds(bedrock::kMaintenanceIntervalMs + 1));
         for (int id = 1; id < 4; ++id) net.nodes[id]->proposalTick();
         net.flush();
         CHECK_EQ(Access::forwarded(*net.nodes[0]).size(), 3u);

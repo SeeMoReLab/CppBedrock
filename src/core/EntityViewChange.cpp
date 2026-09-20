@@ -55,6 +55,14 @@ void Entity::onRequestTimerExpired(std::uint64_t generation) {
         }
     }
     if (currentView() == std::numeric_limits<int>::max()) throw std::runtime_error("view number exhausted");
+    // Doubling here is the other half of timing a request from its arrival.
+    // A view change hands the incoming primary whatever the last one left
+    // unordered; if that cannot be cleared inside one timeout the deadline has
+    // already passed when the new view installs, and the replica elects again
+    // at once. Doubling gives each successive primary more room than the last,
+    // so a burst converges instead of running until the backlog happens to
+    // drain, and a replica that has fallen far behind can still catch up.
+    setViewChangeBackoff(viewChangeBackoff_ + 1);
     startViewChange(currentView() + 1, "watched request deadline expired");
 }
 
@@ -88,7 +96,7 @@ void Entity::onViewChangeWaitExpired(uint64_t generation) {
     if (!running || !inViewChange || generation != viewChangeWaitGeneration_ ||
         !viewChangeWaitSince_ || Clock::now() < *viewChangeWaitSince_ + viewChangeWaitDuration()) return;
     if (currentView() == std::numeric_limits<int>::max()) throw std::runtime_error("view number exhausted");
-    viewChangeBackoff_ = std::min(viewChangeBackoff_ + 1, 30u);
+    setViewChangeBackoff(viewChangeBackoff_ + 1);
     startViewChange(currentView() + 1, "NewView deadline expired");
 }
 

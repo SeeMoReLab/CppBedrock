@@ -1,6 +1,7 @@
 #include "core/PendingRequestTimer.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace bedrock {
 
@@ -41,7 +42,10 @@ void PendingRequestTimer::selectWatchLocked() {
 }
 
 PendingRequestTimer::Clock::time_point PendingRequestTimer::deadlineLocked() const {
-    return std::max(watchedSince_, floor_) + std::chrono::milliseconds(std::max(1, timeoutMs_.load()));
+    const std::uint64_t base = static_cast<std::uint64_t>(std::max(1, timeoutMs_.load()));
+    const std::uint64_t scaled = base << std::min(backoff_, 30u);
+    return std::max(watchedSince_, floor_) +
+           std::chrono::milliseconds(std::min(scaled, std::uint64_t(std::numeric_limits<int>::max())));
 }
 
 bool PendingRequestTimer::track(const std::string& key, Clock::time_point acceptedAt) {
@@ -104,6 +108,16 @@ void PendingRequestTimer::rearm(Clock::time_point since) {
         std::lock_guard<std::mutex> lk(mtx_);
         selectWatchLocked();
         if (watchedKey_) watchedSince_ = since;
+    }
+    cv_.notify_all();
+}
+
+void PendingRequestTimer::setBackoff(unsigned shift) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (backoff_ == shift) return;
+        backoff_ = shift;
+        ++generation_;
     }
     cv_.notify_all();
 }

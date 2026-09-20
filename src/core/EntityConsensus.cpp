@@ -132,11 +132,28 @@ std::string Entity::digestFor(int seq) const {
     return std::string();
 }
 
+void Entity::rememberBody(const bedrock::PrePrepare& body) {
+    if (body.requests().empty()) return;
+    bodiesByDigest_.emplace(bedrock::requestDigest(body), body);
+}
+
+const bedrock::PrePrepare* Entity::bodyForDigest(const std::string& digest) const {
+    if (digest.empty()) return nullptr;
+    auto found = bodiesByDigest_.find(digest);
+    return found == bodiesByDigest_.end() ? nullptr : &found->second;
+}
+
 void Entity::attachLocalBody(ProtocolEnvelope& env) const {
     if (bedrock::carriesBody(env)) return;
     auto found = batchIndex_.find(env.pre_prepare().sequence());
-    if (found == batchIndex_.end() || bedrock::requestDigest(found->second) != env.digest()) return;
-    *env.mutable_pre_prepare()->mutable_requests() = found->second.requests();
+    if (found != batchIndex_.end() && bedrock::requestDigest(found->second) == env.digest()) {
+        *env.mutable_pre_prepare()->mutable_requests() = found->second.requests();
+        return;
+    }
+    // The sequence slot may have moved to another batch, but the bytes this
+    // header names can still be in hand from when they were first seen.
+    if (const auto* body = bodyForDigest(env.digest()))
+        *env.mutable_pre_prepare()->mutable_requests() = body->requests();
 }
 
 void Entity::requestBatch(int seq) {
@@ -159,6 +176,7 @@ void Entity::installBatchBody(int seq, const bedrock::PrePrepare& body) {
     auto& stored = batchIndex_[seq];
     stored = body;
     stored.set_sequence(seq);
+    rememberBody(stored);
     for (const auto& r : body.requests()) {
         auto pending = pendingRequests_.find(requestKey(r.client_id(), r.request_id()));
         if (pending != pendingRequests_.end()) pending->second.proposedInView = currentView();
@@ -246,6 +264,7 @@ void Entity::acceptProposal(const ProtocolEnvelope& env) {
         if (!bedrock::carriesBody(instance.proposal) && bedrock::carriesBody(env)) {
             instance.proposal = env;
             if (p.sequence() > lastExecuted_) batchIndex_[p.sequence()] = p;
+            rememberBody(p);
         }
         return;
     }
@@ -254,7 +273,7 @@ void Entity::acceptProposal(const ProtocolEnvelope& env) {
     // holding an entry for a sequence means holding the right bytes. A
     // header-only re-proposal invalidates any body left from another view.
     if (p.sequence() > lastExecuted_) {
-        if (bedrock::carriesBody(env)) batchIndex_[p.sequence()] = p;
+        if (bedrock::carriesBody(env)) { batchIndex_[p.sequence()] = p; rememberBody(p); }
         else {
             auto stale = batchIndex_.find(p.sequence());
             if (stale != batchIndex_.end() && bedrock::requestDigest(stale->second) != env.digest())
@@ -376,6 +395,7 @@ void Entity::advanceConsensus(int seq) {
         attachLocalBody(i.proposal);
         if (!bedrock::carriesBody(i.proposal)) { requestBatch(seq); return; }
         batchIndex_[seq] = i.proposal.pre_prepare();
+        rememberBody(i.proposal.pre_prepare());
     }
     const int view = i.proposal.pre_prepare().view();
     const std::string digest = i.proposal.digest();
@@ -467,7 +487,7 @@ void Entity::learnCommitted(const json& proof, int path) {
         throw std::runtime_error("conflicting certified decisions");
     committedProofs_[seq] = proof;
     if (seq <= lastExecuted_) return;
-    if (bedrock::carriesBody(env)) batchIndex_[seq] = p;
+    if (bedrock::carriesBody(env)) { batchIndex_[seq] = p; rememberBody(p); }
     {
         std::lock_guard<std::mutex> lock(phaseTsMtx);
         phaseTs_commit.emplace(seq, nowUs());

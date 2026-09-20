@@ -258,8 +258,22 @@ bool Entity::completeSequence(int seq, int path) {
         for (auto& [clientId, queue] : replies)
             repliesSent_.fetch_add(clientStreams_.reply(clientId, queue));
         completed.push_back("seq:" + std::to_string(seq));
+        const auto watchedBefore = requestTimer_.watch();
         requestTimer_.complete(completed);
-        if (executed && !inViewChange) viewChangeBackoff_ = 0;
+        // PBFT restores the timeout when the request it was timing executes,
+        // not on any execution at all. The difference matters during a burst:
+        // the incoming primary is draining a backlog, so execution is
+        // progressing while the watched request is still starving, and
+        // resetting there would undo the backoff on every view change and
+        // leave the burst undamped. The watch is re-selected, and its
+        // generation therefore changes, exactly when the entry being timed
+        // completes.
+        if (executed && !inViewChange) {
+            const auto watchedAfter = requestTimer_.watch();
+            if (!watchedBefore || !watchedAfter ||
+                watchedAfter->generation != watchedBefore->generation)
+                setViewChangeBackoff(0);
+        }
         executeUs_ += static_cast<uint64_t>(nowUs() - executeStart);
         markOperationProcessed(seq, path, executed, batch.requests_size());
         return true;

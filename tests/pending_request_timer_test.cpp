@@ -71,6 +71,29 @@ void viewFloorGivesTheNewPrimaryAFullTimeout() {
     CHECK(timer.watch()->deadline == fresh + 200ms);
 }
 
+void backoffScalesTheDeadlineAndRearms() {
+    std::atomic<int> timeout{200};
+    PendingRequestTimer timer(timeout, [](auto) {});
+    const auto arrived = Clock::now();
+    CHECK(timer.track("a", arrived));
+    const auto base = *timer.watch();
+    CHECK(base.deadline == arrived + 200ms);
+    // Each view change a replica starts doubles the timeout, so that the next
+    // primary gets more room to clear the backlog than the last one had.
+    timer.setBackoff(1);
+    CHECK(timer.watch()->deadline == arrived + 400ms);
+    CHECK(timer.watch()->generation != base.generation);  // an armed wait re-evaluates
+    timer.setBackoff(3);
+    CHECK(timer.watch()->deadline == arrived + 1600ms);
+    CHECK(!timer.expired(timer.watch()->generation, arrived + 1599ms));
+    CHECK(timer.expired(timer.watch()->generation, arrived + 1600ms));
+    // Executing the request that was being timed restores the base timeout.
+    timer.setBackoff(0);
+    CHECK(timer.watch()->deadline == arrived + 200ms);
+    // The watch still carries its own arrival, so ordering is untouched.
+    CHECK(timer.watch()->since == arrived);
+}
+
 void batchCompletesAtomically() {
     std::atomic<int> timeout{200};
     PendingRequestTimer timer(timeout, [](auto) {});
@@ -182,6 +205,7 @@ void stopWhileArmed() {
 int main() {
     watchedRequestIsTimedFromItsArrival();
     viewFloorGivesTheNewPrimaryAFullTimeout();
+    backoffScalesTheDeadlineAndRearms();
     batchCompletesAtomically();
     resetPreservesArrivalOrder();
     timeoutChangesKeepElapsedTime();

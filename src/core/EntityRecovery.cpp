@@ -216,9 +216,13 @@ void Entity::handleConsensusControl(const json& msg) {
         const int seq = msg.at("sequence");
         const std::string digest = msg.at("digest");
         auto found = batchIndex_.find(seq);
-        if (found == batchIndex_.end() || bedrock::requestDigest(found->second) != digest) return;
+        const bedrock::PrePrepare* body =
+            (found != batchIndex_.end() && bedrock::requestDigest(found->second) == digest)
+                ? &found->second
+                : bodyForDigest(digest);
+        if (!body) return;
         bedrock::ProtocolEnvelope payload;
-        *payload.mutable_pre_prepare() = found->second;
+        *payload.mutable_pre_prepare() = *body;
         sendTo(msg.at("message_sender_id").get<int>(),
                Message(signControl(json{{"type", "BatchResponse"}, {"sequence", seq}, {"digest", digest},
                                         {"batch", bedrock::encodeEnvelope(payload)}}).dump()));
@@ -250,6 +254,37 @@ void Entity::scheduleConsensusMaintenance() {
     });
 }
 
+// A committee can deadlock on a single sequence it can no longer substantiate,
+// and every part of that state is otherwise only visible at debug level: the
+// replica keeps asking for a batch body nobody has, execution never passes the
+// gap, the window fills, admission sheds everything, and the only thing in the
+// log is a view change every few seconds that changes nothing. Say so, with the
+// specific reason, so a stall is diagnosable from an ordinary run.
+void Entity::reportExecutionStall() {
+    if (!pbftCore_) return;
+    const auto stalled = Clock::now() - lastConsensusProgress_;
+    if (stalled < std::chrono::milliseconds(bedrock::kExecutionStallReportMs)) return;
+    if (Clock::now() - lastStallReport_ < std::chrono::milliseconds(bedrock::kExecutionStallReportMs)) return;
+    lastStallReport_ = Clock::now();
+    const int seq = lastExecuted_ + 1;
+    const auto instance = consensusInstances_.find(seq);
+    const auto digest = digestFor(seq);
+    LOG_WARN("execution stalled at sequence " << seq << " for "
+             << std::chrono::duration_cast<std::chrono::milliseconds>(stalled).count() << "ms"
+             << ": ready=" << (readySequences_.count(seq) ? 1 : 0)
+             << " have_body=" << (batchIndex_.count(seq) ? 1 : 0)
+             << " have_preprepare="
+             << (instance != consensusInstances_.end() && instance->second.proposal.has_pre_prepare() ? 1 : 0)
+             << " body_on_proposal="
+             << (instance != consensusInstances_.end() && bedrock::carriesBody(instance->second.proposal) ? 1 : 0)
+             << " prepares=" << (instance != consensusInstances_.end() ? instance->second.prepares.size() : 0)
+             << " commits=" << (instance != consensusInstances_.end() ? instance->second.commits.size() : 0)
+             << " digest_known=" << (digest.empty() ? 0 : 1)
+             << " view=" << currentView() << " checkpoint=" << stableCheckpoint_
+             << " window_end=" << stableCheckpoint_ + consensusWindow()
+             << " pending=" << pendingRequests_.size() << " bodies=" << batchIndex_.size());
+}
+
 void Entity::maintainConsensus() {
     std::lock_guard<std::recursive_mutex> lock(eventMtx);
     if (!pbftCore_) return;
@@ -261,7 +296,9 @@ void Entity::maintainConsensus() {
         // the other replicas are still making progress in the old view.
         // Certified decisions remain valid and must be recovered while waiting.
         requestRecovery();
+        reportExecutionStall();
     } else {
+        reportExecutionStall();
         // Every replica observes who leads, not only the replica that happens
         // to propose. The injector pins a victim for the interval and refuses
         // to re-pin it, so that electing a different leader escapes the delay

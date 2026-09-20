@@ -22,6 +22,8 @@ constexpr int kCheckpointInterval = 2;
 // requested window is rejected at startup.
 constexpr int kMaxConsensusWindow = 256;
 constexpr int kDefaultConsensusWindow = 16;
+// How long execution may stand still before a replica reports why.
+constexpr int kExecutionStallReportMs = 2000;
 // How often a replica checks for stalled sequences and retransmits. It also
 // bounds how long execution may stall before retransmission starts.
 constexpr int kMaintenanceIntervalMs = 250;

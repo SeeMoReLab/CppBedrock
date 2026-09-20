@@ -491,6 +491,11 @@ private:
     std::optional<Clock::time_point> viewChangeWaitSince_;
     uint64_t viewChangeWaitGeneration_{0};
     unsigned viewChangeBackoff_{0};
+    // One backoff for both deadlines, because in PBFT they are one timeout.
+    void setViewChangeBackoff(unsigned shift) {
+        viewChangeBackoff_ = std::min(shift, 30u);
+        requestTimer_.setBackoff(viewChangeBackoff_);
+    }
     std::chrono::milliseconds viewChangeWaitDuration() const;
     void armViewChangeWait();
     void cancelViewChangeWait();
@@ -605,6 +610,18 @@ private:
     void rememberPrepared(int seq, const nlohmann::json& proof);
     void learnCommitted(const nlohmann::json& proof, int path);
     void drainExecution();
+    void reportExecutionStall();
+    // Bodies addressed by digest, not by sequence. batchIndex_ holds at most
+    // one body per sequence and a header-only re-proposal naming a different
+    // batch evicts it, but the evicted bytes are exactly what a peer still
+    // stuck on that digest needs - and a BatchRequest asks by digest. Keeping
+    // them here means a replica can always answer for any batch it has seen
+    // since the last checkpoint, which is what stops a committee deadlocking
+    // on a sequence whose body every replica has just discarded.
+    std::map<std::string, bedrock::PrePrepare> bodiesByDigest_;
+    void rememberBody(const bedrock::PrePrepare& body);
+    const bedrock::PrePrepare* bodyForDigest(const std::string& digest) const;
+    Clock::time_point lastStallReport_{};
     void finishNewView(const nlohmann::json& msg);
     void makeCheckpoint();
     void acceptCheckpoint(const nlohmann::json& msg);

@@ -803,6 +803,10 @@ void Entity::pruneSequenceState() {
     pruneIntMap(receivedMessages);
     pruneIntMap(preparePhaseTimerRunning);
     pruneIntMap(preprepareCache);
+    // Bodies are keyed by digest, so they are dropped by the sequence they
+    // were proposed at rather than by map order.
+    for (auto it = bodiesByDigest_.begin(); it != bodiesByDigest_.end();)
+        it = (it->second.sequence() < floor) ? bodiesByDigest_.erase(it) : std::next(it);
     for (auto it = executedRequestBySeq_.begin(); it != executedRequestBySeq_.end() && it->first < floor;) {
         executedRequests_.erase(it->second);
         it = executedRequestBySeq_.erase(it);

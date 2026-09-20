@@ -59,6 +59,12 @@ public:
     // incoming primary would inherit deadlines that had already passed and be
     // voted out for its predecessor's delay, one view per backlogged request.
     void setFloor(Clock::time_point floor);
+    // PBFT doubles the timeout each time a replica starts a view change and
+    // restores it when the request it was timing executes. Without that, every
+    // view change hands the incoming primary the backlog the last one left and
+    // the same unchanged deadline to clear it in, so a replica that cannot
+    // clear it elects again immediately and never recovers.
+    void setBackoff(unsigned shift);
     // Recompute from watchedSince, without granting a fresh timeout.
     void timeoutChanged();
 
@@ -86,6 +92,7 @@ private:
     std::optional<std::string> watchedKey_;
     Clock::time_point watchedSince_{};
     Clock::time_point floor_{Clock::time_point::min()};
+    unsigned backoff_{0};
     std::uint64_t generation_{0};
     bool running_{false};
     std::thread thread_;

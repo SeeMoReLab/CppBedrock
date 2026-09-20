@@ -262,6 +262,16 @@ void Entity::maintainConsensus() {
         // Certified decisions remain valid and must be recovered while waiting.
         requestRecovery();
     } else {
+        // Every replica observes who leads, not only the replica that happens
+        // to propose. The injector pins a victim for the interval and refuses
+        // to re-pin it, so that electing a different leader escapes the delay
+        // for the rest of the tick - which is the entire reason a slow leader
+        // is worth a view change. Were the proposing replica the only observer,
+        // each new leader would find the tick unpinned and pin itself, so the
+        // delay would follow the leadership and no election could escape it.
+        // Observing outside a view change keeps the choice agreed: every
+        // replica resolves the same installed view to the same leader.
+        proposalDelay_->observeLeader(currentLeader(), peerIds_);
         // Retransmission recovers lost messages, and one proposal is half a
         // megabyte, so resending into a pipeline that is merely deep is how a
         // busy replica is made slower. Execution is in sequence order, so a

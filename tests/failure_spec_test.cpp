@@ -107,6 +107,20 @@ void leaderWindowPinsWithinIntervalTick() {
     CHECK_EQ(ctrl->delayForProposal(1, 2, all).count(), 3000);
 }
 
+void observingReplicaPinsLeaderWithoutProposing() {
+    auto ctrl = controllerAt(100s);
+    const auto all = ids(4);
+    // A replica that never proposes still fixes the tick's victim. This is what
+    // lets a view change escape a slow leader: the replica elected next finds
+    // the tick already pinned to its predecessor and proposes without delay.
+    // If only the proposer observed, every new leader would pin itself and the
+    // delay would follow leadership, which no election can escape.
+    ctrl->observeLeader(1, all);
+    CHECK_EQ(ctrl->delayFor(1).count(), 3000);
+    CHECK_EQ(ctrl->delayFor(2).count(), 0);
+    CHECK_EQ(ctrl->delayForProposal(2, 2, all).count(), 0);
+}
+
 void explicitReplicaRuleApplies() {
     auto ctrl = controllerAt(200s);  // phase at 120s
     const auto all = ids(4);
@@ -184,6 +198,7 @@ int main() {
     warmupDisablesInjection();
     leaderWindowTargetsLeaderAndSuccessors();
     leaderWindowPinsWithinIntervalTick();
+    observingReplicaPinsLeaderWithoutProposing();
     explicitReplicaRuleApplies();
     disabledControllerReturnsZero();
     missingSectionYieldsNoDelays();

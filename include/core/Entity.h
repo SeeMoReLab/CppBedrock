@@ -516,6 +516,9 @@ private:
     uint64_t proposalGeneration_{0};
     Clock::time_point lastRecoveryRequest_{};
     Clock::time_point lastConsensusProgress_{Clock::now()};
+    // Arrival time of the newest batch execution has reached, used to tell a
+    // request execution has overtaken from one it has merely not caught up to.
+    std::atomic<long long> lastExecutedArrivalUs_{0};
     // Execution advances here and nowhere else. State transfer is progress
     // just as ordering is, and callers that ask whether this replica is
     // executing - the retransmission gate and the election watchdog - are

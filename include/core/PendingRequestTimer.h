@@ -54,6 +54,11 @@ public:
     // Re-watch the oldest entry as of `since`, so the next deadline falls one
     // timeout after that moment rather than a full timeout from now.
     void rearm(Clock::time_point since);
+    // No deadline may fall before this instant. A view change re-tracks the
+    // backlog with the arrival times it already had, so without a floor the
+    // incoming primary would inherit deadlines that had already passed and be
+    // voted out for its predecessor's delay, one view per backlogged request.
+    void setFloor(Clock::time_point floor);
     // Recompute from watchedSince, without granting a fresh timeout.
     void timeoutChanged();
 
@@ -80,6 +85,7 @@ private:
     std::multimap<Clock::time_point, std::string> byTime_;
     std::optional<std::string> watchedKey_;
     Clock::time_point watchedSince_{};
+    Clock::time_point floor_{Clock::time_point::min()};
     std::uint64_t generation_{0};
     bool running_{false};
     std::thread thread_;

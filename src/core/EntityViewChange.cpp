@@ -21,21 +21,38 @@ void Entity::onRequestTimerExpired(std::uint64_t generation) {
     std::lock_guard<std::recursive_mutex> engine(eventMtx);
     if (!running || !pbftCore_ || inViewChange || !requestTimer_.expired(generation)) return;
     // PBFT stops this timer when the request it is timing executes and restarts
-    // it while others are still pending, which in a healthy system means it is
-    // restarted continuously. That rests on the primary being obliged to order
-    // every request a backup holds. This engine admits into a bounded pool and
-    // sheds the rest, so a request the leader's own admission dropped is never
-    // proposed, never executes, and never leaves this replica's queue: it sits
-    // at the head of the watch order and is handed a fresh timeout forever,
-    // until one of them elapses and a replica executing in lockstep with the
-    // quorum calls a view change nobody joins. With load shedding, one specific
-    // request is not a meaningful unit, so restart on any execution: re-date
-    // the watch to the last one, leaving the deadline exactly one timeout after
-    // it. A leader that has actually stopped executes nothing, so the deadline
-    // still arrives on schedule.
+    // it while others are still pending. That rests on the primary being obliged
+    // to order every request a backup holds. This engine admits into a bounded
+    // pool and each replica sheds on its own occupancy, so the leader can drop a
+    // request a backup accepted: it is never proposed, never executes, and never
+    // leaves this replica's queue, sitting at the head of the watch order and
+    // being handed a fresh timeout forever until one elapses and a replica
+    // executing in lockstep with the quorum calls a view change nobody joins.
+    //
+    // Restarting on any execution would answer that, but it asks a different
+    // question than PBFT does - whether the replica is executing at all, rather
+    // than whether this request is starving - and a leader that orders every
+    // request late is then never replaced at any timeout, which is precisely
+    // the fault the election timeout exists to escape.
+    //
+    // Arrival order separates the two. A shed request is one execution has
+    // overtaken: batches made entirely of later arrivals keep executing while it
+    // waits, and no view change can help because the next leader sheds it too.
+    // A leader merely slow starves the oldest request while everything executing
+    // arrived earlier still, and electing does help. So restart the timer only
+    // on execution that has passed this request by; otherwise let the deadline
+    // stand. A leader that has stopped executes nothing and is caught either way.
+    // Both conditions must hold to suppress the view change. Execution that has
+    // stopped is a stalled leader whatever sits at the head of the watch, and a
+    // replica that declined to elect there would wait out a dead leader forever.
     if (const auto watch = requestTimer_.watch(); watch && lastConsensusProgress_ > watch->since) {
-        requestTimer_.rearm(lastConsensusProgress_);
-        return;
+        const auto watched = pendingRequests_.find(watch->key);
+        const bool overtaken = watched == pendingRequests_.end() ||
+                               lastExecutedArrivalUs_.load() > watched->second.arrivalUs;
+        if (overtaken) {
+            requestTimer_.rearm(lastConsensusProgress_);
+            return;
+        }
     }
     if (currentView() == std::numeric_limits<int>::max()) throw std::runtime_error("view number exhausted");
     startViewChange(currentView() + 1, "watched request deadline expired");
@@ -335,7 +352,12 @@ void Entity::finishNewView(const json& msg) {
         request.proposedInView = -1;
         pending.push_back({key, request.acceptedAt});
     }
+    // The new primary is timed from the moment its view began, not from the
+    // arrivals it inherited: it cannot be blamed for how long the old primary
+    // sat on the backlog. Requests arriving from here are timed from arrival as
+    // usual, so a primary that is itself steadily late is still replaced.
     requestTimer_.reset(pending);
+    requestTimer_.setFloor(Clock::now());
     int next = std::max(lastExecuted_, msg["checkpoint"].at("sequence").get<int>());
     // Set the allocator before processing proposals, since execution can
     // stabilize a checkpoint and release buffered client requests.

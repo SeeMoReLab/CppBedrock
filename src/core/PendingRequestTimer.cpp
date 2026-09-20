@@ -32,11 +32,16 @@ void PendingRequestTimer::selectWatchLocked() {
     watchedKey_.reset();
     if (byTime_.empty()) return;
     watchedKey_ = byTime_.begin()->second;
-    watchedSince_ = Clock::now();
+    // PBFT times a request from when the replica received it, not from when the
+    // previous one finished. Dating the watch to now would hand each request a
+    // full fresh timeout however long it had already been waiting, so a leader
+    // that orders everything late - but steadily - would reset the deadline on
+    // every completion and never be replaced at any timeout value.
+    watchedSince_ = byTime_.begin()->first;
 }
 
 PendingRequestTimer::Clock::time_point PendingRequestTimer::deadlineLocked() const {
-    return watchedSince_ + std::chrono::milliseconds(std::max(1, timeoutMs_.load()));
+    return std::max(watchedSince_, floor_) + std::chrono::milliseconds(std::max(1, timeoutMs_.load()));
 }
 
 bool PendingRequestTimer::track(const std::string& key, Clock::time_point acceptedAt) {
@@ -99,6 +104,15 @@ void PendingRequestTimer::rearm(Clock::time_point since) {
         std::lock_guard<std::mutex> lk(mtx_);
         selectWatchLocked();
         if (watchedKey_) watchedSince_ = since;
+    }
+    cv_.notify_all();
+}
+
+void PendingRequestTimer::setFloor(Clock::time_point floor) {
+    {
+        std::lock_guard<std::mutex> lk(mtx_);
+        floor_ = floor;
+        ++generation_;
     }
     cv_.notify_all();
 }

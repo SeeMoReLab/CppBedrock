@@ -730,6 +730,16 @@ void Entity::markOperationProcessed(int seq, int path, uint32_t transactions, ui
         std::lock_guard<std::mutex> lk(phaseTsMtx);
         auto it_fs = firstSeenUs.find(seq);
         if (it_fs != firstSeenUs.end() && now > it_fs->second) e2eLatUs = now - it_fs->second;
+        // firstSeenUs holds the arrival of the oldest request this batch
+        // carries, so the watermark only advances past a request once a batch
+        // made entirely of later arrivals has executed. The election watchdog
+        // reads it to tell starvation from being overtaken.
+        if (it_fs != firstSeenUs.end()) {
+            long long seen = lastExecutedArrivalUs_.load(std::memory_order_relaxed);
+            while (it_fs->second > seen &&
+                   !lastExecutedArrivalUs_.compare_exchange_weak(seen, it_fs->second,
+                                                                 std::memory_order_relaxed)) {}
+        }
         auto it_pp = phaseTs_preprepare.find(seq);
         auto it_pr = phaseTs_prepare.find(seq);
         auto it_co = phaseTs_commit.find(seq);

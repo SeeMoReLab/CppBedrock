@@ -12,14 +12,20 @@ using namespace std::chrono_literals;
 
 namespace {
 
-void watchedRequestGetsFreshDeadline() {
+void watchedRequestIsTimedFromItsArrival() {
     std::atomic<int> timeout{200};
     PendingRequestTimer timer(timeout, [](auto) {});
     const auto old = Clock::now() - 10s;
     CHECK(timer.track("a", old));
     auto a = *timer.watch();
-    CHECK(a.since > old);
-    CHECK(a.deadline == a.since + 200ms);
+    // The deadline belongs to the request, not to the moment it became watched.
+    // One that has already waited longer than the timeout is late as soon as it
+    // is picked up; dating the watch to now would instead give every request a
+    // full timeout starting from its predecessor's completion, so a leader that
+    // orders everything late but steadily would never miss a deadline.
+    CHECK(a.since == old);
+    CHECK(a.deadline == old + 200ms);
+    CHECK(timer.expired(a.generation, Clock::now()));
     CHECK(timer.track("b", old + 1ms));
     CHECK(timer.track("c", old + 2ms));
     CHECK(!timer.track("a"));
@@ -29,17 +35,40 @@ void watchedRequestGetsFreshDeadline() {
     CHECK(timer.watch()->deadline == a.deadline);
     CHECK(timer.expired(a.generation, a.deadline));
 
-    const auto before = Clock::now();
     CHECK(timer.complete("a"));
     auto b = *timer.watch();
     CHECK_EQ(b.key, std::string("b"));
-    CHECK(b.since >= before);
+    CHECK(b.since == old + 1ms);  // its own arrival, not the completion of "a"
     CHECK(b.deadline == b.since + 200ms);
     CHECK(!timer.expired(a.generation, b.deadline));
     CHECK(!timer.expired(b.generation, b.deadline - 1ms));
     CHECK(timer.expired(b.generation, b.deadline));
     CHECK(timer.complete("b"));
     CHECK(!timer.watch());
+}
+
+void viewFloorGivesTheNewPrimaryAFullTimeout() {
+    std::atomic<int> timeout{200};
+    PendingRequestTimer timer(timeout, [](auto) {});
+    const auto old = Clock::now() - 10s;
+    timer.reset({{"a", old}, {"b", old + 1ms}});
+    CHECK(timer.expired(timer.watch()->generation, Clock::now()));
+    // Installing a view floors every deadline at the moment it began, so the
+    // backlog the old primary left behind cannot expire the new one instantly.
+    const auto installed = Clock::now();
+    timer.setFloor(installed);
+    CHECK(timer.watch()->deadline == installed + 200ms);
+    CHECK(!timer.expired(timer.watch()->generation, installed + 199ms));
+    CHECK(timer.expired(timer.watch()->generation, installed + 200ms));
+    // The head still carries its own arrival, so ordering is untouched, and a
+    // request that arrives after the floor is timed from its arrival again.
+    CHECK_EQ(timer.watch()->key, std::string("a"));
+    timer.complete("a");
+    CHECK(timer.watch()->deadline == installed + 200ms);
+    const auto fresh = installed + 10s;
+    timer.complete("b");
+    CHECK(timer.track("c", fresh));
+    CHECK(timer.watch()->deadline == fresh + 200ms);
 }
 
 void batchCompletesAtomically() {
@@ -62,7 +91,7 @@ void resetPreservesArrivalOrder() {
     const auto generation = timer.watch()->generation;
     timer.reset({{"later", old + 1ms}, {"oldest", old}, {"last", old + 2ms}});
     CHECK_EQ(timer.watch()->key, std::string("oldest"));
-    CHECK(timer.watch()->since >= old + 10s);
+    CHECK(timer.watch()->since == old);  // still timed from when it arrived
     CHECK(!timer.expired(generation, Clock::now() + 1h));
     CHECK(timer.oldestKeys(3) == (std::vector<std::string>{"oldest", "later", "last"}));
     timer.complete("oldest");
@@ -151,7 +180,8 @@ void stopWhileArmed() {
 }
 
 int main() {
-    watchedRequestGetsFreshDeadline();
+    watchedRequestIsTimedFromItsArrival();
+    viewFloorGivesTheNewPrimaryAFullTimeout();
     batchCompletesAtomically();
     resetPreservesArrivalOrder();
     timeoutChangesKeepElapsedTime();

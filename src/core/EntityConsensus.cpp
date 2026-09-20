@@ -261,19 +261,32 @@ void Entity::acceptProposal(const ProtocolEnvelope& env) {
                 batchIndex_.erase(stale);
         }
     }
-    {
-        std::lock_guard<std::mutex> lock(phaseTsMtx);
-        phaseTs_preprepare.emplace(p.sequence(), nowUs());
-        firstSeenUs.emplace(p.sequence(), nowUs());
-    }
     // Mark the requests this batch carries as in flight, exactly as a fetched
     // body does. Without it a replica cannot tell a request waiting its turn
     // in the leader's queue from one the leader never received, and both the
     // relay path and the next proposal answered that question by scanning the
     // whole log and building a key per in-flight request.
+    //
+    // The same pass dates the sequence. Consensus latency is meant to be how
+    // long a request waited to be ordered, and the leader measures it from the
+    // arrival of the oldest request it carries. A follower that stamped the
+    // pre-prepare's arrival instead would start its clock after the leader had
+    // already finished waiting, so a leader slow to propose would cost nothing
+    // on three replicas out of four - deleting precisely the term the election
+    // timeout exists to remove. The client broadcasts, so a follower holds
+    // these requests with its own arrival time and can date them the same way.
+    // A request this replica never saw leaves now as the best it knows.
+    long long oldestArrival = nowUs();
     for (const auto& r : p.requests()) {
         auto pending = pendingRequests_.find(requestKey(r.client_id(), r.request_id()));
-        if (pending != pendingRequests_.end()) pending->second.proposedInView = p.view();
+        if (pending == pendingRequests_.end()) continue;
+        pending->second.proposedInView = p.view();
+        oldestArrival = std::min(oldestArrival, pending->second.arrivalUs);
+    }
+    {
+        std::lock_guard<std::mutex> lock(phaseTsMtx);
+        phaseTs_preprepare.emplace(p.sequence(), nowUs());
+        firstSeenUs.emplace(p.sequence(), oldestArrival);
     }
     entityInfo["sequence"] = std::max(entityInfo["sequence"].get<int>(), p.sequence());
     onPrePrepareAccepted(p.sequence(), p.view());

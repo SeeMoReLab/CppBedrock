@@ -293,6 +293,14 @@ Rank runs on the **mean** episode reward from the agent's own dataset, not the m
 
 **Election 250 with slow-path 20 has no phase.** The low slow-path value wins only when a replica is absent, and losing a replica leaves the view-change quorum as exactly the three survivors, which lifts the election floor: 250 ms cannot complete a run under a crash at any delay level, and 600 ms already collapses under a crash at 5+50 ms. The two requirements exclude each other, so the pair is dominated rather than missing, and a learning agent should be expected to discover that.
 
+### A replica does not rejoin the fast path after a crash
+
+A replica cut off with `<silence>` and then restored rejoins its view and resumes executing, and the transport recovers - `send_failures` stops climbing. The committee does not regain the fast path. Across a probe with a 30 s crash, `fast_path` froze at 395 on every replica for the remaining 60 s while `slow_path` climbed from 265 to 548 and execution continued normally, with no view changes at all. SBFT runs permanently on the slow path from then on.
+
+This is unrelated to a solo view change stranding a replica, which `onRequestTimerExpired` now prevents: the views here are healthy throughout. The cause has not been diagnosed.
+
+The calibrated spec works around it by putting the two crashed-replica phases last, with nothing after them. Any phase following a crash would be measured on a committee that has lost the fast path rather than on its own fault, and a control phase placed there reads as a collapse: in a wiring check it gave 7,568 tps with 37 view changes where the identical opening phase gave 31,982 with none.
+
 ### Reading the numbers
 
 Run-to-run spread is wide in the stressed regimes - roughly 7 percent between repeats of the same configuration, more where the fault is harsh - so treat any margin under about 10 percent as unresolved and repeat it. Several conclusions in earlier revisions of this file came from single runs and did not survive repetition.

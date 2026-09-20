@@ -243,74 +243,61 @@ At PBFT 40,000 the offered load is roughly twice capacity, so the queues stay fu
 
 ## SBFT timer calibration
 
-Measured at 40,000 requests/s, four replicas in namespaces on one 48-core CloudLab host, with the consensus window at 64 batches in flight.
+Measured at 40,000 requests/s, four replicas in namespaces on one 48-core CloudLab host, with the consensus window at 64 batches in flight. Ladder: election 250 / 600 / 1200 ms, slow path 20 / 500 ms.
 
-### The pipeline depth comes first
+### Measure the view change before choosing the timeouts
 
-An earlier version of this section put the election ladder at 2,000 / 4,000 / 8,000. That was an artifact of the consensus window, not a property of the protocol. With the window at 16 sequences, one late sequence blocks execution, the unexecuted sequences reach the window, the leader stops proposing, and nothing commits until the late one arrives. At 5+150 ms with no fault injected a clean run still had **two to three consecutive seconds with zero execution**, so every election timeout below those stalls fired on them and the calibration had to climb until it cleared them.
+The election timeout has one job: fire after a leader has stopped, and not before recovery from the previous view change has finished. Its floor is therefore the cost of a view change, and that is worth measuring directly rather than inferring from throughput. The engine logs both ends of it - `view change to N` and `installed authenticated view N` - so the duration comes out of any run's logs:
 
-Widening the window removes the stalls and the ladder falls by a factor of two:
-
-| 5+150 ms, no fault | window 16 | window 64 |
-| --- | ---: | ---: |
-| election 2,000 | 27,053 tps, 14 elections | 39,705 and 39,633 tps, no elections |
-| election 8,000 | 37,429 tps, no elections | 37,620 tps, no elections |
-
-Calibrate the pipeline before the timers. A timeout ladder measured on a pipeline that stalls is measuring the pipeline.
-
-### The reward has to see latency
-
-The slow-path timeout is a latency knob: waiting for the `n`-th prepare buys the fast path, which is two message delays shorter than the slow one. Once the pipeline is deep enough to hide per-decision latency, that trade stops showing up in throughput at all. Across four regimes the two values are indistinguishable on throughput and clearly separated on latency and fast-path share:
-
-| Regime | 500 ms wait | 20 ms wait |
-| --- | ---: | ---: |
-| base | 38,959 tps, p50 158 ms, 100 percent fast | 38,949 tps, p50 176 ms, 91 percent |
-| 5+50 ms, straggler +150 | 30,416 tps, p50 1,169 ms, 70 percent | 31,913 tps, p50 984 ms, 34 percent |
-| 5+150 ms | 26,728 tps, p50 881 ms, 94 percent | 26,362 tps, p50 1,166 ms, 52 percent |
-| 5+150 ms, straggler +400 | 21,996 tps, p50 1,121 ms, 84 percent | 21,053 tps, p50 1,258 ms, 35 percent |
-
-Every throughput difference there is inside the run-to-run spread. A throughput-only reward cannot rank the two values, so `calculate_sbft_reward` in `learning_agent/reward_utils.py` multiplies the throughput reward by `2000 / (2000 + p50_consensus_latency_ms)`. It is multiplicative so the reward stays non-negative, which the policy models rely on, and the knee sits well above the latency a regime cannot avoid - about 900 ms at 150 ms one way with 100 ms batching - because a discount that has already saturated stops discriminating. The other protocols keep the throughput-only reward. Rewards quoted below are on that scale.
-
-### What sets each timer
-
-**The election timeout** is the execution-stall watchdog. With no fault its floor is set by ordinary execution gaps, which the wide window keeps short: 350 ms runs clean at both base and 5+50 ms, and only 5+150 ms needs 2,000. Under a fault the floor is set by how long a view change takes to recover, because a timeout shorter than recovery re-fires during its own recovery and cascades. That floor is what separates the three values, and it grows with both network delay and straggler severity:
-
-| Regime, leader stalled 5 s every 20 s | 1,000 | 2,000 | 4,000 |
+| one-way delay | median | p90 | max |
 | --- | ---: | ---: | ---: |
-| base, no straggler | **9.72** | 9.23 | 8.35 |
-| base, straggler +200 | **8.65** | 7.90 | 6.84 |
-| 5+50 ms, straggler +100 | 2.25 | **6.70** | 5.67 |
-| 5+150 ms, straggler +400 | 1.22 | 3.00 | **4.00** |
+| 5 ms | 35 ms | 82 ms | 138 ms |
+| 5+50 ms | 185 ms | 335 ms | 2,864 ms |
+| 5+150 ms | 385 ms | 626 ms | 1,430 ms |
 
-Below the floor the cascade is severe rather than gradual: at base with the same fault, 350 ms gives 16,330 tps with 193 elections and 500 ms gives 23,398 with 92, against 38,959 with 6 at 1,000 ms.
+That is almost exactly three one-way trips (15, 165, 465 ms) with a fixed term of tens of milliseconds, not hundreds. Recovery scales with delay; it is not dominated by evidence assembly or signing. Widening the consensus window from 16 to 64 changes it by about 5 percent, so the size of the view-change evidence is not the cost.
 
-**The slow-path timeout** is decided by the prepare spread against the round trip. Waiting costs the spread; not waiting costs two extra message delays, so the crossover sits near twice the one-way delay. A straggler - one replica whose outgoing packets are slow - is the knob that sets the spread, and it has three regions: below 20 ms both values take the fast path and tie, between 20 ms and `2d` the high value wins, and above `2d` the low value wins. Past the wait itself the high value is pure loss, because the collector pays the full 500 ms and falls back anyway.
+Add the new leader's proposal tick and one ordering round and the effective floor is roughly **200 / 500 / 1,100 ms** at the three delay levels, which is what the ladder tracks. Each value is the smallest one that is safe at its delay, which is also the fastest to detect the fault. Below its floor a timeout re-fires during its own recovery and collapses rather than degrading: 250 ms at 5+50 ms gives 88 view changes against 20 injected stalls, and 600 ms at 5+150 ms gives 35 against 16.
+
+An earlier version of this section put the ladder at 1,000 / 2,000 / 4,000 and reported that base, 5+50 ms and 5+150 ms had no distinct optima. Every one of those values sits at or above the top of the floor range, so all three cleared every floor and could not separate. The ladder was an octave too high, and the conclusion drawn from it - that only two election levels exist - was wrong.
+
+### A straggler is not a crash, on either axis
+
+The slow-path timeout decides how long the collector waits for the `n`-th prepare. Waiting turns out to be worth it whenever that prepare arrives at all: at stragglers of +80, +160 and +380 ms - each past the point where the arithmetic says the two extra message delays of the slow path should be cheaper - the high value still lands the fast path 99 percent of the time and wins (2.31 against 1.30 at base, 1.09 against 0.59 at 5+50 ms, 0.85 against 0.67 at 5+150 ms). Only an **absent** replica makes the wait pure loss, and then the low value wins by a wide margin (1.16 against 0.68 at base, 1.00 against 0.54 at 5+50 ms).
+
+A straggler is also not a free instrument on the election axis. A +200 ms straggler at base takes the view-change duration from 77 ms to 335 ms, so it lifts the election floor about fourfold even though the quorum could in principle exclude the slow replica. Anything severe enough to matter to the fast path moves the floor as well.
+
+### The fault has to be frequent, not long
+
+The pipeline holds roughly 64 batches of about 4,000 requests, which is about 6.4 seconds of execution. Any leader outage shorter than that is invisible in throughput, because execution keeps draining the buffer while the view change happens. A 15 s stall every 20 s costs nothing measurable - 40,000 tps and every timeout tied - because the buffer refills during the healthy 5 s. A 2 s stall every 5 s separates the ladder cleanly. Offered load is at capacity (60k, 80k, 100k and 140k all return about 40k), so this is buffered work rather than spare headroom.
+
+`<proposalDelay>` also does not mean what "stall" suggests. It defers **every** proposal by `delayMs` for as long as that replica leads, and the leader does not recover on its own: the only thing that ends the window is electing someone else, and the next `<interval>` tick re-pins the delay on whoever leads then. The value of a low timeout is entirely "elect away sooner", so the separation between two timeouts is about `(T_high - T_low) / interval`. A long interval destroys the signal: at 60 s the difference between 500 ms and 4,000 ms is 6 percent and they tie; at 5 s it is 30 percent and they separate.
+
+### The reward has to see the tail
+
+Both timers are latency knobs, and with a deep pipeline neither moves throughput. The election timeout decides how long the committee tolerates a leader that delays every proposal, so its cost lands on the proposals made inside that window - in the tail, not the median. Across a factor of eight in election timeout the p50 of consensus latency moves from 74 ms to 107 ms while the p95 moves from 99 ms to 271 ms and the worst episode from 328 ms to 4,730 ms.
+
+`calculate_sbft_reward` therefore multiplies the throughput reward by `300 / (300 + p95_consensus_latency_ms)`. Multiplicative so the reward stays non-negative, which the policy models rely on; p95 because that is where the timers show; and the knee near the healthy p95 so the term discriminates at the scale the timers actually move instead of saturating. With a p50 knee at 2,000 ms the same data ranked the longest timeout best, which is backwards.
+
+Rank runs on the **mean** episode reward from the agent's own dataset, not the median and not client-side latency. The agent optimises expected reward per episode, and a median discards the minority of episodes that contain the fault. Client-side p50 is a different quantity from per-sequence consensus latency - 158 ms against 38 ms in the same run - and ranking on it inflated margins about sevenfold. Calibration runs therefore go through `scheduled` mode with a one-row constant schedule, which is what writes the dataset.
 
 ### The five pairs
 
-| Election | Slow path | Regime (leader stalled 5 s every 20 s) | Reward | Runner-up |
+| Election | Slow path | Phase | Reward | Runner-up |
 | ---: | ---: | --- | ---: | --- |
-| 1,000 | 500 | base, no straggler | 9.72 | 9.64 at 20; 9.23 at 2,000 |
-| 1,000 | 20 | base, straggler +200 | 8.65 | 7.90 at 2,000; 3.05 at 500 |
-| 2,000 | 20 | 5+50 ms, straggler +100 | 6.70 | 5.67 at 4,000; 4.75 at 500 |
-| 4,000 | 500 | 5+150 ms, straggler +400 | 4.00 | 3.69 at 20; 3.00 at 2,000 |
-| 4,000 | 20 | 5+150 ms, straggler +800 | 3.79 | 2.83 at 500; 2.14 at 2,000 |
+| 250 | 500 | base, leader proposals delayed 2 s every 5 s | 4.69 | 3.78 at 600 |
+| 600 | 500 | 5+50 ms, same fault | 2.29 | 1.84 at 1,200 |
+| 1,200 | 500 | 5+150 ms, 3 s every 6 s | 1.28 | 0.63 at 600 |
+| 600 | 20 | base, replica 3 crashed, same fault | 1.41 | 1.16 at 1,200 |
+| 1,200 | 20 | 5+50 ms, replica 3 crashed | 0.83 | 0.09 at 600 |
 
-Each pair was ranked against the full three-by-two matrix for its phase. Only three one-way delays are used: base, 5+50 ms and 5+150 ms.
+**Election 250 with slow-path 20 has no phase.** The low slow-path value wins only when a replica is absent, and losing a replica leaves the view-change quorum as exactly the three survivors, which lifts the election floor: 250 ms cannot complete a run under a crash at any delay level, and 600 ms already collapses under a crash at 5+50 ms. The two requirements exclude each other, so the pair is dominated rather than missing, and a learning agent should be expected to discover that.
 
-**The sixth pair, 2,000 with 500, has no regime where it wins.** Election 2,000 is the best value only at 50 ms, and at 50 ms every straggler severe enough to push view-change recovery past 1,000 ms is also severe enough that waiting for its prepare costs more than the slow path. Four shapes were tried at 50 ms: follower stragglers of +50, +100 and +150, and a leader straggler of +100 combined with a follower straggler of +50. In the two where 2,000 won the election axis the low slow-path value won outright (6.70 against 4.75, and 5.85 against 5.27); in the other two the election axis went to 4,000. The exclusion is structural, and a learning agent should be expected to discover that the corner is dominated.
+### Reading the numbers
 
-### A solo view change strands a replica for the rest of the run
+Run-to-run spread is wide in the stressed regimes - roughly 7 percent between repeats of the same configuration, more where the fault is harsh - so treat any margin under about 10 percent as unresolved and repeat it. Several conclusions in earlier revisions of this file came from single runs and did not survive repetition.
 
-A replica whose watchdog fires while the others are healthy enters a view change nobody joins. It needs `2f+1` ViewChange messages for its new view and will never get them, the NewView wait is only armed once it holds a quorum, so it never escalates, and it cannot return to the quorum's view without invalidating the evidence it already signed. It executes along with the committee by state transfer but stays `view_changing` forever, and because it never sends prepares in the live view, SBFT's fast path - which needs all `n` - is dead for the remainder of the run.
-
-Reproduced three times at 5+150 ms with election 4,000: `view=1 view_changing=1` against `view=0` on the other three, `view=3` against `view=2`, and again `view=3` against `view=2`, each with the fast-path share collapsing from above 90 percent to between 18 and 35 percent. It is why 4,000 scored worse than both 2,000 and 8,000 in the no-fault scans, a non-monotonicity that has no other explanation. Where timers are close enough that the replicas fire together the view change completes and the fast path survives: one run took 13 view changes to view 13 with all four replicas in step and kept 96 percent fast path.
-
-The fix is a pre-vote: the watchdog broadcasts a lightweight suspicion that carries no evidence and grants no rights, and a replica enters a view change only once `f+1` replicas suspect. Returning to a lower view is not an option, because the stale ViewChange could later join a NewView quorum whose evidence is missing everything the replica prepared after signing it. This is recorded, not implemented.
-
-### Run-to-run spread
-
-Spread in the stressed regimes is wide and single runs mislead. Repeats of 5+150 ms with a +500 straggler gave 30,821 and 28,658 at 4,000 against 29,040 and 30,902 at 8,000 - fully overlapping. An earlier claim here that 8,000 beat 4,000 by 37,429 to 24,125 at 5+150 ms rested on one run each; three repeats put 4,000 at 34,070, 36,887 and 34,005. Interleave the comparisons and repeat anything whose margin is under about 10 percent.
+Measurement resolution matters as much as the measurements. View-change duration read from 1 s `Stats` samples came out as 527-1,707 ms across regimes and suggested a large fixed cost that would make the floors inseparable; the exact figures from the log pair above are 35-385 ms and scale cleanly with delay. The sampled version was an artifact of its own sampling rate.
 
 ## SBFT fast and slow paths
 

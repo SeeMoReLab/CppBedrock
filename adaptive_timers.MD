@@ -243,7 +243,7 @@ At PBFT 40,000 the offered load is roughly twice capacity, so the queues stay fu
 
 ## SBFT timer calibration
 
-Measured at 15,000 requests/s, four replicas in namespaces on one 48-core CloudLab host, with the consensus window at 64 batches in flight. Election timeout 550 / 1200 ms, slow path 20 / 500 ms.
+Measured at 15,000 requests/s, four replicas in namespaces on one 48-core CloudLab host, with the consensus window at 64 batches in flight. Election timeout 350 / 700 / 1400 ms, slow path 20 / 500 ms.
 
 ### Three defects had to be fixed before any of this could be measured
 
@@ -263,33 +263,47 @@ Capacity is 40,000 requests/s - 60,000 offered returns 40,033. Two separate thin
 
 **At exactly half capacity there is no stable operating point.** A view change leaves a backlog of roughly `(D + tail)` requests-worth of work, which the incoming leader clears using the spare capacity `C - rate`. The drain takes `(D + tail) x rate / (C - rate)`, which at `rate = C/2` equals `D + tail` - about one timeout. The system is then metastable: the identical base configuration gave 6 view changes in a 150 s run and 296 in a 300 s one, and an earlier ladder calibrated in 150 s runs stormed when its phases were extended to 300 s. At 15,000 the factor is 0.6 and the phases are stable; anything at or above 20,000 is not.
 
-### The escape window, and the tail that bounds it
+### Two independent knobs
 
-Each phase delays the current leader's proposals by `D`, re-pinned to whoever leads every 60 s. A timeout then falls into one of three regimes:
+Network delay and leader proposal delay do different jobs, and tying them together - as an earlier revision of this section did, scaling the delay with the network level - conflates them and wastes the design space.
+
+**Network delay sets the healthy p95 latency tail**, measured with a safe timeout and no fault: **167 / 319 / 624 ms** at base, 5+50 and 5+150. A timeout at or below its level's tail fires on ordinary latency and storms, whatever the fault is. That alone removes 350 ms at 5+150: 325 view changes and 9,956 tps with no injected fault at all. It is also why a rung cannot simply be made small - the floor is the tail, not the cost of a view change, and it is several times larger.
+
+**Leader proposal delay decides which of the surviving timeouts wins.** A timeout falls into one of three regimes:
 
 ```
-        cascades              elects once per tick           tolerates
-    ------------------|--------------------------------|------------------>
-                    tail                            D + tail
+      re-elects on its own backlog      escapes once per tick        never fires
+    ---------------------------|------------------------------|------------------>
+                            ~ D/3                          D + tail
 ```
 
-Above `D + tail` the deadline never arrives, so the timeout never fires and pays `D` on every request. **Below the delay level's healthy p95 tail** it fires on ordinary latency, and the backlog from its own view change re-fires it before the escape can settle. Between them it elects about once per tick and escapes to a leader carrying no delay.
+Below roughly a third of the delay, the backlog the escape leaves takes longer than the timeout to drain, so the deadline is missed again immediately. Above `D + tail` the deadline never arrives and the timeout pays `D` on every request. Between them it elects about once per tick and escapes to a leader carrying no delay.
 
-The lower edge is the tail, not the delay, and that was worth getting right: 600 ms cascaded at 5+150 ms where the tail is 624 (192 view changes) but not at 5+50 ms where it is 319, nor at base where it is 167 - with `D` varied over 600 to 3,000 in between. The healthy p95 tails, with a safe timeout and no fault, are **167 / 319 / 624 ms**.
+Both boundaries move with `D`, so the delay magnitude alone selects the winner at a fixed network level. At base delay, holding the rungs at 350 / 700 / 1400:
 
-Firing has to be decisive, not marginal. Reducing the base delay from 230 to 180 ms made a 250 ms timeout *worse*, not better - 225 view changes against 17 - because requests then cross the deadline only sometimes, so the timer fires without the escape resolving anything. Decisive firing needs roughly `D + tail >= 1.6 x T`.
+| base, leader delayed | 350 | 700 | 1400 |
+| ---: | ---: | ---: | ---: |
+| 320 ms | **2.91** | 2.56 (never fires) | 1.33 (never fires, p95 719) |
+| 750 ms | 2.91 | 2.91 | 0.92 (never fires, p95 1159) |
+| 1,000 ms | 2.89 | 2.89 | 2.21 |
+| 1,200 ms | 2.56 (74 view changes) | 2.90 | 2.88 |
+| 2,000 ms | 2.72 (33) | 2.80 (10) | 2.86 (5) |
 
-### Two election levels, not three
+Firing has to be decisive rather than marginal. Reducing the base delay from 230 to 180 ms made a 250 ms timeout *worse*, not better - 225 view changes against 17 - because requests then cross the deadline only sometimes, so the timer fires without the escape resolving anything. A larger delay makes the escape cleaner, not harsher: at D = 750 a 350 ms timeout elects 14 times, at D = 180 it elects 225.
 
-A rung has to sit above its own level's tail and below the next level's, or it will not both survive where it wins and fail where it should. That confines the rungs to the span between the tails, which here is 167 to 624 ms - a factor of 3.7. But decisive firing needs `D + tail >= 1.6 x T`, and for the next rung up to genuinely tolerate rather than escape it needs `D + tail <= 0.5 x T_next`, so `T_next >= 3.2 x T`. Two rungs plus margins do not fit in 3.7x, and the measurements bear that out: at base delay, 250 ms and 550 ms are indistinguishable (2.89 and 2.75 against 2.60 and 2.88 over two runs each), while at 5+50 ms the 250 ms rung collapses outright (0.22, 524 view changes, 10,323 tps).
+### Why the middle rung's phase is at 5+150, not at base
 
-| | 250 | 550 | 1200 |
-| --- | ---: | ---: | ---: |
-| base, D=230 | 2.89 / 2.75 | 2.60 / 2.88 | 1.48 (tolerates) |
-| 5+50 ms, D=500 | 0.22 (524 view changes) | **1.95** | 1.21 (tolerates) |
-| 5+150 ms, D=1200 | 0.02 | 0.28 (256 view changes) | **1.53** |
+The table above shows the squeeze. At base the low rung stays healthy until about D = 1200, and the high rung starts firing at about D = 1230, so the window in which one has failed and the other has not is roughly 40 ms wide. At D = 1000 the low two tie at 2.89; at D = 1200 they tie at 2.90 and 2.88; at D = 1500 the middle wins only because the top rung was moved to 2000. Any middle-rung phase built at base delay is balanced on that edge.
 
-So the usable ladder is 550 and 1200. The tails scale with the one-way delay, and base, 5+50 and 5+150 put them only about 2x apart - too close for a third rung. Delay levels spread further apart, such as base, 5+150 and 5+450, would support one; these will not. That is a property of the delay levels chosen, not of the engine.
+At 5+150 the tail removes the low rung for free, so the window is the whole range between the remaining two, and the same delay knob then separates them cleanly:
+
+| 5+150 ms, leader delayed | 350 | 700 | 1400 |
+| ---: | ---: | ---: | ---: |
+| none | 0.09 (325 view changes) | 1.36 | **1.46** |
+| 600 ms | 0.08 (327) | **1.30** | 0.84 (never fires, p95 1241) |
+| 2,400 ms | - | 0.98 (97) | **1.24** |
+
+So the three rungs each win a phase, by three different mechanisms: 350 because the other two never fire at a small delay, 700 because 350 is below the tail and 1400 never fires, 1400 because at four times the delay 700 re-elects on its own backlog.
 
 ### Starvation, shedding, and the view floor
 
@@ -310,16 +324,16 @@ All four prepares travel the same link, so without a straggler the spread betwee
 
 The two axes are not independent. Every fault that makes waiting for the `n`-th prepare worthless also lengthens view-change recovery, so it raises the best election timeout at the same time. With a replica crashed at base delay the reward climbs monotonically with the timeout - 2.69 at 800, 2.88 at 1,400, 3.02 at 2,400 - because nothing is left for a short timeout to gain. Stragglers mild enough to leave the election rung alone are too mild to flip the fast-path axis: +200 ms at 5+50 ms still favours 500 ms, and +100 ms at base collapses both. Decoupling them would need a fault that suppresses the fast path without slowing view changes, such as dropping prepares from one replica while it stays responsive to view-change messages; the failure spec offers only `<proposalDelay>` plus network-level delay, per-source delay and `<silence>`.
 
-### The three pairs
+### The four pairs
 
 | Election | Slow path | Phase | Reward | Runner-up |
 | ---: | ---: | --- | ---: | --- |
-| 550 | 500 | base, leader delayed 230 ms | 2.88 | 1.48 at 1,200 |
-| 550 | 500 | 5+50 ms, leader delayed 500 ms | 1.95 | 1.21 at 1,200 |
-| 1,200 | 500 | 5+150 ms, delayed 1,200 ms, replica 3 +150 ms | 1.13 | 0.62 at 20 ms |
-| 1,200 | 20 | 5+150 ms, delayed 1,200 ms, replica 3 +1,000 ms | 0.38 | 0.00 at 500 ms |
+| 350 | 500 | base, leader delayed 320 ms | 2.91 | 2.56 at 700 |
+| 700 | 500 | 5+150 ms, leader delayed 600 ms | 1.30 | 0.84 at 1,400 |
+| 1,400 | 500 | 5+150 ms, leader delayed 2,400 ms | 1.24 | 0.98 at 700 |
+| 1,400 | 20 | 5+150 ms, delayed 2,400 ms, replica 3 +1,000 ms | 0.38 | 0.00 at 500 ms |
 
-The last two phases differ only in how far out replica 3 is. At +150 ms, half what the slow path costs at that delay, its prepare is worth waiting for. At +1,000 ms it never is.
+Two of the six possible pairs have no regime. 20 ms on the slow path only wins when a replica is effectively absent, and that same condition lengthens view-change recovery, so it always pairs with the top rung - see the previous section.
 
 ### The reward has to see the tail
 
@@ -335,11 +349,13 @@ The calibrated spec uses no `<silence>` at all. Stragglers reproduce the fast-pa
 
 ### Reading the numbers
 
-Calibrate with phases as long as the ones you intend to run. Three separate ladders in this file looked clean in 150 s runs and fell apart at 300 s, because the failure mode is metastable rather than noisy: the first tick escapes correctly and the storm starts at the second. Run-to-run spread is otherwise about 7 percent, so treat any margin under 10 percent as unresolved and repeat it - the 250-against-550 comparison at base delay reversed between runs, which is what settled it as a tie.
+Calibrate with phases as long as the ones you intend to run. Three separate ladders in this file looked clean in 150 s runs and fell apart at 300 s, because the failure mode is metastable rather than noisy: the first tick escapes correctly and the storm starts at the second. Run-to-run spread is otherwise about 7 percent, so treat any margin under 10 percent as unresolved and repeat it - a 250-against-550 comparison at base delay reversed between repeats, which is what showed those two were tied rather than ordered.
+
+Vary one thing at a time, including the fault's magnitude. Scaling the leader delay with the network delay, as an earlier revision did, hides which of the two is doing the work; separating them is what showed that the delay magnitude alone moves the winner up and down the ladder at a fixed network level.
 
 Measurement resolution matters as much as the measurements. View-change duration read from 1 s `Stats` samples came out as 527-1,707 ms across regimes and suggested a large fixed cost; the exact figures from the `view change to` / `installed authenticated view` log pair are 35 / 185 / 385 ms at the three delay levels, about three one-way trips with a fixed term of tens of milliseconds. The sampled version was an artifact of its own sampling rate. View-change cost turns out not to bound the election timeout from below at all - the healthy latency tail does, and it is several times larger.
 
-Earlier revisions of this section put the ladder at 1,000 / 2,000 / 4,000, then 250 / 600 / 1,200, then 400 / 800 / 1,400. The first two were measured through the three defects above; the third was measured at half capacity, in the metastable regime, and in runs too short to show it.
+Earlier revisions of this section put the ladder at 1,000 / 2,000 / 4,000, then 250 / 600 / 1,200, then 400 / 800 / 1,400, then 550 / 1,200. The first two were measured through the three defects above; the third was measured at half capacity, in the metastable regime, and in runs too short to show it. The fourth concluded that only two rungs were separable, which was a consequence of scaling the leader delay with the network delay: every phase then varied both knobs at once, and the middle rung had nowhere to win.
 
 ## SBFT fast and slow paths
 

@@ -209,6 +209,8 @@ A delayed leader's latency is **not** `tail + D`. Measured at base, on the rung 
 
 There is a knee between 150 and 200, and the p95 row says what it is. Below the knee the delay only defers a proposal and the spread stays at its undisturbed ~20 ms. Above it the held proposal occupies its consensus-window slot - `proposeBatch` allocates the sequence before applying the delay - long enough to throttle the pipeline, so the cost grows faster than `D` and the spread widens with it, to 173 ms at `D = 200`. At 5+50 the cost is about `1.0*D` throughout, because there the delay overlaps work already in flight.
 
+The upper edge of a delay window is set by the delayed **p95**, not the p50. At `D = 200` the delayed p50 is 513, comfortably under a 600 ms rung, but p95 is 685 - and one crossing per interval tick is enough, because the escape then removes the delay for the remainder of that tick. Measured: 600 at `D = 200` escapes cleanly, p50 172 and 2 view changes for 2 ticks, so the phase stops distinguishing it from 250 at all. At `D = 150` the delayed p95 is 349 and 600 tolerates it, with one stray view change per phase from the re-pin transient, reproduced across two runs. Both 120 and 150 hold; 120 is used because it is the only one with a clean zero, and because 250 elects 6 times there against 16 at 150.
+
 Fitting a single factor across the knee is what put an earlier attempt's delays outside their own windows. A flat `1.7*D` chose 700 ms at base to let 1200 sleep through it, which instead put the delayed latency at 1358 and made 1200 escape; the same fit then read the low end as 48 to 193 ms when the usable range is 100 to 180.
 
 Each phase's delay sits mid-window between the rung that must escape it and the rung that must sleep through it:
@@ -224,6 +226,19 @@ Raising `D` brings the next rung up into play; it does not push the winner highe
 #### The middle rung is 600, not 500
 
 500 works, but it sits where the *transient* catches it. `pinLeaderWindow` re-pins its victim once per `<interval>` tick, and the pipeline drains and refloods around that move. At a 150 ms delay the steady state is comfortable for 500 - p50 330, p95 345 - yet it elected three times in a 120-second phase, one per re-pin plus one on phase entry, leaving it in the worst of the three states: mostly paying the delay, but electing anyway. Raising the rung to 600 took that to a single view change at the same delay and to none at 120 ms, widened all three windows above, and removed the residual churn in the recovery phase (0 view changes against 9 and 1).
+
+600 is also near the top of its band, so there is no headroom to raise it further. Probing the 5+150 phase alone, at 20,000 requests/s:
+
+| T at 5+150 | tps | p50 | p95 | view changes |
+| ---: | ---: | ---: | ---: | ---: |
+| 600 (four runs) | 16,515 to 20,008 | 1,297 to 1,538 | - | 40 to 73 |
+| 700 | 20,004 | 625 | 636 | 2 |
+| 750 | 19,928 | 634 | 652 | 6 |
+| 800 | 20,000 | 626 | 631 | 7 |
+
+The boundary is between 600 and 700, where the undisturbed p95 of 640 to 650 puts it. A rung at 640 or above survives this phase, which would leave 1200 no longer uniquely correct in it. The middle rung is therefore pinned between the 5+50 tail of 335 below and roughly 640 above, and 600 takes the top of that range.
+
+Note what the phase discriminates *by*. Two of the four runs at 600 held a full 20,000 tps; the collapse is not dependable. The latency discount is: reward is throughput scaled by `300 / (300 + p95)`, and p50 of 1,300 to 1,500 against 636 separates the rungs in every run. A phase built on an expected throughput collapse here would be reading a signal that is only sometimes present.
 
 #### The ladder as verified
 

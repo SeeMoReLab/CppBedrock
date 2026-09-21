@@ -451,6 +451,29 @@ The fast-path column is the evidence that matters. The last phase runs at 97 per
 
 An earlier revision carried a sixth phase, a 5+200 link with a 500 ms straggler, built to give slow-path 900 a home. That value is gone and so is the phase.
 
+### The full grid, and the noise floor
+
+Every one of the 6 pairs was run in every one of the 5 phases. The labels above all survive it, but two cells in that grid looked like corrections and were not, and both failures were the same mistake.
+
+**The slow path is only exercised in the two straggler phases.** Phases 1 to 3 carry no straggler, so all `n` prepares arrive together, the wait never fires, and 150 against 400 is a distinction without a difference there. Measured at 5+150: 0.0 percent slow at W = 400 and 1.1 percent at W = 150. At one percent the median instance is a fast-path instance, so p50 cannot move - a wait that catches more fast paths shifts p95 or the mean, never the median, until slow exceeds half. A 32 ms p50 gap read as the larger wait "catching fast paths the smaller one drops" was noise.
+
+**Comparisons must be back to back.** Phase 4 read 319 ms at election 400 and 263 ms at election 900, a 56 ms gap suggesting the middle rung was marginally firing. Run consecutively under identical conditions the two give 291 and 280: an 11 ms gap. The original 56 came from comparing a composed 1,500 s run against an isolated 200 s probe.
+
+The run-to-run spread on p50 between identical configurations is **10 to 30 ms**. Differences below that are not evidence, whatever mechanism is available to explain them.
+
+### The election timeout must exceed the slow-path latency
+
+The two timers are coupled through `W`, because the slow path's latency contains it: `100 + 5 * one_way + W`. Raising the wait therefore raises the floor under the election timer. Measured on the straggler phase at base with W = 1000, where that floor is 1,125 ms:
+
+| election | tps | p50 | view changes |
+| ---: | ---: | ---: | ---: |
+| 400 | 6,685 | 3,276 | 107 |
+| 900 | 7,002 | 2,540 | 74 |
+
+Both storm, and the clean 1,125 ms is never observed because the election timer fires before the slow path completes; the storms then compound it.
+
+This is why the slow-path action space stops at 400. At W = 900 the floor is `100 + 25 + 900 = 1,025`, already above 900, the largest election value - so a 900 ms wait is unusable against any straggler at base, not merely hard to give a phase to.
+
 ### The two knobs separate by different physics
 
 Reading one quantity sees half the spec.

@@ -209,15 +209,24 @@ A delayed leader's latency is **not** `tail + D`. Measured at base, on the rung 
 
 There is a knee between 150 and 200, and the p95 row says what it is. Below the knee the delay only defers a proposal and the spread stays at its undisturbed ~20 ms. Above it the held proposal occupies its consensus-window slot - `proposeBatch` allocates the sequence before applying the delay - long enough to throttle the pipeline, so the cost grows faster than `D` and the spread widens with it, to 173 ms at `D = 200`. At 5+50 the cost is about `1.0*D` throughout, because there the delay overlaps work already in flight.
 
-The upper edge of a delay window is set by the delayed **p95**, not the p50. At `D = 200` the delayed p50 is 513, comfortably under a 600 ms rung, but p95 is 685 - and one crossing per interval tick is enough, because the escape then removes the delay for the remainder of that tick. Measured: 600 at `D = 200` escapes cleanly, p50 172 and 2 view changes for 2 ticks, so the phase stops distinguishing it from 250 at all. At `D = 150` the delayed p95 is 349 and 600 tolerates it, with one stray view change per phase from the re-pin transient, reproduced across two runs. Both 120 and 150 hold; 120 is used because it is the only one with a clean zero, and because 250 elects 6 times there against 16 at 150.
+The upper edge of a delay window is set by the **transient**, not by the median cost. `pinLeaderWindow` re-pins its victim once per `<interval>` tick and the pipeline drains and refloods around that move; the spike grows with `D`, and one crossing per tick is enough for a rung to escape, because the window will not re-pin afterwards. Measured against the 600 rung at base:
 
-Fitting a single factor across the knee is what put an earlier attempt's delays outside their own windows. A flat `1.7*D` chose 700 ms at base to let 1200 sleep through it, which instead put the delayed latency at 1358 and made 1200 escape; the same fit then read the low end as 48 to 193 ms when the usable range is 100 to 180.
+| D | 120 | 150 | 170 | 200 |
+| --- | ---: | ---: | ---: | ---: |
+| view changes, 120 s phase | 0 | 1 | 2 | 2 |
+| delayed p50 | 293 | 320 | (150) | 513 |
+| delayed p95 | 312 | 349 | (163) | 685 |
+| 600 | sleeps | sleeps | **escapes** | **escapes** |
+
+The parenthesised values at `D = 170` are the healthy tail, not a delayed one: 600 elected away, so no delayed latency is observable there. A 20 ms step from 150 to 170 cannot move steady-state latency from 320 to over 600, which is what rules out reading this as a steady-state effect - the steady-state knee between 150 and 200 is real and separate, and it is the transient that binds first. So the usable window is 100 to 150. Both 120 and 150 hold; 120 is used because it is the only one with clean zeros, and because 250 elects 6 times there against 16 at 150.
+
+Fitting a single factor across the knee is what put an earlier attempt's delays outside their own windows. A flat `1.7*D` chose 700 ms at base to let 1200 sleep through it, which instead put the delayed latency at 1358 and made 1200 escape; the same fit then read the low end as 48 to 193 ms when the usable range is 100 to 150.
 
 Each phase's delay sits mid-window between the rung that must escape it and the rung that must sleep through it:
 
 | phase | must escape | must sleep through | window | chosen |
 | --- | --- | --- | --- | ---: |
-| base + small | 250 | 600 | 100 to 180 | **120** |
+| base + small | 250 | 600 | 100 to 150 | **120** |
 | base + big | 600 | 1200 | 254 to 607 | **400** |
 | 5+50 + small | 600 | 1200 | 265 to 865 | **500** |
 
@@ -240,6 +249,12 @@ The boundary is between 600 and 700, where the undisturbed p95 of 640 to 650 put
 
 Note what the phase discriminates *by*. Two of the four runs at 600 held a full 20,000 tps; the collapse is not dependable. The latency discount is: reward is throughput scaled by `300 / (300 + p95)`, and p50 of 1,300 to 1,500 against 636 separates the rungs in every run. A phase built on an expected throughput collapse here would be reading a signal that is only sometimes present.
 
+#### Why the low rung is 250 and not 300
+
+The 5+50 tail removes the low rung, and 300 is not far enough under it to be removed *reliably*. Probing that phase alone, 300 scored a mean episode reward of 1.72 with episodes down to 2,413 tps; run in the full spec it scored **2.69**, beating both 600 and 1200 at 2.65 and winning the phase outright. Same timeout, same network level, opposite labels. 250 measures 0.85 with 140 to 156 view changes in every run that has the cell.
+
+A rung sitting on a boundary that moves between runs cannot be an oracle label, whichever side it happens to land on. Raising the low rung also does not buy what it looks like it buys: pairing 300 with a 150 ms delay drops an episode to 2k at `base + small` (3.24 against 250's 3.57) and to zero at `base + big` (2.77 against 3.27), because the rung still elects while carrying a backlog. Nor can the delay be raised to compensate - 170 is already past the point where 600 escapes.
+
 #### The ladder as verified
 
 One 740-second run per timeout over the seven phases, `tps / p50 / view changes`:
@@ -248,7 +263,7 @@ One 740-second run per timeout over the seven phases, `tps / p50 / view changes`
 | --- | --- | --- | --- | --- |
 | base, no fault | 19990 / 168 / 0 | 19999 / 169 / 0 | 20015 / 175 / 0 | all three |
 | base + delay 120 | 20000 / 169 / 6 | 19993 / 293 / 0 | 20002 / 298 / 0 | **250** |
-| base + delay 400 | 19605 / 170 / 3 | 20004 / 170 / 2 | 19892 / 860 / 1 | **250 or 600** |
+| base + delay 400 | 19605 / 170 / 3 | 20004 / 170 / 2 | 19892 / 860 / 1 | **600** (see below) |
 | 5+50, no fault | 19584 / 1021 / 140 | 20000 / 333 / 0 | 20003 / 326 / 0 | **600 or 1200** |
 | 5+50 + delay 500 | 16268 / 1645 / 100 | 20000 / 320 / 3 | 20002 / 841 / 0 | **600** |
 | 5+150, no fault | 16180 / 1702 / 70 | 16515 / 1538 / 55 | 20006 / 636 / 0 | **1200** |
@@ -256,7 +271,30 @@ One 740-second run per timeout over the seven phases, `tps / p50 / view changes`
 
 Every phase discriminates, and the two mechanisms are visible in the p50 column: where a rung escapes it keeps the healthy tail (169, 170, 320), and where it sleeps through the delay it pays it (293, 860, 841).
 
-The recovery phase reads worse than it is. Its numbers are the aftermath of whichever rung the run carried through 5+150, not a property of the recovery regime - a schedule that runs 1200 through 5+150 enters recovery clean. This is also the one schedule entry that switches *after* its boundary rather than ten seconds before it: switching early is protective when the next regime is harsher, but here the next regime is benign and the current one is the phase that punishes the low rung hardest.
+**Read that table with care: medians are not sufficient to judge whether a rung is removed.** A rung can hold a median of 20,000 tps and the healthy tail while individual episodes collapse - 350 at 5+50 medians 20,000 tps and p50 323 with episodes at **zero**, and 250 at `base + delay 400` medians 19,605 and p50 170 with episodes at 400. The agent is ranked on mean episode reward, which is what the next section uses and what corrected the `base + delay 400` label from 250 to 600.
+
+#### Verified end to end
+
+Running the schedule itself, in scheduled mode against this spec, against the best each constant timeout can do - mean episode reward per phase:
+
+| phase | oracle | 250 | 600 | 1200 |
+| --- | ---: | ---: | ---: | ---: |
+| base | 3.54 | 3.57 | 3.55 | 3.55 |
+| base + delay 120 | 3.60 | **3.57** | 2.81 | 2.79 |
+| base + delay 400 | 3.12 | 3.27 | **3.60** | 1.28 |
+| 5+50 | 2.58 | 0.85 | **2.65** | **2.65** |
+| 5+50 + delay 500 | **2.70** | 0.49 | 2.50 | 1.47 |
+| 5+150 | 1.83 | 0.32 | 0.48 | **1.79** |
+| recovery | 3.27 | 0.60 | 3.35 | **3.37** |
+| **whole run** | **2.86** | 1.75 | 2.55 | 2.20 |
+
+The schedule beats every fixed choice and matches or exceeds the best constant in each phase, which is the property the calibration exists to have.
+
+It also settles the recovery label, which constant-timeout runs structurally cannot: 250 scores 0.60 there in its own run purely as the aftermath of having carried 250 through 5+150. Entered clean it scores 3.27 with no episode below 20k. A second oracle run differing *only* in that entry scored 3.33 - and the same pair differ by 0.12 at `base` and 0.45 at `base + delay 400` on identical settings, so 0.06 is inside the noise. The phases tie and the lower value is labelled.
+
+Two cautions on the evidence. `base + delay 400` is the noisiest cell in the ladder, and it is the one whose label changed: 250 collapses there in both runs that have it (worst episodes 400 and 778 tps) while 600 never does across four, but the reward gap between them is smaller than the run-to-run spread. And the 5+150 cell for 600 ranges from 0.48 to 1.19 over five runs against 1200's 1.79 to 1.83 - always ranked correctly, but the margin swings from 3.7x to 1.5x.
+
+The recovery entry is the one schedule entry that switches *after* its boundary rather than ten seconds before it: switching early is protective when the next regime is harsher, but here the next regime is benign and the current one is the phase that punishes the low rung hardest.
 
 ### CloudLab validation under injected network delay
 

@@ -1,5 +1,7 @@
 #include "core/PendingRequestTimer.h"
 
+#include "core/Consensus.h"
+
 #include <algorithm>
 #include <limits>
 
@@ -44,8 +46,8 @@ void PendingRequestTimer::selectWatchLocked() {
 PendingRequestTimer::Clock::time_point PendingRequestTimer::deadlineLocked() const {
     const std::uint64_t base = static_cast<std::uint64_t>(std::max(1, timeoutMs_.load()));
     const std::uint64_t scaled = base << std::min(backoff_, 30u);
-    return std::max(watchedSince_, floor_) +
-           std::chrono::milliseconds(std::min(scaled, std::uint64_t(std::numeric_limits<int>::max())));
+    const std::uint64_t ceiling = std::max<std::uint64_t>(base, kMaxElectionBackoffMs);
+    return std::max(watchedSince_, floor_) + std::chrono::milliseconds(std::min(scaled, ceiling));
 }
 
 bool PendingRequestTimer::track(const std::string& key, Clock::time_point acceptedAt) {
@@ -152,7 +154,7 @@ std::size_t PendingRequestTimer::size() const {
 std::optional<PendingRequestTimer::Watch> PendingRequestTimer::watch() const {
     std::lock_guard<std::mutex> lk(mtx_);
     if (!watchedKey_) return std::nullopt;
-    return Watch{*watchedKey_, watchedSince_, deadlineLocked(), generation_};
+    return Watch{*watchedKey_, watchedSince_, deadlineLocked(), generation_, floor_ > watchedSince_};
 }
 
 bool PendingRequestTimer::expired(std::uint64_t generation, Clock::time_point now) const {

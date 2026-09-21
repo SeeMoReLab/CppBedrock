@@ -1,4 +1,6 @@
 #include "core/PendingRequestTimer.h"
+
+#include "core/Consensus.h"
 #include "test_support.h"
 
 #include <atomic>
@@ -92,6 +94,25 @@ void backoffScalesTheDeadlineAndRearms() {
     CHECK(timer.watch()->deadline == arrived + 200ms);
     // The watch still carries its own arrival, so ordering is untouched.
     CHECK(timer.watch()->since == arrived);
+}
+
+void backoffSaturatesRatherThanGrowingWithoutBound() {
+    std::atomic<int> timeout{1000};
+    PendingRequestTimer timer(timeout, [](auto) {});
+    const auto arrived = Clock::now();
+    CHECK(timer.track("a", arrived));
+    timer.setBackoff(4);
+    CHECK(timer.watch()->deadline == arrived + 16000ms);
+    // A replica must still notice a leader that has stopped, so the doubling
+    // stops here rather than running away.
+    timer.setBackoff(20);
+    CHECK(timer.watch()->deadline == arrived + std::chrono::milliseconds(bedrock::kMaxElectionBackoffMs));
+    // A base timeout above the ceiling is honoured, never shortened.
+    std::atomic<int> longTimeout{60000};
+    PendingRequestTimer slow(longTimeout, [](auto) {});
+    slow.track("b", arrived);
+    slow.setBackoff(5);
+    CHECK(slow.watch()->deadline == arrived + 60000ms);
 }
 
 void batchCompletesAtomically() {
@@ -206,6 +227,7 @@ int main() {
     watchedRequestIsTimedFromItsArrival();
     viewFloorGivesTheNewPrimaryAFullTimeout();
     backoffScalesTheDeadlineAndRearms();
+    backoffSaturatesRatherThanGrowingWithoutBound();
     batchCompletesAtomically();
     resetPreservesArrivalOrder();
     timeoutChangesKeepElapsedTime();

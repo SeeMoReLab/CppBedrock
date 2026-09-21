@@ -24,6 +24,10 @@ constexpr int kMaxConsensusWindow = 256;
 constexpr int kDefaultConsensusWindow = 16;
 // How long execution may stand still before a replica reports why.
 constexpr int kExecutionStallReportMs = 2000;
+// Ceiling on the backed-off election deadline. The backoff has to be able to
+// outlast a backlog, but an unbounded one would leave a replica unable to
+// notice a leader that has genuinely stopped, so it saturates here instead.
+constexpr int kMaxElectionBackoffMs = 30000;
 // How often a replica checks for stalled sequences and retransmits. It also
 // bounds how long execution may stall before retransmission starts.
 constexpr int kMaintenanceIntervalMs = 250;

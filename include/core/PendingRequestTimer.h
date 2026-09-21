@@ -34,6 +34,12 @@ public:
         Clock::time_point since;
         Clock::time_point deadline;
         std::uint64_t generation;
+        // True when the deadline came from the view floor rather than from
+        // this request's own arrival. Such a deadline says nothing about
+        // whether the timeout is adequate: it was granted to spare the
+        // incoming primary its predecessor's backlog, so meeting it is not
+        // evidence of health.
+        bool floored;
     };
 
     PendingRequestTimer(const std::atomic<int>& timeoutMs, Callback onExpire);

@@ -181,45 +181,51 @@ Two couplings were removed along the way, and the rule is worth stating: **nothi
 
 ### Calibrated timeouts and proposal delays
 
-> **This ladder is superseded and must be re-derived.** It was measured with the consensus window at 16 batches in flight, before the window was widened to 64 (see the SBFT section: the shallow window stalls execution for seconds at a time at 150 ms one way), and, more importantly, before the election watchdog was corrected to time a request from its arrival. Under the old behaviour a steadily-late leader never missed a deadline at any timeout, which is the effect the whole table is built on. `run_pbft.sh` is still pinned to a window of 16 so nothing silently changed, but none of the numbers below should be relied on. Re-deriving it is cheap now: the method is the SBFT section's escape window, and the tooling is the same.
+Measured at 20,000 requests/s, four replicas in namespaces on one 32-core CloudLab host, with the consensus window at 16 batches in flight. **Election timeout 250 / 500 / 1200 ms; leader proposal delays 120 / 400 / 500 ms.** This is `config/pbft/failure_spec.xml` and `learning_agent/config/schedule_pbft.csv`.
 
-The election timeout is a watchdog on *request starvation*: `PendingRequestTimer::selectWatchLocked` dates the watch to the request's own arrival, so the deadline is arrival plus the timeout however long the request has already waited, and a view change fires when the oldest pending request has waited too long. It used to date the watch to the moment an entry became watched, which armed a fresh deadline on every completion and turned it into a watchdog on execution stalls instead; a leader that ordered everything late but steadily then reset the deadline forever. The older text below was written against that behaviour.
+It replaces an earlier 350 / 1000 / 4000 ladder measured at 40,000 requests/s, which was an artifact of the election watchdog dating its watch to the moment a request became watched rather than to the request's arrival. Under that behaviour a steadily-late leader never missed a deadline at any timeout, so the whole table measured absorption rather than discrimination. The method below is the SBFT section's escape window, applied to PBFT.
 
-The ladder, measured at 40,000 requests/s:
+#### Two defects had to be fixed before the ladder would hold
 
-| Election timeout | 5 ms | 5 + 50 ms | 5 + 150 ms |
-| ---: | --- | --- | --- |
-| 350 ms | 39,396 tps, no elections | 39,731 tps, no elections | collapses |
-| 500 ms | 39,918 tps, no elections | 39,697 tps, no elections | 5,822 tps, 95 elections |
-| 1,000 ms | - | 39,846 tps, no elections | 24,391 tps, 52 elections |
-| 2,000 ms | - | 39,735 tps, no elections | 36,300 to 39,600 tps, 0 to 3 elections |
-| 4,000 ms | - | - | 39,491 tps, no elections, 100 of 100 full-cadence seconds |
+**A committee could deadlock on a re-proposed batch.** `batchIndex_` was keyed by sequence alone. View-change evidence strips request bodies, so a re-proposal arrives header-only, and storing it overwrote the body every replica held for that sequence. `BatchRequest` asks for a body *by digest*, so once every replica had overwritten its copy no replica could answer, and execution stopped at that sequence permanently - with no log line saying so. Bodies are now also held in `bodiesByDigest_`, pruned by proposed sequence, and `reportExecutionStall` prints the reason a sequence is stuck (`ready`, `have_body`, `have_preprepare`, prepare and commit counts, `digest_known`) every two seconds.
 
-The 150 ms column also explains the bistability recorded above: the bad state was *triggered* by elections. At 4,000 ms there are none and the regime is stable at full cadence, so the instability was the timeout provoking view changes on a healthy leader, not a capacity wall.
+**The view-change backoff could never accumulate.** PBFT doubles the timeout each time a replica starts a view change and restores it when the request it was timing executes. The restore fired on *any* completion however late, and the view floor - which grants the incoming primary a full timeout so it is not voted out for its predecessor's backlog - made every post-view-change completion look punctual. So the backoff reset on the evidence of its own concession and the doubling never took effect: a storm had nothing to terminate it. A floored deadline is now marked as such and does not count as evidence, the completion must beat its deadline, and the doubling is capped at `kMaxElectionBackoffMs`. Draining the queue entirely still counts as health, since nothing is starving.
 
-Proposal delays, injected on the leader and re-resolved every 20 seconds so each run contains several episodes. `delayed` is the count of proposals actually held back, and it is the diagnostic that makes the result readable: a high count with no elections means the delay was absorbed, while a low count with elections means the first episode elected and the delay then stopped applying, because the new leader is not the targeted one.
+#### The network delay sets the floor
 
-| Proposal delay | 350 ms timeout | 1,000 ms timeout | 4,000 ms timeout |
-| ---: | --- | --- | --- |
-| 300 ms | 4 elections, 4 delayed | **absorbed**: no elections, 623 delayed, p50 148 to 461 ms | - |
-| 450 ms | - | 11 elections, 149 delayed | (2,000 ms: 3 elections) |
-| 600 ms | - | 3 elections, 223 delayed | (2,000 ms: 3 elections) |
-| 1,000 ms | - | 4 elections, 9 delayed | **absorbed**: no elections, 537 delayed |
+Undisturbed p50 consensus latency with a safe timeout and no fault: **168 / 335 / 630 ms** at base, 5+50 and 5+150. A rung at or below its level's tail fires on ordinary latency and storms with no fault injected at all. That alone removes 250 at 5+50 (140 view changes, p50 1021) and both 250 and 500 at 5+150 (70 and 57). Latency here is near-deterministic - p50 and p95 track each other at every level - so a timeout fires on every request or on none, and the rungs have to interleave with the tails rather than sit clear of them.
 
-The stall a proposal delay causes is larger than the delay itself, because the pipeline drains before the held proposal lands, and `proposeBatch` allocates the sequence number before applying the delay, so a held proposal occupies a consensus-window slot while it waits. With a 2,000 ms large timeout no delay separated medium from large - 450, 600 and 1,000 ms all produced about three elections, one per re-targeting episode. Widening the large timeout to 4,000 ms resolves it, and costs nothing at 150 ms where 4,000 ms is the best-performing value anyway.
+#### The proposal delay is not additive
 
-So the calibration is:
+A delayed leader's latency is **not** `tail + D`. Measured on the rung that sleeps through the delay: `168 + 1.7*D` at base, and `335 + 1.0*D` at 5+50. At base the delay stalls a pipeline that was keeping up, and `proposeBatch` allocates the sequence before applying the delay, so a held proposal occupies a consensus-window slot while it waits; at 5+50 it overlaps work already in flight. Ignoring the factor is what put an earlier attempt's delays outside their own windows - 700 ms at base was chosen to let 1200 sleep through it and instead pushed the delayed latency to 1358, so 1200 escaped.
 
-| | Value | Verified by |
-| --- | ---: | --- |
-| Small timeout | 350 ms | Clean at 5 ms; elects under a 300 ms proposal delay that the medium absorbs |
-| Medium timeout | 1,000 ms | Clean at 5+50 ms; absorbs a 300 ms proposal delay; elects at 5+150 ms and under a 1,000 ms proposal delay |
-| Large timeout | 4,000 ms | Clean at 5+150 ms at full cadence; absorbs a 1,000 ms proposal delay at both 5 ms and 5+50 ms |
-| P1, absorbed by medium | 300 ms | No elections and 623 delayed proposals at 1,000 ms; 4 elections at 350 ms |
-| P2, elects at medium only | 1,000 ms | 4 elections at 1,000 ms; no elections and 537 delayed at 4,000 ms |
-| P3, absorbed by large at 50 ms | 1,000 ms | No elections and 488 delayed proposals at 4,000 ms with a 50 ms link |
+Each phase's delay is placed mid-window between the rung that must escape it and the rung that must sleep through it:
 
-One requirement is **not** met: a small timeout that keeps electing under a 50 ms link with no proposal delay. No value does this, because the replica cannot distinguish 5 ms from 50 ms while the pipeline absorbs both. The small-versus-medium distinction is available only through proposal delay.
+| phase | must escape | must sleep through | window | chosen |
+| --- | --- | --- | --- | ---: |
+| base + small | 250 (`D > 48`) | 500 (`D < 193`) | 48 to 193 | **120** |
+| base + big | 500 (`D > 193`) | 1200 (`D < 600`) | 193 to 600 | **400** |
+| 5+50 + small | 500 (`D > 160`) | 1200 (`D < 840`) | 160 to 840 | **500** |
+
+Raising `D` brings the next rung up into play; it does not push the winner higher. So the 5+150 phase carries no delay - its tail alone leaves only 1200.
+
+#### The ladder as verified
+
+One 740-second run per timeout over the seven phases, `tps / p50 / view changes`:
+
+| phase | 250 | 500 | 1200 | best |
+| --- | --- | --- | --- | --- |
+| base, no fault | 19990 / 168 / 0 | 20004 / 172 / 0 | 20015 / 175 / 0 | all three |
+| base + delay 120 | 20000 / 169 / 6 | 19997 / 300 / 0 | 20002 / 298 / 0 | **250** |
+| base + delay 400 | 19605 / 170 / 3 | 20000 / 160 / 3 | 19892 / 860 / 1 | **250 or 500** |
+| 5+50, no fault | 19584 / 1021 / 140 | 20000 / 328 / 0 | 20003 / 326 / 0 | **500 or 1200** |
+| 5+50 + delay 500 | 16268 / 1645 / 100 | 20000 / 323 / 3 | 20002 / 841 / 0 | **500** |
+| 5+150, no fault | 16180 / 1702 / 70 | 18035 / 1541 / 57 | 20006 / 636 / 0 | **1200** |
+| base, recovery | 20307 / 1840 / 59 | 20450 / 577 / 9 | 20002 / 178 / 0 | all three |
+
+Every phase discriminates, and the two mechanisms are visible in the p50 column: where a rung escapes it keeps the healthy tail (169, 160, 323), and where it sleeps through the delay it pays it (300, 860, 841).
+
+The recovery phase reads worse than it is. Its numbers are the aftermath of whichever rung the run carried through 5+150, not a property of the recovery regime - a schedule that runs 1200 through 5+150 enters recovery clean. This is also the one schedule entry that switches *after* its boundary rather than ten seconds before it: switching early is protective when the next regime is harsher, but here the next regime is benign and the current one is the phase that punishes the low rung hardest.
 
 ### CloudLab validation under injected network delay
 

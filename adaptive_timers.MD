@@ -181,7 +181,7 @@ Two couplings were removed along the way, and the rule is worth stating: **nothi
 
 ### Calibrated timeouts and proposal delays
 
-Measured at 20,000 requests/s, four replicas in namespaces on one 32-core CloudLab host, with the consensus window at 16 batches in flight. **Election timeout 250 / 500 / 1200 ms; leader proposal delays 120 / 400 / 500 ms.** This is `config/pbft/failure_spec.xml` and `learning_agent/config/schedule_pbft.csv`.
+Measured at 20,000 requests/s, four replicas in namespaces on one 32-core CloudLab host, with the consensus window at 16 batches in flight. **Election timeout 250 / 600 / 1200 ms; leader proposal delays 120 / 400 / 500 ms.** This is `config/pbft/failure_spec.xml` and `learning_agent/config/schedule_pbft.csv`.
 
 It replaces an earlier 350 / 1000 / 4000 ladder measured at 40,000 requests/s, which was an artifact of the election watchdog dating its watch to the moment a request became watched rather than to the request's arrival. Under that behaviour a steadily-late leader never missed a deadline at any timeout, so the whole table measured absorption rather than discrimination. The method below is the SBFT section's escape window, applied to PBFT.
 
@@ -193,37 +193,53 @@ It replaces an earlier 350 / 1000 / 4000 ladder measured at 40,000 requests/s, w
 
 #### The network delay sets the floor
 
-Undisturbed p50 consensus latency with a safe timeout and no fault: **168 / 335 / 630 ms** at base, 5+50 and 5+150. A rung at or below its level's tail fires on ordinary latency and storms with no fault injected at all. That alone removes 250 at 5+50 (140 view changes, p50 1021) and both 250 and 500 at 5+150 (70 and 57). Latency here is near-deterministic - p50 and p95 track each other at every level - so a timeout fires on every request or on none, and the rungs have to interleave with the tails rather than sit clear of them.
+Undisturbed p50 consensus latency with a safe timeout and no fault: **168 / 335 / 630 ms** at base, 5+50 and 5+150. A rung at or below its level's tail fires on ordinary latency and storms with no fault injected at all. That alone removes 250 at 5+50 (140 view changes, p50 1021) and both 250 and 600 at 5+150 (70 and 55). Latency here is near-deterministic - p95 runs about 20 ms above p50 at every level - so a timeout fires on every request or on none, and the rungs have to interleave with the tails rather than sit clear of them.
 
-#### The proposal delay is not additive
+A consequence worth stating, because it is what lets the middle rung sit high: a rung only has to clear the p95-p50 spread to be removed by a tail, not a comfortable fraction of the tail. The middle rung at 600 is 30 ms under the 5+150 tail of 630 and still storms there - 55 view changes, 16,515 tps. Sitting high is what makes every delay window wide.
 
-A delayed leader's latency is **not** `tail + D`. Measured on the rung that sleeps through the delay: `168 + 1.7*D` at base, and `335 + 1.0*D` at 5+50. At base the delay stalls a pipeline that was keeping up, and `proposeBatch` allocates the sequence before applying the delay, so a held proposal occupies a consensus-window slot while it waits; at 5+50 it overlaps work already in flight. Ignoring the factor is what put an earlier attempt's delays outside their own windows - 700 ms at base was chosen to let 1200 sleep through it and instead pushed the delayed latency to 1358, so 1200 escaped.
+#### The proposal delay is not additive, and not linear either
 
-Each phase's delay is placed mid-window between the rung that must escape it and the rung that must sleep through it:
+A delayed leader's latency is **not** `tail + D`. Measured at base, on the rung that sleeps through the delay:
+
+| D | 120 | 150 | 200 | 400 |
+| --- | ---: | ---: | ---: | ---: |
+| p50 | 293 | 321 | 513 | 721 to 860 |
+| p95 | 318 | 349 | 685 | - |
+| cost / D | 1.04 | 1.02 | 1.73 | 1.38 to 1.73 |
+
+There is a knee between 150 and 200, and the p95 row says what it is. Below the knee the delay only defers a proposal and the spread stays at its undisturbed ~20 ms. Above it the held proposal occupies its consensus-window slot - `proposeBatch` allocates the sequence before applying the delay - long enough to throttle the pipeline, so the cost grows faster than `D` and the spread widens with it, to 173 ms at `D = 200`. At 5+50 the cost is about `1.0*D` throughout, because there the delay overlaps work already in flight.
+
+Fitting a single factor across the knee is what put an earlier attempt's delays outside their own windows. A flat `1.7*D` chose 700 ms at base to let 1200 sleep through it, which instead put the delayed latency at 1358 and made 1200 escape; the same fit then read the low end as 48 to 193 ms when the usable range is 100 to 180.
+
+Each phase's delay sits mid-window between the rung that must escape it and the rung that must sleep through it:
 
 | phase | must escape | must sleep through | window | chosen |
 | --- | --- | --- | --- | ---: |
-| base + small | 250 (`D > 48`) | 500 (`D < 193`) | 48 to 193 | **120** |
-| base + big | 500 (`D > 193`) | 1200 (`D < 600`) | 193 to 600 | **400** |
-| 5+50 + small | 500 (`D > 160`) | 1200 (`D < 840`) | 160 to 840 | **500** |
+| base + small | 250 | 600 | 100 to 180 | **120** |
+| base + big | 600 | 1200 | 254 to 607 | **400** |
+| 5+50 + small | 600 | 1200 | 265 to 865 | **500** |
 
 Raising `D` brings the next rung up into play; it does not push the winner higher. So the 5+150 phase carries no delay - its tail alone leaves only 1200.
+
+#### The middle rung is 600, not 500
+
+500 works, but it sits where the *transient* catches it. `pinLeaderWindow` re-pins its victim once per `<interval>` tick, and the pipeline drains and refloods around that move. At a 150 ms delay the steady state is comfortable for 500 - p50 330, p95 345 - yet it elected three times in a 120-second phase, one per re-pin plus one on phase entry, leaving it in the worst of the three states: mostly paying the delay, but electing anyway. Raising the rung to 600 took that to a single view change at the same delay and to none at 120 ms, widened all three windows above, and removed the residual churn in the recovery phase (0 view changes against 9 and 1).
 
 #### The ladder as verified
 
 One 740-second run per timeout over the seven phases, `tps / p50 / view changes`:
 
-| phase | 250 | 500 | 1200 | best |
+| phase | 250 | 600 | 1200 | best |
 | --- | --- | --- | --- | --- |
-| base, no fault | 19990 / 168 / 0 | 20004 / 172 / 0 | 20015 / 175 / 0 | all three |
-| base + delay 120 | 20000 / 169 / 6 | 19997 / 300 / 0 | 20002 / 298 / 0 | **250** |
-| base + delay 400 | 19605 / 170 / 3 | 20000 / 160 / 3 | 19892 / 860 / 1 | **250 or 500** |
-| 5+50, no fault | 19584 / 1021 / 140 | 20000 / 328 / 0 | 20003 / 326 / 0 | **500 or 1200** |
-| 5+50 + delay 500 | 16268 / 1645 / 100 | 20000 / 323 / 3 | 20002 / 841 / 0 | **500** |
-| 5+150, no fault | 16180 / 1702 / 70 | 18035 / 1541 / 57 | 20006 / 636 / 0 | **1200** |
-| base, recovery | 20307 / 1840 / 59 | 20450 / 577 / 9 | 20002 / 178 / 0 | all three |
+| base, no fault | 19990 / 168 / 0 | 19999 / 169 / 0 | 20015 / 175 / 0 | all three |
+| base + delay 120 | 20000 / 169 / 6 | 19993 / 293 / 0 | 20002 / 298 / 0 | **250** |
+| base + delay 400 | 19605 / 170 / 3 | 20004 / 170 / 2 | 19892 / 860 / 1 | **250 or 600** |
+| 5+50, no fault | 19584 / 1021 / 140 | 20000 / 333 / 0 | 20003 / 326 / 0 | **600 or 1200** |
+| 5+50 + delay 500 | 16268 / 1645 / 100 | 20000 / 320 / 3 | 20002 / 841 / 0 | **600** |
+| 5+150, no fault | 16180 / 1702 / 70 | 16515 / 1538 / 55 | 20006 / 636 / 0 | **1200** |
+| base, recovery | 20307 / 1840 / 59 | 19993 / 191 / 0 | 20002 / 178 / 0 | all three |
 
-Every phase discriminates, and the two mechanisms are visible in the p50 column: where a rung escapes it keeps the healthy tail (169, 160, 323), and where it sleeps through the delay it pays it (300, 860, 841).
+Every phase discriminates, and the two mechanisms are visible in the p50 column: where a rung escapes it keeps the healthy tail (169, 170, 320), and where it sleeps through the delay it pays it (293, 860, 841).
 
 The recovery phase reads worse than it is. Its numbers are the aftermath of whichever rung the run carried through 5+150, not a property of the recovery regime - a schedule that runs 1200 through 5+150 enters recovery clean. This is also the one schedule entry that switches *after* its boundary rather than ten seconds before it: switching early is protective when the next regime is harsher, but here the next regime is benign and the current one is the phase that punishes the low rung hardest.
 

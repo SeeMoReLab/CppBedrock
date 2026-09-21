@@ -437,17 +437,17 @@ Every cell measured at 15,000 requests/s on this hardware, one 200 s run each, p
 
 Phases 2 and 5 are ties resolved downward: 400 and 900 are within 5 ms and 26 ms of each other there, so the lower value is labelled. Phase 3 at 150 is the one cell inferred rather than run - 150 already storms at 5+50 with 366 view changes, so it cannot do better against a larger tail.
 
-Running the composed spec end to end reproduces each phase and, critically, shows no carryover:
+Running the composed spec end to end reproduces each phase, with the schedule switching pairs ten seconds ahead of each boundary:
 
 | phase | label | tps | p50 | view changes | fast path |
 | --- | --- | ---: | ---: | ---: | ---: |
-| base + delay 150 | (150, 150) | 15,001 | 127 | 8 | 100% |
-| 5+50 | (400, 150) | 15,000 | 283 | 4 | 100% |
-| 5+150 | (900, 150) | 15,000 | 571 | 6 | 98% |
-| base + straggler 5000 | (400, 150) | 15,006 | 307 | 1 | 0% |
-| 5+150 + straggler 250 | (900, 400) | 15,003 | 813 | 10 | 99% |
+| base + delay 150 | (150, 150) | 15,002 | 125 | 9 | 100% |
+| 5+50 | (400, 150) | 15,003 | 265 | 4 | 100% |
+| 5+150 | (900, 150) | 15,003 | 590 | 7 | 99% |
+| base + straggler 5000 | (400, 150) | 15,000 | 319 | 1 | 0% |
+| 5+150 + straggler 250 | (900, 400) | 15,003 | 811 | 14 | 97% |
 
-The fast-path column is the evidence that matters. Phases 5 and 6 run at 99 and 98 percent fast *after* passing through a phase whose straggler makes the fast path unreachable. Had that phase used `<silence>`, both would read 0 percent and their labels would be meaningless - see below.
+The fast-path column is the evidence that matters. The last phase runs at 97 percent fast *after* passing through a phase whose straggler makes the fast path unreachable. Had that phase used `<silence>` it would read 0 percent and its label would be meaningless - see "A replica does not rejoin the fast path after a crash".
 
 An earlier revision carried a sixth phase, a 5+200 link with a 500 ms straggler, built to give slow-path 900 a home. That value is gone and so is the phase.
 

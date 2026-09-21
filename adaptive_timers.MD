@@ -318,7 +318,7 @@ At PBFT 40,000 the offered load is roughly twice capacity, so the queues stay fu
 
 ## SBFT timer calibration
 
-Measured at 15,000 requests/s, four replicas in namespaces on one 64-core CloudLab host, with the consensus window at 64 batches in flight. Capacity is 53,500 requests/s, so the offered rate is 28 percent of it. **Both timers choose from 150 / 400 / 900 ms - the action space in `models.py` `TIMEOUT_VALUES_MS` - and every value is best in some phase of `config/sbft/failure_spec.xml`.**
+Measured at 15,000 requests/s, four replicas in namespaces on one 64-core CloudLab host, with the consensus window at 64 batches in flight. Capacity is 53,500 requests/s, so the offered rate is 28 percent of it. **The election timeout chooses from 150 / 400 / 900 (`TIMEOUT_VALUES_MS`) and the slow-path wait from 150 / 400 (`SBFT_SLOW_PATH_VALUES_MS`) - six actions, and every value of each is best in some phase of `config/sbft/failure_spec.xml`.**
 
 This supersedes an earlier 350 / 700 / 1400 ladder with the slow path held constant. That calibration had no phase that actuated the slow-path timer at all, and its election rungs were derived on 32-core hardware whose base tail was 168 ms against 116 ms here. It also used values no agent could select: 250 / 600 / 1200 are not in the action space, and scheduled mode accepted them only because it validates that a timeout is an integer number of milliseconds and nothing more.
 
@@ -382,13 +382,22 @@ The first phase wants the fast path to be *unreachable*, and a crash is the obvi
 | --- | ---: | ---: | ---: | ---: | --- |
 | base + straggler 5000 | effectively infinite | **299** | 554 | 2,241 (67 vc, 7,154 tps) | **150** |
 | 5+150 + straggler 250 | 250 | 1,052 | **815** | 815 | **400** |
-| 5+200 + straggler 500 | 500 | 4,143 (8,530 tps) | 2,563 (8,655 tps) | **2,719 (11,354 tps)** | **900** |
 
 The fast/slow counts confirm the mechanism independently of the timing: at 5+150 with a 250 ms straggler, W = 150 takes the slow path on all 1600 instances and W = 400 takes the fast path on all 1600.
 
-### The last phase cannot isolate the two knobs
+### The slow-path wait needs two values, not three
 
-Slow-path 900 is best only where the straggler exceeds 400 ms - otherwise 400 ties it by also waiting. A straggler above 400 ms puts latency past 900 ms, which is the largest election value, so every election arm storms there. `(900, 900)` is the best available action in that phase, not a clean reading of either axis. Widening the election action space upward is what would fix it.
+Its cost is `S` when the wait outlasts the straggler's lag and `W + R` when it does not, so the best value is always one of two things: the floor, which gives up at once and pays the extra round, or the smallest value above `S`. Which one wins flips at `S = floor + R`.
+
+| S | best |
+| --- | --- |
+| `S <= 150` | every value waits - all tie |
+| `150 < S < 150 + R` | the smallest value above `S` |
+| `S >= 150 + R` | 150 |
+
+Two values cover that completely. A third earns a place only when two different lags both fall inside `(150, 150 + R)`, and that window is `R` wide - 33 ms at base. Separating 900 from 400 needs `400 < S < 150 + R`, hence `R > 250`, hence a one-way delay above 112 ms, which puts latency past 900 ms - the largest election value - so every election arm storms and the phase cannot isolate either knob. Measured at 5+150 with a 250 ms straggler, 400 and 900 give 815 ms and 841 ms: a tie.
+
+So the slow path has its own two-value enum, as autobahn's fast-path wait does, and the action space is 3 x 2 = 6 rather than 3 x 3 = 9. An earlier revision of this section carried a sixth phase built to give 900 a home; it is removed with the value.
 
 ### Three defects had to be fixed before any of this could be measured
 
@@ -425,7 +434,6 @@ Every cell measured at 15,000 requests/s on this hardware, one 200 s run each, p
 | 3 | 5+150 | (storms; worse than 400) | 13,350 tps / 1,134 / 163 vc | **571 / 6 vc** | **900** |
 | 4 | base + straggler 5000 | **263 ms** | 556 | 8,096 tps / 3,141 / 63 vc | **150** |
 | 5 | 5+150 + straggler 250 | 1,052 | **815** | 841 | **400** |
-| 6 | 5+200 + straggler 500 | 8,530 tps / 4,143 | 8,655 tps / 2,563 | **11,354 tps / 2,719** | **900** |
 
 Phases 2 and 5 are ties resolved downward: 400 and 900 are within 5 ms and 26 ms of each other there, so the lower value is labelled. Phase 3 at 150 is the one cell inferred rather than run - 150 already storms at 5+50 with 366 view changes, so it cannot do better against a larger tail.
 
@@ -438,11 +446,10 @@ Running the composed spec end to end reproduces each phase and, critically, show
 | 5+150 | (900, 150) | 15,000 | 571 | 6 | 98% |
 | base + straggler 5000 | (400, 150) | 15,006 | 307 | 1 | 0% |
 | 5+150 + straggler 250 | (900, 400) | 15,003 | 813 | 10 | 99% |
-| 5+200 + straggler 500 | (900, 900) | 9,554 | 2,891 | 91 | 98% |
 
 The fast-path column is the evidence that matters. Phases 5 and 6 run at 99 and 98 percent fast *after* passing through a phase whose straggler makes the fast path unreachable. Had that phase used `<silence>`, both would read 0 percent and their labels would be meaningless - see below.
 
-The last phase is noisier composed than in isolation, 9,554 tps against 11,354 with 91 view changes against 55. It is the phase where every election arm storms, so there is no settled state for it to reach; the winner is unchanged.
+An earlier revision carried a sixth phase, a 5+200 link with a 500 ms straggler, built to give slow-path 900 a home. That value is gone and so is the phase.
 
 ### The two knobs separate by different physics
 
@@ -450,7 +457,7 @@ Reading one quantity sees half the spec.
 
 **Election shows up in throughput**, because the only thing in this system that costs throughput is a view-change storm: 13,796 and 13,350 tps against 15,000 for the arms that storm.
 
-**Slow path shows up in latency**, because the fast-path wait defers work rather than dropping it. Every straggler run at 5+150 delivered 15,000 tps whichever value was chosen, separating only on p50. The exception is the 5+200 phase, where the fallback is expensive enough to push latency past every election value and so costs both.
+**Slow path shows up in latency**, because the fast-path wait defers work rather than dropping it. Every straggler run at 5+150 delivered 15,000 tps whichever value was chosen, separating only on p50.
 
 The same is true of the low-election phase: the proposal delay costs 2.7 percent of throughput at 2,000 ms and nothing measurable at 150 ms. So four of the six labelled cells are latency-only, and a throughput-only reward ranks none of them.
 

@@ -365,14 +365,23 @@ A leader proposal delay does select it, because the fast path still completes an
 
 ### The slow-path wait races the n-th prepare, and the race depends on the link
 
-SBFT commits on the fast path only with prepares from all `n` replicas, so the leader waits `W` for the n-th and otherwise falls back. Falling back costs `W + R`; waiting costs `S`, the straggler's lag. `R` is the extra round, and **it is not a constant** - measured `R = 2 * one_way_delay + 25 ms`:
+SBFT commits on the fast path only with prepares from all `n` replicas, so the leader waits `W` for the n-th and otherwise falls back. Falling back costs `W + R`; waiting costs `S`, the straggler's lag.
 
-| | one-way | R |
-| --- | ---: | ---: |
-| base | 5 ms | 33 ms |
-| 5+150 | 155 ms | 337 ms |
+`R` is one round trip. The fast path commits in three one-way hops - pre-prepare, prepare, commit certificate - and the slow path in five, adding a commitAck broadcast and an execute. Measured directly with the election timeout at 5,000 ms so nothing storms, two control runs per link at different waits, and three waits per link against a 5,000 ms straggler that makes the fast path unreachable:
 
-That is the whole reason the axis is rankable. At base the two sides tie - a 200 ms straggler gives p50 374 at W = 150 against 373 at W = 400, with 1746 slow-path decisions against 0, the mechanism firing perfectly and changing nothing. At 5+150 the same race separates by 237 ms. An earlier revision of this section concluded the axis was degenerate; that conclusion was drawn from base-delay measurements alone and is wrong.
+| link | controls (fast) | mean | slow, minus W (W = 200 / 500 / 1000) | mean | difference | one RTT |
+| --- | --- | ---: | --- | ---: | ---: | ---: |
+| base | 107, 93 | 100 | 135, 147, 135 | 139 | 39 | 10 |
+| 5+50 | 252, 287 | 270 | 391, 401, 410 | 400 | 130 | 110 |
+| 5+150 | 591, 577 | 584 | 878, 911, 901 | 897 | **313** | **310** |
+
+The 5+150 row is the one that carries the result: 313 against 310, with the effect thirty times the run-to-run spread. Fitting all three gives `1.83 * one_way + 30 ms`; the slope's uncertainty is about 0.22 given control spreads of 14 to 35 ms, so 2.0 is within one sigma and the measurement cannot say anything tighter than "one RTT".
+
+The residual matters more than the slope. The excess over one RTT is 29 ms at base, 20 at 5+50 and 3 at 5+150 - a fixed per-fallback cost of roughly 20 to 30 ms. At base that is three times the RTT itself; at 5+150 it is negligible. So the whole link-dependence of this axis comes from the RTT, the only part that scales.
+
+The wait passes through additively. Across the three wait values the intercepts agree to within 20 ms per link, and the increment from W = 500 to W = 1000 measures 488, 509 and 490 against a nominal 500.
+
+Two measurement notes. Latencies must be compared between runs of the same kind: a control and a straggler run differ by design, but an isolated 200 s probe and a phase of a composed 1,500 s run differ by more than the effects being measured. And a control's p50 is a fast-path value even when a few percent of instances fall back, because the median is not in that tail - at 5+150 the prepare spread exceeds 500 ms on 4.7 percent of instances and exceeds 1,000 ms on 2.1 percent, so no wait in the action space makes that phase purely fast, yet every control median above is a clean fast-path measurement.
 
 A global delay slows all four replicas equally and creates no spread - 1749 fast / 0 slow at 5+50 - so every slow-path phase needs an explicit straggler.
 

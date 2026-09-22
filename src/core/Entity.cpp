@@ -874,12 +874,20 @@ void Entity::replyToClient(const std::string& clientId, uint64_t requestId, cons
 
 void Entity::applyAgentTimeouts(const AgentTimeouts& timeouts) {
     std::lock_guard<std::recursive_mutex> engine(eventMtx);
+    const int previousElectionMs = viewChangeTimeoutMs.load();
     if (timeouts.electionMs > 0) {
         viewChangeTimeoutMs = timeouts.electionMs;
     }
     if (timeouts.slowPathMs > 0) {
         fastPathWaitMs = timeouts.slowPathMs;
     }
+    // Deadlines are dated from a request's arrival, so a lower timeout puts
+    // every pending request older than the new value into the past and elects
+    // at once, one view per drain attempt. The new timeout says what the
+    // primary owes from now on, not a debt against work already accepted -
+    // the same reason a view change floors the timer for its successor.
+    if (timeouts.electionMs > 0 && timeouts.electionMs < previousElectionMs)
+        requestTimer_.setFloor(std::chrono::steady_clock::now());
     requestTimer_.timeoutChanged();
     if (viewChangeWaitSince_ && timeouts.electionMs > 0) scheduleViewChangeWait();
     LOG_INFO("applied timeouts: election_timeout_ms=" << viewChangeTimeoutMs.load()

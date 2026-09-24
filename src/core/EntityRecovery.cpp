@@ -279,6 +279,14 @@ void Entity::reportExecutionStall() {
              << (instance != consensusInstances_.end() && bedrock::carriesBody(instance->second.proposal) ? 1 : 0)
              << " prepares=" << (instance != consensusInstances_.end() ? instance->second.prepares.size() : 0)
              << " commits=" << (instance != consensusInstances_.end() ? instance->second.commits.size() : 0)
+             // SBFT slow-path state, so a stall can be placed at the certificate,
+             // the acks or the execute round instead of guessed at.
+             << " wait=" << (instance != consensusInstances_.end() && instance->second.waitScheduled ? 1 : 0)
+             << " cert=" << (instance != consensusInstances_.end() && instance->second.certificateSent ? 1 : 0)
+             << " ack_sent=" << (instance != consensusInstances_.end() && instance->second.ackSent ? 1 : 0)
+             << " acks=" << (instance != consensusInstances_.end() ? instance->second.acks.size() : 0)
+             << " exec_sent=" << (instance != consensusInstances_.end() && instance->second.executeSent ? 1 : 0)
+             << " exec=" << (instance != consensusInstances_.end() && instance->second.execution.has_commit() ? 1 : 0)
              << " digest_known=" << (digest.empty() ? 0 : 1)
              << " view=" << currentView() << " checkpoint=" << stableCheckpoint_
              << " window_end=" << stableCheckpoint_ + consensusWindow()

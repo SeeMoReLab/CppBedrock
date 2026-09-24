@@ -81,6 +81,8 @@ void Entity::cancelViewChangeWait() {
 void Entity::armViewChangeWait() {
     viewChangeWaitSince_ = Clock::now();
     scheduleViewChangeWait();
+    LOG_INFO("view-change wait armed for view " << currentView() << ", "
+             << viewChangeWaitDuration().count() << " ms");
 }
 
 void Entity::scheduleViewChangeWait() {
@@ -128,7 +130,13 @@ void Entity::startViewChange(int newView, const std::string& reason) {
              << ", prepared=" << prepared.size() << ", committed=" << committed.size()
              << ", evidence_bytes=" << vc.dump().size());
     requestTimer_.clear();
-    if (viewChangeMsgs_[newView].size() >= static_cast<size_t>(2 * f + 1)) armViewChangeWait();
+    // The wait starts when this replica sends its ViewChange, not when it has
+    // collected 2f+1 of them. A ViewChange is sent once, so if the link drops
+    // it the quorum never forms; the replica would then have cleared its only
+    // timer and armed nothing, and no replica could ever move again. Expiry
+    // escalates to the next view and resends, with backoff, which is how a
+    // lost ViewChange gets retried at all. Reaching quorum re-arms it.
+    armViewChangeWait();
     sendToAll(Message(vc.dump()));
     tryBuildNewView(newView);
 }
@@ -185,6 +193,9 @@ void Entity::onViewChangeMessage(const json& msg) {
         if (it->second.empty()) it = viewChangeMsgs_.erase(it); else ++it;
     }
     const bool inserted = viewChangeMsgs_[view].emplace(sender, msg).second;
+    if (inserted)
+        LOG_INFO("ViewChange from " << sender << " for view " << view << ": "
+                 << viewChangeMsgs_[view].size() << "/" << (2 * f + 1));
     if (inserted && view == currentView() && inViewChange &&
         viewChangeMsgs_[view].size() == static_cast<size_t>(2 * f + 1)) {
         armViewChangeWait();

@@ -70,7 +70,11 @@ std::chrono::milliseconds Entity::viewChangeWaitDuration() const {
     // Saturate safely at the maximum supported millisecond timeout.
     const uint64_t base = std::max(1, viewChangeTimeoutMs.load());
     const uint64_t duration = base << std::min(viewChangeBackoff_, 30u);
-    return std::chrono::milliseconds(std::min(duration, uint64_t(std::numeric_limits<int>::max())));
+    // Same ceiling as the request timer. Uncapped, a few fruitless views park
+    // every replica on a wait of minutes, and replicas whose ViewChange for
+    // the current target was lost never retry within a run.
+    const uint64_t ceiling = std::max<uint64_t>(base, bedrock::kMaxElectionBackoffMs);
+    return std::chrono::milliseconds(std::min(duration, ceiling));
 }
 
 void Entity::cancelViewChangeWait() {

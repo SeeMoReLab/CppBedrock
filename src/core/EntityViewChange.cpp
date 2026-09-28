@@ -101,6 +101,20 @@ void Entity::onViewChangeWaitExpired(uint64_t generation) {
     std::lock_guard<std::recursive_mutex> engine(eventMtx);
     if (!running || !inViewChange || generation != viewChangeWaitGeneration_ ||
         !viewChangeWaitSince_ || Clock::now() < *viewChangeWaitSince_ + viewChangeWaitDuration()) return;
+    // PBFT leaves a view only after 2f+1 replicas have asked for it or for one
+    // beyond it. Until then expiry retransmits this replica's ViewChange, which
+    // is the paper's assumption that a lost message is resent. Escalating alone
+    // lets one replica walk ahead of any quorum; with a dead peer the two
+    // behind then never hold the f+1 senders they would need to follow it.
+    size_t reached = 0;
+    for (const auto& [view, messages] : viewChangeMsgs_) if (view >= currentView()) reached += messages.size();
+    const auto own = viewChangeMsgs_.find(currentView());
+    if (reached < static_cast<size_t>(2 * f + 1) && own != viewChangeMsgs_.end() && own->second.count(nodeId)) {
+        LOG_INFO("ViewChange for view " << currentView() << " resent, " << reached << "/" << (2 * f + 1) << " reached");
+        armViewChangeWait();
+        sendToAll(Message(own->second.at(nodeId).dump()));
+        return;
+    }
     if (currentView() == std::numeric_limits<int>::max()) throw std::runtime_error("view number exhausted");
     setViewChangeBackoff(viewChangeBackoff_ + 1);
     startViewChange(currentView() + 1, "NewView deadline expired");
@@ -134,12 +148,11 @@ void Entity::startViewChange(int newView, const std::string& reason) {
              << ", prepared=" << prepared.size() << ", committed=" << committed.size()
              << ", evidence_bytes=" << vc.dump().size());
     requestTimer_.clear();
-    // The wait starts when this replica sends its ViewChange, not when it has
-    // collected 2f+1 of them. A ViewChange is sent once, so if the link drops
-    // it the quorum never forms; the replica would then have cleared its only
-    // timer and armed nothing, and no replica could ever move again. Expiry
-    // escalates to the next view and resends, with backoff, which is how a
-    // lost ViewChange gets retried at all. Reaching quorum re-arms it.
+    // The wait starts when this replica sends its ViewChange, not only when it
+    // has collected 2f+1 of them: the transport never retransmits, so a lost
+    // ViewChange would otherwise leave every timer clear for good. Expiry
+    // resends it until 2f+1 replicas have reached this view, and escalates
+    // with backoff after that. Reaching quorum re-arms it.
     armViewChangeWait();
     sendToAll(Message(vc.dump()));
     tryBuildNewView(newView);

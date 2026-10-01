@@ -417,6 +417,15 @@ void Entity::advanceConsensus(int seq) {
         }
         return;
     }
+    if (isCurrentLeader() && seq > lastExecuted_ && prepares.size() >= static_cast<size_t>(2 * f + 1)) {
+        // Report only: when the 2f+1-th and the n-th prepare arrived, so the
+        // agent sees how long a fast-path wait would have had to be, also when
+        // it missed (AgentConsensusSample::nthPrepareGapUs, read at execution).
+        std::lock_guard<std::mutex> lk(phaseTsMtx);
+        auto& stamp = nthPrepareTs_[seq];
+        if (stamp.quorumUs < 0) stamp.quorumUs = nowUs();
+        if (stamp.allUs < 0 && prepares.size() >= static_cast<size_t>(committeeSize())) stamp.allUs = nowUs();
+    }
     if (isCurrentLeader() && !i.certificateSent) {
         if (prepares.size() == static_cast<size_t>(committeeSize())) {
             sbftDecide(seq, view, true);

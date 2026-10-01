@@ -145,6 +145,9 @@ private:
         rep.set_slow_path_timeout_ms((uint32_t)std::max(0, t.slowPathMs));
         rep.set_fast_path_count(m.fastPathCount);
         rep.set_slow_path_count(m.slowPathCount);
+        rep.set_nth_prepare_gap_ms(m.nthPrepareGapMs);
+        rep.set_nth_prepare_seen_count(m.nthPrepareSeenCount);
+        rep.set_nth_prepare_unseen_count(m.nthPrepareUnseenCount);
     }
 };
 
@@ -210,6 +213,8 @@ void AgentClient::MetricsWindow::reset(std::chrono::steady_clock::time_point sta
     newViews = 0;
     fastPath = 0;
     slowPath = 0;
+    nthPrepareGapsUs.clear();
+    nthPrepareUnseen = 0;
     windowStart = start;
 }
 
@@ -232,6 +237,9 @@ AgentMetricsSnapshot AgentClient::MetricsWindow::snapshot(
     s.regencyChangeCount = newViews;
     s.fastPathCount = fastPath;
     s.slowPathCount = slowPath;
+    s.nthPrepareGapMs = percentileMs(nthPrepareGapsUs, 0.50);
+    s.nthPrepareSeenCount = static_cast<uint32_t>(nthPrepareGapsUs.size());
+    s.nthPrepareUnseenCount = nthPrepareUnseen;
     s.phase1AvgMs = avgMs(phase1Us);
     s.phase2AvgMs = avgMs(phase2Us);
     s.phase3AvgMs = avgMs(phase3Us);
@@ -333,6 +341,8 @@ void AgentClient::recordConsensus(const AgentConsensusSample& sample) {
             }
             if (sample.path == 1) ++metrics_.fastPath;
             else if (sample.path == 0) ++metrics_.slowPath;
+            if (sample.nthPrepareGapUs >= 0) metrics_.nthPrepareGapsUs.push_back(sample.nthPrepareGapUs);
+            else if (sample.nthPrepareGapUs == -2) ++metrics_.nthPrepareUnseen;
         }
         hasLastCommit_ = true;
         lastCommitTime_ = now;

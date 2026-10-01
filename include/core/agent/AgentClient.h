@@ -50,6 +50,10 @@ struct AgentConsensusSample {
     long long phase3Us{-1};  // protocol phase slot 3 (e.g. commit)
     // Fast/slow path attribution for SBFT: -1 unknown, 0 slow, 1 fast.
     int path{-1};
+    // SBFT, measured only by the replica that led the sequence: n-th prepare
+    // arrival minus the 2f+1-th; -2 when the n-th had not arrived by
+    // execution; -1 when this replica did not lead it.
+    long long nthPrepareGapUs{-1};
 };
 
 // Aggregated metrics for one learning window. The base fields mirror the
@@ -76,6 +80,12 @@ struct AgentMetricsSnapshot {
     float phase3AvgMs{0.0f};
     uint32_t fastPathCount{0};
     uint32_t slowPathCount{0};
+    // SBFT, over the sequences this replica led in the window: median n-th
+    // prepare gap of those whose n-th prepare arrived by execution, and the
+    // counts with and without it.
+    float nthPrepareGapMs{0.0f};
+    uint32_t nthPrepareSeenCount{0};
+    uint32_t nthPrepareUnseenCount{0};
 };
 
 // Protocol-specific mapping between the generic metrics/timeouts and the
@@ -165,6 +175,8 @@ private:
         uint32_t newViews{0};
         uint32_t fastPath{0};
         uint32_t slowPath{0};
+        std::vector<long long> nthPrepareGapsUs;
+        uint32_t nthPrepareUnseen{0};
         std::chrono::steady_clock::time_point windowStart{};
 
         void reset(std::chrono::steady_clock::time_point start);

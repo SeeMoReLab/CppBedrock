@@ -725,7 +725,7 @@ void Entity::markOperationProcessed(int seq, int path, uint32_t transactions, ui
 
     const long long now = nowUs();
     long long e2eLatUs = -1;
-    long long ppLatUs = -1, prLatUs = -1, coLatUs = -1;
+    long long ppLatUs = -1, prLatUs = -1, coLatUs = -1, nthGapUs = -1;
     {
         std::lock_guard<std::mutex> lk(phaseTsMtx);
         auto it_fs = firstSeenUs.find(seq);
@@ -755,6 +755,11 @@ void Entity::markOperationProcessed(int seq, int path, uint32_t transactions, ui
             long long coUs = now - it_co->second;
             if (coUs > 0) coLatUs = coUs;
         }
+        auto it_nth = nthPrepareTs_.find(seq);
+        if (it_nth != nthPrepareTs_.end()) {
+            nthGapUs = it_nth->second.allUs >= 0 ? it_nth->second.allUs - it_nth->second.quorumUs : -2;
+            nthPrepareTs_.erase(it_nth);
+        }
         firstSeenUs.erase(seq);
         phaseTs_preprepare.erase(seq);
         phaseTs_prepare.erase(seq);
@@ -768,6 +773,7 @@ void Entity::markOperationProcessed(int seq, int path, uint32_t transactions, ui
         sample.phase1Us = ppLatUs;
         sample.phase2Us = prLatUs;
         sample.phase3Us = coLatUs;
+        sample.nthPrepareGapUs = nthGapUs;
         sample.path = path;
         sample.transactions = transactions;
         sample.batchSize = batchSize;
@@ -821,6 +827,7 @@ void Entity::pruneSequenceState() {
         pruneIntMap(phaseTs_prepare);
         pruneIntMap(phaseTs_commit);
         pruneIntMap(firstSeenUs);
+        pruneIntMap(nthPrepareTs_);
     }
     {
         std::lock_guard<std::mutex> lk(senderIdsMtx);

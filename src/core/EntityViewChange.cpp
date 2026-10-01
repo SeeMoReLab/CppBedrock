@@ -380,6 +380,7 @@ void Entity::finishNewView(const json& msg) {
     {
         std::lock_guard<std::mutex> lock(phaseTsMtx);
         phaseTs_preprepare.clear(); phaseTs_prepare.clear(); phaseTs_commit.clear();
+        nthPrepareTs_.clear();
     }
     stabilizeCheckpoint(msg.at("checkpoint"));
     std::vector<bedrock::PendingRequestTimer::Entry> pending;

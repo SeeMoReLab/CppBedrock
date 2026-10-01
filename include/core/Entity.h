@@ -383,6 +383,11 @@ public:
     std::unordered_map<int, long long> phaseTs_prepare;    // seq -> prepared (quorum or certificate)
     std::unordered_map<int, long long> phaseTs_commit;     // seq -> committed (quorum or certificate)
     std::unordered_map<int, long long> firstSeenUs;        // seq -> request first seen locally
+    // SBFT, report only: when this replica, leading the sequence's view, held
+    // 2f+1 and then all n prepares (-1 until it did). allUs - quorumUs is how
+    // long a fast-path wait would have had to be; read once at execution.
+    struct NthPrepareStamp { long long quorumUs{-1}; long long allUs{-1}; };
+    std::unordered_map<int, NthPrepareStamp> nthPrepareTs_;
     std::mutex phaseTsMtx;
 
 private:
@@ -611,6 +616,10 @@ private:
     void learnCommitted(const nlohmann::json& proof, int path);
     void drainExecution();
     void reportExecutionStall();
+    // One line a second with the request timer's watch, so a timeout that does
+    // not fire (backoff, view floor) is visible in an ordinary run.
+    void reportRequestTimer();
+    Clock::time_point lastTimerReport_{};
     // Bodies addressed by digest, not by sequence. batchIndex_ holds at most
     // one body per sequence and a header-only re-proposal naming a different
     // batch evicts it, but the evicted bytes are exactly what a peer still

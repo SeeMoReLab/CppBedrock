@@ -4,6 +4,7 @@
 #include "core/events/ProtoMessage.h"
 #include <algorithm>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -99,6 +100,7 @@ void Entity::pruneCertifiedPrefix() {
     {
         std::lock_guard<std::mutex> lock(phaseTsMtx);
         unordered(phaseTs_preprepare); unordered(phaseTs_prepare); unordered(phaseTs_commit); unordered(firstSeenUs);
+        unordered(nthPrepareTs_);
     }
     {
         std::lock_guard<std::mutex> lock(processedMtx);
@@ -293,6 +295,28 @@ void Entity::reportExecutionStall() {
              << " pending=" << pendingRequests_.size() << " bodies=" << batchIndex_.size());
 }
 
+void Entity::reportRequestTimer() {
+    if (!pbftCore_) return;
+    const auto now = Clock::now();
+    if (now - lastTimerReport_ < std::chrono::seconds(1)) return;
+    lastTimerReport_ = now;
+    const auto watch = requestTimer_.watch();
+    const auto ms = [now](Clock::time_point t) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(t - now).count();
+    };
+    std::ostringstream line;
+    line << "request timer: view=" << currentView() << " leader=" << currentLeader()
+         << " in_vc=" << (inViewChange ? 1 : 0) << " timeout_ms=" << viewChangeTimeoutMs.load()
+         << " backoff=" << viewChangeBackoff_ << " pending=" << pendingRequests_.size();
+    if (watch) {
+        line << " watched_age_ms=" << -ms(watch->since) << " deadline_in_ms=" << ms(watch->deadline)
+             << " floored=" << (watch->floored ? 1 : 0);
+    } else {
+        line << " watched=none";
+    }
+    LOG_INFO(line.str());
+}
+
 void Entity::maintainConsensus() {
     std::lock_guard<std::recursive_mutex> lock(eventMtx);
     if (!pbftCore_) return;
@@ -305,8 +329,10 @@ void Entity::maintainConsensus() {
         // Certified decisions remain valid and must be recovered while waiting.
         requestRecovery();
         reportExecutionStall();
+        reportRequestTimer();
     } else {
         reportExecutionStall();
+        reportRequestTimer();
         // Every replica observes who leads, not only the replica that happens
         // to propose. The injector pins a victim for the interval and refuses
         // to re-pin it, so that electing a different leader escapes the delay

@@ -125,6 +125,7 @@ Entity::Entity(const EntityOptions& options)
              << " (n=" << committee_.size() << " f=" << f
              << " election_timeout_ms=" << viewChangeTimeoutMs.load()
              << " slow_path_timeout_ms=" << fastPathWaitMs.load() << ")");
+    logAppliedTimeouts();
 
     timeKeeper = std::make_unique<TimeKeeper>(viewChangeTimeoutMs, [this] { this->onTimeout(); });
     entityInfo["server_name"] = nodeId;
@@ -897,8 +898,17 @@ void Entity::applyAgentTimeouts(const AgentTimeouts& timeouts) {
         requestTimer_.setFloor(std::chrono::steady_clock::now());
     requestTimer_.timeoutChanged();
     if (viewChangeWaitSince_ && timeouts.electionMs > 0) scheduleViewChangeWait();
-    LOG_INFO("applied timeouts: election_timeout_ms=" << viewChangeTimeoutMs.load()
-             << " slow_path_timeout_ms=" << fastPathWaitMs.load());
+    logAppliedTimeouts();
+}
+
+void Entity::logAppliedTimeouts() const {
+    // The fast-path wait is an action only for SBFT; PBFT never reads it.
+    if (protocolName_ == "SBFT") {
+        LOG_INFO("applied timeouts: election_timeout_ms=" << viewChangeTimeoutMs.load()
+                 << " slow_path_timeout_ms=" << fastPathWaitMs.load());
+    } else {
+        LOG_INFO("applied timeouts: election_timeout_ms=" << viewChangeTimeoutMs.load());
+    }
 }
 
 void Entity::initiateViewChange() {

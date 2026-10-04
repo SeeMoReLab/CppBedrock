@@ -219,6 +219,8 @@ public:
     void onNewViewMessage(const nlohmann::json& msg);
     // Applies a recommendation from the learning agent (learning thread).
     void applyAgentTimeouts(const AgentTimeouts& timeouts);
+    // Logs "applied timeouts:" with the agent's action dimensions; the harness plot reads it.
+    void logAppliedTimeouts() const;
 
     // ---- legacy view change (Hotstuff/Zyzzyva paths) ----
     void onTimeout();

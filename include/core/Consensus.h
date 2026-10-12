@@ -32,7 +32,8 @@ constexpr int kMaxElectionBackoffMs = 30000;
 // bounds how long execution may stall before retransmission starts.
 constexpr int kMaintenanceIntervalMs = 250;
 constexpr int kMaxBatchRequests = 8192;
-constexpr int kMaxBatchBytes = 512 * 1024;
+// 8 MiB leaves room for 8192 requests of 512 B (the harness passes 4.5 MiB).
+constexpr int kMaxBatchBytes = 8 * 1024 * 1024;
 
 // One instance in one view. Cleared on view installation; evidence needed
 // across views lives separately in the prepared/committed proof logs.

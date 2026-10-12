@@ -746,15 +746,15 @@ void Entity::markOperationProcessed(int seq, int path, uint32_t transactions, ui
         auto it_co = phaseTs_commit.find(seq);
         if (it_pp != phaseTs_preprepare.end() && it_pr != phaseTs_prepare.end()) {
             long long ppUs = it_pr->second - it_pp->second;
-            if (ppUs > 0) ppLatUs = ppUs;
+            if (ppUs >= 0) ppLatUs = ppUs;
         }
         if (it_pr != phaseTs_prepare.end() && it_co != phaseTs_commit.end()) {
             long long prUs = it_co->second - it_pr->second;
-            if (prUs > 0) prLatUs = prUs;
+            if (prUs >= 0) prLatUs = prUs;
         }
         if (it_co != phaseTs_commit.end()) {
             long long coUs = now - it_co->second;
-            if (coUs > 0) coLatUs = coUs;
+            if (coUs >= 0) coLatUs = coUs;
         }
         auto it_nth = nthPrepareTs_.find(seq);
         if (it_nth != nthPrepareTs_.end()) {

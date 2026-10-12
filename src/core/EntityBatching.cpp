@@ -227,6 +227,10 @@ void Entity::forwardPendingRequests() {
     // it for the same judgement.
     const auto grace = std::chrono::milliseconds(bedrock::kMaintenanceIntervalMs);
     if (now - watch->since < grace) return;
+    // Relay only once execution has stalled, as the comment above intends: a slowed leader that keeps
+    // committing has every request already (the client broadcasts), and relaying the whole backlog after
+    // each commit is what stops it (runs/2026-10-11-recal512, R4).
+    if (now - lastConsensusProgress_ < grace) return;
     const auto retry = std::chrono::milliseconds(2 * bedrock::kMaintenanceIntervalMs);
     if (watch->key == lastForwardedKey_ && lastRequestForward_ != Clock::time_point{} &&
         now - lastRequestForward_ < retry) return;

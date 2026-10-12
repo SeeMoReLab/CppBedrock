@@ -2,7 +2,8 @@
 //
 //   CppBedrock --node-id 0 --committee netcfg/committee.json \
 //              --protocol-config config/config.pbft.yaml --keys-dir netcfg/keys \
-//              [--agent-port 15501 --learning-feature-duration 10000 ...] \
+//              [--agent-port 15501 --learning-anchor-unix-ms 1700000010000 \
+//               --learning-feature-duration 10000 ...] \
 //              [--initial-timeout 5000] [--initial-slow-path-timeout 20] \
 //              [--failure-spec failure_spec.xml --failure-start-unix-ms 1700000000000] \
 //              [--stats-interval 1000] [--verbose]
@@ -39,6 +40,8 @@ void usage(const char* argv0) {
     std::cerr
         << "Usage: " << argv0 << " --node-id <int> --committee <path> --protocol-config <path> --keys-dir <path>\n"
         << "  [--agent-port <port>]                 learning-agent gRPC port on 127.0.0.1 (0 = no agent)\n"
+        << "  [--learning-anchor-unix-ms <ms>]      episode grid anchor, start + failure-spec warm-up; episode e applies\n"
+        << "                                        at anchor + period*(e-1) (required with --agent-port > 0)\n"
         << "  [--learning-feature-duration <ms>]    default 10000\n"
         << "  [--learning-reply-wait <ms>]          default 2000\n"
         << "  [--learning-warmup-duration <ms>]     default 3000\n"
@@ -50,7 +53,7 @@ void usage(const char* argv0) {
         << "  [--stats-interval <ms>]               period of the Stats log line (default 1000, 0 = off)\n"
         << "  [--proposal-interval <ms>]           fixed batch cadence (default 100)\n"
         << "  [--batch-max-requests <count>]       requests per batch (default/max 8192)\n"
-        << "  [--batch-max-bytes <bytes>]          batch bytes (default/max 524288)\n"
+        << "  [--batch-max-bytes <bytes>]          batch bytes (default 524288, max 8388608)\n"
         << "  [--max-inflight-batches <count>]     unexecuted batches (default and max 16, the consensus window)\n"
         << "  [--max-pending-requests <count>]     bound each ingress/pending queue (default 32768)\n"
         << "  [--max-pending-bytes <bytes>]        bound each ingress/pending queue (default 16777216)\n"
@@ -97,6 +100,7 @@ int main(int argc, char** argv) {
             else if (arg == "--protocol-config") options.protocolConfigPath = value(arg);
             else if (arg == "--keys-dir") options.keysDir = value(arg);
             else if (arg == "--agent-port") options.agentPort = parseInt(arg, value(arg));
+            else if (arg == "--learning-anchor-unix-ms") options.agentConfig.anchorUnixMs = parseUnsigned(arg, value(arg));
             else if (arg == "--learning-feature-duration") options.agentConfig.featureDurationMs = parseInt(arg, value(arg));
             else if (arg == "--learning-reply-wait") options.agentConfig.replyWaitMs = parseInt(arg, value(arg));
             else if (arg == "--learning-warmup-duration") options.agentConfig.warmupDurationMs = parseInt(arg, value(arg));
@@ -127,6 +131,9 @@ int main(int argc, char** argv) {
         if (options.protocolConfigPath.empty()) throw std::runtime_error("--protocol-config is required");
         if (options.keysDir.empty()) throw std::runtime_error("--keys-dir is required");
         if (options.agentPort < 0) throw std::runtime_error("--agent-port must be >= 0");
+        if (options.agentPort > 0 && options.agentConfig.anchorUnixMs == 0) {
+            throw std::runtime_error("--learning-anchor-unix-ms is required with --agent-port");
+        }
         if (options.statsIntervalMs < 0) throw std::runtime_error("--stats-interval must be >= 0");
         if (options.failureSpecPath.empty() != (options.failureStartUnixMs == 0)) {
             throw std::runtime_error("--failure-spec and --failure-start-unix-ms must be given together");

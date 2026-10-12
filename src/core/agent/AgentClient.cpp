@@ -4,6 +4,7 @@
 #include <google/protobuf/empty.pb.h>
 
 #include <algorithm>
+#include <cmath>
 #include <numeric>
 #include <stdexcept>
 #include <chrono>
@@ -19,47 +20,69 @@
 
 namespace {
 
+// Nearest rank: sorted[ceil(p*n)-1].
 long long percentile(const std::vector<long long>& sorted, double p) {
     if (sorted.empty()) return 0;
-    double idx = p * (double)(sorted.size() - 1);
-    size_t lo = (size_t)idx;
-    size_t hi = std::min(sorted.size() - 1, lo + 1);
-    double f = idx - (double)lo;
-    return (long long)((1.0 - f) * (double)sorted[lo] + f * (double)sorted[hi]);
+    long long rank = (long long)std::ceil(p * (double)sorted.size()) - 1;
+    return sorted[(size_t)std::max(0LL, rank)];
 }
 
-float avgMs(const std::vector<long long>& us) {
-    if (us.empty()) return 0.0f;
-    long long sum = std::accumulate(us.begin(), us.end(), 0LL);
-    return (float)((double)sum / (double)us.size() / 1000.0);
+// Mean and p50/p90/p95 of raw samples, each divided by unit (1000 turns
+// microseconds into ms; 1 for counts).
+AgentStats windowStats(std::vector<long long> samples, double unit) {
+    AgentStats s;
+    if (samples.empty()) return s;
+    std::sort(samples.begin(), samples.end());
+    long long sum = std::accumulate(samples.begin(), samples.end(), 0LL);
+    s.avg = (float)((double)sum / (double)samples.size() / unit);
+    s.p50 = (float)((double)percentile(samples, 0.50) / unit);
+    s.p90 = (float)((double)percentile(samples, 0.90) / unit);
+    s.p95 = (float)((double)percentile(samples, 0.95) / unit);
+    return s;
 }
 
-float percentileMs(std::vector<long long> us, double p) {
-    if (us.empty()) return 0.0f;
-    std::sort(us.begin(), us.end());
-    return (float)((double)percentile(us, p) / 1000.0);
-}
-
-// Fills the 16 base fields shared by PbftReport, SbftReport, and
-// HotstuffReport (identical setter names in every generated class).
+// Fills the base fields shared by PbftReport, SbftReport, and HotstuffReport
+// (identical setter names in every generated class).
 template <typename ReportT>
 void fillBaseReport(ReportT& rep, const AgentMetricsSnapshot& m, const AgentTimeouts& t) {
     rep.set_total_transactions(m.totalTransactions);
     rep.set_total_consensus_instances(m.totalConsensus);
-    rep.set_avg_consensus_latency_ms(m.avgLatencyMs);
-    rep.set_p50_consensus_latency_ms(m.p50LatencyMs);
-    rep.set_p95_consensus_latency_ms(m.p95LatencyMs);
+    rep.set_avg_consensus_latency_ms(m.latencyMs.avg);
+    rep.set_p50_consensus_latency_ms(m.latencyMs.p50);
+    rep.set_p90_consensus_latency_ms(m.latencyMs.p90);
+    rep.set_p95_consensus_latency_ms(m.latencyMs.p95);
     rep.set_throughput_tps(m.throughputTps);
-    rep.set_avg_batch_size(m.avgBatchSize);
-    rep.set_p95_batch_size(m.p95BatchSize);
+    rep.set_avg_batch_size(m.batchSize.avg);
+    rep.set_p50_batch_size(m.batchSize.p50);
+    rep.set_p90_batch_size(m.batchSize.p90);
+    rep.set_p95_batch_size(m.batchSize.p95);
     rep.set_leader_change_count(m.leaderChangeCount);
     rep.set_regency_change_count(m.regencyChangeCount);
     rep.set_timeout_ms((uint32_t)std::max(0, t.electionMs));
-    rep.set_avg_inter_commit_gap_ms(m.avgInterCommitGapMs);
-    rep.set_p50_inter_commit_gap_ms(m.p50InterCommitGapMs);
-    rep.set_p95_inter_commit_gap_ms(m.p95InterCommitGapMs);
+    rep.set_avg_inter_commit_gap_ms(m.interCommitGapMs.avg);
+    rep.set_p50_inter_commit_gap_ms(m.interCommitGapMs.p50);
+    rep.set_p90_inter_commit_gap_ms(m.interCommitGapMs.p90);
+    rep.set_p95_inter_commit_gap_ms(m.interCommitGapMs.p95);
     rep.set_view_change_count(m.viewChangeCount);
     rep.set_no_progress_view_change_count(m.noProgressViewChangeCount);
+}
+
+// Fills the phase families shared by PbftReport and SbftReport; the
+// unprefixed phase fields are the window means.
+template <typename ReportT>
+void fillPhaseReport(ReportT& rep, const AgentMetricsSnapshot& m) {
+    rep.set_pre_prepare_latency_ms(m.phase1Ms.avg);
+    rep.set_p50_pre_prepare_latency_ms(m.phase1Ms.p50);
+    rep.set_p90_pre_prepare_latency_ms(m.phase1Ms.p90);
+    rep.set_p95_pre_prepare_latency_ms(m.phase1Ms.p95);
+    rep.set_prepare_latency_ms(m.phase2Ms.avg);
+    rep.set_p50_prepare_latency_ms(m.phase2Ms.p50);
+    rep.set_p90_prepare_latency_ms(m.phase2Ms.p90);
+    rep.set_p95_prepare_latency_ms(m.phase2Ms.p95);
+    rep.set_commit_latency_ms(m.phase3Ms.avg);
+    rep.set_p50_commit_latency_ms(m.phase3Ms.p50);
+    rep.set_p90_commit_latency_ms(m.phase3Ms.p90);
+    rep.set_p95_commit_latency_ms(m.phase3Ms.p95);
 }
 
 // ---- Adapters -------------------------------------------------------------
@@ -98,9 +121,7 @@ private:
                             const AgentMetricsSnapshot& m,
                             const AgentTimeouts& t) {
         fillBaseReport(rep, m, t);
-        rep.set_pre_prepare_latency_ms(m.phase1AvgMs);
-        rep.set_prepare_latency_ms(m.phase2AvgMs);
-        rep.set_commit_latency_ms(m.phase3AvgMs);
+        fillPhaseReport(rep, m);
     }
 };
 
@@ -139,9 +160,7 @@ private:
                             const AgentMetricsSnapshot& m,
                             const AgentTimeouts& t) {
         fillBaseReport(rep, m, t);
-        rep.set_pre_prepare_latency_ms(m.phase1AvgMs);
-        rep.set_prepare_latency_ms(m.phase2AvgMs);
-        rep.set_commit_latency_ms(m.phase3AvgMs);
+        fillPhaseReport(rep, m);
         rep.set_slow_path_timeout_ms((uint32_t)std::max(0, t.slowPathMs));
         rep.set_fast_path_count(m.fastPathCount);
         rep.set_slow_path_count(m.slowPathCount);
@@ -208,6 +227,7 @@ void AgentClient::MetricsWindow::reset(std::chrono::steady_clock::time_point sta
     phase2Us.clear();
     phase3Us.clear();
     interCommitGapsUs.clear();
+    hasLastCommit = false;
     viewChanges = 0;
     noProgressViewChanges = 0;
     newViews = 0;
@@ -223,37 +243,21 @@ AgentMetricsSnapshot AgentClient::MetricsWindow::snapshot(
     AgentMetricsSnapshot s;
     s.totalTransactions = transactions;
     s.totalConsensus = static_cast<uint32_t>(batchSizes.size());
-    if (!batchSizes.empty()) {
-        std::vector<long long> sorted = batchSizes;
-        std::sort(sorted.begin(), sorted.end());
-        long long total = 0;
-        for (auto size : batchSizes) total += size;
-        s.avgBatchSize = static_cast<float>(total) / batchSizes.size();
-        s.p95BatchSize = static_cast<float>(percentile(sorted, 0.95));
-    }
+    s.batchSize = windowStats(batchSizes, 1.0);
     s.viewChangeCount = viewChanges;
     s.noProgressViewChangeCount = noProgressViewChanges;
     s.leaderChangeCount = newViews;
     s.regencyChangeCount = newViews;
     s.fastPathCount = fastPath;
     s.slowPathCount = slowPath;
-    s.nthPrepareGapMs = percentileMs(nthPrepareGapsUs, 0.50);
+    s.nthPrepareGapMs = windowStats(nthPrepareGapsUs, 1000.0).p50;
     s.nthPrepareSeenCount = static_cast<uint32_t>(nthPrepareGapsUs.size());
     s.nthPrepareUnseenCount = nthPrepareUnseen;
-    s.phase1AvgMs = avgMs(phase1Us);
-    s.phase2AvgMs = avgMs(phase2Us);
-    s.phase3AvgMs = avgMs(phase3Us);
-    if (!latenciesUs.empty()) {
-        std::vector<long long> sorted = latenciesUs;
-        std::sort(sorted.begin(), sorted.end());
-        s.avgLatencyMs = avgMs(latenciesUs);
-        s.p50LatencyMs = (float)((double)percentile(sorted, 0.50) / 1000.0);
-        s.p95LatencyMs = (float)((double)percentile(sorted, 0.95) / 1000.0);
-        s.p99LatencyMs = (float)((double)percentile(sorted, 0.99) / 1000.0);
-    }
-    s.avgInterCommitGapMs = avgMs(interCommitGapsUs);
-    s.p50InterCommitGapMs = percentileMs(interCommitGapsUs, 0.50);
-    s.p95InterCommitGapMs = percentileMs(interCommitGapsUs, 0.95);
+    s.phase1Ms = windowStats(phase1Us, 1000.0);
+    s.phase2Ms = windowStats(phase2Us, 1000.0);
+    s.phase3Ms = windowStats(phase3Us, 1000.0);
+    s.latencyMs = windowStats(latenciesUs, 1000.0);
+    s.interCommitGapMs = windowStats(interCommitGapsUs, 1000.0);
     auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - windowStart).count();
     if (elapsedMs > 0) {
         s.throughputTps = (float)((double)transactions * 1000.0 / (double)elapsedMs);
@@ -274,6 +278,11 @@ AgentClient::AgentClient(AgentClientConfig config,
       lastTimeouts_(initialTimeouts) {
     if (!adapter_) throw std::invalid_argument("AgentClient requires an adapter");
     if (config_.port <= 0) throw std::invalid_argument("AgentClient requires a positive agent port");
+    if (config_.anchorUnixMs > 0 &&
+        (long long)config_.featureDurationMs + config_.replyWaitMs + config_.warmupDurationMs +
+                config_.rewardDurationMs <= 0) {
+        throw std::invalid_argument("AgentClient episode grid requires a positive episode period");
+    }
 }
 
 AgentClient::~AgentClient() { stop(); }
@@ -335,17 +344,17 @@ void AgentClient::recordConsensus(const AgentConsensusSample& sample) {
             if (sample.phase1Us >= 0) metrics_.phase1Us.push_back(sample.phase1Us);
             if (sample.phase2Us >= 0) metrics_.phase2Us.push_back(sample.phase2Us);
             if (sample.phase3Us >= 0) metrics_.phase3Us.push_back(sample.phase3Us);
-            if (hasLastCommit_) {
+            if (metrics_.hasLastCommit) {
                 metrics_.interCommitGapsUs.push_back(
-                    std::chrono::duration_cast<std::chrono::microseconds>(now - lastCommitTime_).count());
+                    std::chrono::duration_cast<std::chrono::microseconds>(now - metrics_.lastCommitTime).count());
             }
+            metrics_.hasLastCommit = true;
+            metrics_.lastCommitTime = now;
             if (sample.path == 1) ++metrics_.fastPath;
             else if (sample.path == 0) ++metrics_.slowPath;
             if (sample.nthPrepareGapUs >= 0) metrics_.nthPrepareGapsUs.push_back(sample.nthPrepareGapUs);
             else if (sample.nthPrepareGapUs == -2) ++metrics_.nthPrepareUnseen;
         }
-        hasLastCommit_ = true;
-        lastCommitTime_ = now;
     }
     if (notify) stopCv_.notify_all();
 }
@@ -373,20 +382,74 @@ bool AgentClient::waitUntil(std::chrono::steady_clock::time_point deadline) {
 }
 
 void AgentClient::run() {
-    // Idle until the first consensus sample arrives, mirroring the SmartBFT
-    // wall-clock learning manager.
-    {
-        std::unique_lock<std::mutex> lk(stopMtx_);
-        stopCv_.wait(lk, [this] {
-            if (stopRequested_) return true;
-            std::lock_guard<std::mutex> mlk(mtx_);
-            return sawFirstSample_;
-        });
-        if (stopRequested_) return;
-    }
+    using std::chrono::milliseconds;
+    using std::chrono::steady_clock;
+    using std::chrono::system_clock;
 
-    std::chrono::steady_clock::time_point episodeStart;
-    {
+    // Shared episode grid: episode e (>= 1) applies at anchor + period*(e-1) and
+    // starts applyOffset earlier. The anchor is converted to steady_clock once;
+    // every deadline is then arithmetic on e.
+    const bool anchored = config_.anchorUnixMs > 0;
+    const long long periodMs = (long long)config_.featureDurationMs + config_.replyWaitMs +
+                               config_.warmupDurationMs + config_.rewardDurationMs;
+    const long long applyOffsetMs = (long long)config_.featureDurationMs + config_.replyWaitMs;
+    steady_clock::time_point firstApply{};
+    auto gridStart = [&](uint32_t e) {
+        return firstApply + milliseconds(periodMs * (long long)(e - 1) - applyOffsetMs);
+    };
+    auto gridApplyUnixMs = [&](uint32_t e) {
+        return (long long)config_.anchorUnixMs + periodMs * (long long)(e - 1);
+    };
+    // Smallest e >= 1 whose start is not before t.
+    auto firstEpisodeFrom = [&](steady_clock::time_point t) -> uint32_t {
+        const auto behind = t - gridStart(1);
+        if (behind <= steady_clock::duration::zero()) return 1;
+        const steady_clock::duration period = milliseconds(periodMs);
+        return 1 + (uint32_t)((behind + period - steady_clock::duration(1)) / period);
+    };
+    // Idle until the grid start, then open the feature window.
+    auto beginGridEpisode = [&](uint32_t e, steady_clock::time_point startAt) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            episode_ = e;
+            stage_ = Stage::Idle;
+        }
+        if (!waitUntil(startAt)) return false;
+        std::lock_guard<std::mutex> lk(mtx_);
+        stage_ = Stage::Feature;
+        metrics_.reset(steady_clock::now());
+        episodeStartTick_ = lastSequence_;
+        return true;
+    };
+
+    steady_clock::time_point episodeStart;
+    if (anchored) {
+        const auto systemNow = system_clock::now();
+        const auto steadyNow = steady_clock::now();
+        const system_clock::time_point anchor{milliseconds(config_.anchorUnixMs)};
+        firstApply = steadyNow + std::chrono::duration_cast<steady_clock::duration>(anchor - systemNow);
+        const uint32_t first = firstEpisodeFrom(steadyNow);
+        LOG_INFO(logPrefix() << "episode grid: anchor_unix_ms=" << config_.anchorUnixMs
+                 << " period_ms=" << periodMs
+                 << " apply_offset_ms=" << applyOffsetMs
+                 << " first_episode=" << first
+                 << " first_apply_unix_ms=" << gridApplyUnixMs(first));
+        episodeStart = gridStart(first);
+        if (!beginGridEpisode(first, episodeStart)) return;
+    } else {
+        // Idle until the first consensus sample arrives, mirroring the SmartBFT
+        // wall-clock learning manager.
+        LOG_INFO(logPrefix() << "episode anchor: first commit (no grid anchor)");
+        {
+            std::unique_lock<std::mutex> lk(stopMtx_);
+            stopCv_.wait(lk, [this] {
+                if (stopRequested_) return true;
+                std::lock_guard<std::mutex> mlk(mtx_);
+                return sawFirstSample_;
+            });
+            if (stopRequested_) return;
+        }
+
         std::lock_guard<std::mutex> lk(mtx_);
         episodeStart = firstSampleTime_;
         stage_ = Stage::Feature;
@@ -413,6 +476,13 @@ void AgentClient::run() {
         auto applyAt = featureEnd + std::chrono::milliseconds(config_.replyWaitMs);
         if (!waitUntil(applyAt)) return;
         stopPolling();
+        std::string gridLog;
+        if (anchored) {
+            const long long nowUnixMs = std::chrono::duration_cast<milliseconds>(
+                system_clock::now().time_since_epoch()).count();
+            gridLog = " grid_apply_unix_ms=" + std::to_string(gridApplyUnixMs(episode)) +
+                      " lag_ms=" + std::to_string(nowUnixMs - gridApplyUnixMs(episode));
+        }
 
         AgentTimeouts toApply{};
         bool haveDecision = false;
@@ -440,9 +510,11 @@ void AgentClient::run() {
             }
             LOG_INFO(logPrefix() << "applied recommendation: episode=" << episode
                      << " election " << previous.electionMs << "->" << next.electionMs << "ms"
-                     << " slow_path " << previous.slowPathMs << "->" << next.slowPathMs << "ms");
+                     << " slow_path " << previous.slowPathMs << "->" << next.slowPathMs << "ms"
+                     << gridLog);
         } else {
-            LOG_WARN(logPrefix() << "reply deadline reached without recommendation: episode=" << episode);
+            LOG_WARN(logPrefix() << "reply deadline reached without recommendation: episode=" << episode
+                     << gridLog);
         }
         {
             std::lock_guard<std::mutex> lk(mtx_);
@@ -460,13 +532,20 @@ void AgentClient::run() {
 
         // --- Reward stage ---
         auto rewardEnd = rewardStart + std::chrono::milliseconds(config_.rewardDurationMs);
+        // On the grid rewardEnd is the next episode's start; already past means
+        // this episode overran its slot.
+        const bool overran = anchored && steady_clock::now() > rewardEnd;
         if (!waitUntil(rewardEnd)) return;
         {
             std::lock_guard<std::mutex> lk(mtx_);
             AgentMetricsSnapshot snap = metrics_.snapshot(std::chrono::steady_clock::now());
-            pendingReward_.Clear();
-            adapter_->fillReward(pendingReward_, episode_, snap, lastTimeouts_);
-            hasPendingReward_ = true;
+            // An overrun leaves a near-empty reward window; sending it would
+            // score as a stall, so it is dropped.
+            if (!overran) {
+                pendingReward_.Clear();
+                adapter_->fillReward(pendingReward_, episode_, snap, lastTimeouts_);
+                hasPendingReward_ = true;
+            }
 
             LOG_INFO(logPrefix() << "captured reward: episode=" << episode_
                      << " total_consensus=" << snap.totalConsensus
@@ -478,7 +557,23 @@ void AgentClient::run() {
             metrics_.reset(std::chrono::steady_clock::now());
             stage_ = Stage::Feature;
         }
-        episodeStart = rewardEnd;
+        if (!anchored) {
+            episodeStart = rewardEnd;
+            continue;
+        }
+        uint32_t next;
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            next = episode_;
+        }
+        episodeStart = gridStart(next);
+        if (overran) {
+            const uint32_t skipTo = firstEpisodeFrom(steady_clock::now());
+            LOG_WARN(logPrefix() << "episode overran its grid slot: episode=" << next
+                     << " start already past; reward dropped; skipping to episode=" << skipTo);
+            episodeStart = gridStart(skipTo);
+            if (!beginGridEpisode(skipTo, episodeStart)) return;
+        }
     }
 }
 

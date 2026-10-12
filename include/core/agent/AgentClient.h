@@ -56,28 +56,32 @@ struct AgentConsensusSample {
     long long nthPrepareGapUs{-1};
 };
 
+// Mean and nearest-rank percentiles (sorted[ceil(p*n)-1]) of one window's
+// samples; all zero without samples.
+struct AgentStats {
+    float avg{0.0f};
+    float p50{0.0f};
+    float p90{0.0f};
+    float p95{0.0f};
+};
+
 // Aggregated metrics for one learning window. The base fields mirror the
 // PbftReport layout shared by every protocol report in agent.proto.
+// Latencies and gaps are ms; batch size counts requests per batch.
 struct AgentMetricsSnapshot {
     uint32_t totalTransactions{0};
     uint32_t totalConsensus{0};
-    float avgLatencyMs{0.0f};
-    float p50LatencyMs{0.0f};
-    float p95LatencyMs{0.0f};
-    float p99LatencyMs{0.0f};
+    AgentStats latencyMs;
     float throughputTps{0.0f};
-    float avgBatchSize{0.0f};
-    float p95BatchSize{0.0f};
+    AgentStats batchSize;
     uint32_t leaderChangeCount{0};
     uint32_t regencyChangeCount{0};
-    float avgInterCommitGapMs{0.0f};
-    float p50InterCommitGapMs{0.0f};
-    float p95InterCommitGapMs{0.0f};
+    AgentStats interCommitGapMs;
     uint32_t viewChangeCount{0};
     uint32_t noProgressViewChangeCount{0};
-    float phase1AvgMs{0.0f};
-    float phase2AvgMs{0.0f};
-    float phase3AvgMs{0.0f};
+    AgentStats phase1Ms;
+    AgentStats phase2Ms;
+    AgentStats phase3Ms;
     uint32_t fastPathCount{0};
     uint32_t slowPathCount{0};
     // SBFT, over the sequences this replica led in the window: median n-th
@@ -131,6 +135,12 @@ struct AgentClientConfig {
     int rewardDurationMs{5000};
     int pollIntervalMs{50};
     int rpcTimeoutMs{2000};
+    // Shared episode grid (harness start_unix_ms + failure-spec warm-up, epoch
+    // ms): episode e applies its timeouts at anchorUnixMs + period*(e-1), where
+    // period is the sum of the four durations, and starts feature + reply wait
+    // earlier. 0 anchors episode 1 on the first commit instead; that path is
+    // for library tests only, the replica CLI requires an anchor.
+    std::uint64_t anchorUnixMs{0};
 };
 
 class AgentClient {
@@ -148,7 +158,8 @@ public:
     AgentClient& operator=(const AgentClient&) = delete;
 
     // Connects to the agent, resets it, and starts the wall-clock cycle. The
-    // cycle stays idle until the first consensus sample arrives.
+    // cycle stays idle until the first grid episode start at or after now (or,
+    // without an anchor, until the first consensus sample arrives).
     void start();
     void stop();
 
@@ -169,7 +180,10 @@ private:
         std::vector<long long> phase1Us;
         std::vector<long long> phase2Us;
         std::vector<long long> phase3Us;
+        // Gaps between two commits inside this window: n commits give n-1.
         std::vector<long long> interCommitGapsUs;
+        bool hasLastCommit{false};
+        std::chrono::steady_clock::time_point lastCommitTime{};
         uint32_t viewChanges{0};
         uint32_t noProgressViewChanges{0};
         uint32_t newViews{0};
@@ -215,8 +229,6 @@ private:
     uint32_t episode_{1};
     uint32_t episodeStartTick_{0};
     uint32_t lastSequence_{0};
-    bool hasLastCommit_{false};
-    std::chrono::steady_clock::time_point lastCommitTime_{};
     uint64_t commitsSinceViewChange_{0};
     AgentTimeouts currentTimeouts_{};
     AgentTimeouts lastTimeouts_{};  // timeouts active during the reward window

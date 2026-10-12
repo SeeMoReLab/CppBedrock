@@ -520,9 +520,13 @@ Each replica connects to a local LearningAgent gRPC service (`--agent-port`) and
 3. Warm-up for `--learning-warmup-duration` ms: metrics are discarded while the system settles under the new timeouts.
 4. Reward collection for `--learning-reward-duration` ms: metrics under the new timeouts become the reward, delivered with the next episode's report.
 
+Episodes sit on a grid shared by every replica. `--learning-anchor-unix-ms` (required with `--agent-port`; the harness passes the benchmark start plus the failure spec's warm-up) is the apply instant of episode 1, and episode e applies at anchor + P*(e-1), where P is the sum of the four durations (20 s by default). Its feature window starts feature + reply wait earlier. The cycle starts at the first episode whose start is not yet past, so a replica that starts late joins at a later episode with the same numbering; an episode that overruns its slot skips forward the same way, with a warning. The anchor is converted to the monotonic clock once, and each apply logs `grid_apply_unix_ms` and `lag_ms`.
+
 Phase latencies: PBFT reports PrePrepare to prepare quorum, prepare quorum to commit quorum, and commit quorum to execution; SBFT participants report PrePrepare to certificate arrival, certificate to execute certificate (zero on the fast path), and the rest.
 
-Protocol mapping: PBFT and LinearPBFT report as `PROTOCOL_PBFT`, SBFT as `PROTOCOL_SBFT`, the HotStuff variants as `PROTOCOL_HOTSTUFF`. Zyzzyva has no report message in the proto and cannot run with an agent. Start the matching agent, for example `python3 learning_agent/main.py --node-id 0 --protocol pbft --host 127.0.0.1 --port 15501 --signing false --model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv`.
+Window statistics: consensus latency, inter-commit gap, batch size and each phase are reported as avg/p50/p90/p95 over the samples of the window (the unprefixed phase fields are the averages). Percentiles are nearest rank, `sorted[ceil(p*n)-1]`, and 0 without samples. Gaps fall only between two commits inside the window, so n commits give n-1 gaps. Phase samples of exactly 0 are kept.
+
+Protocol mapping: PBFT and LinearPBFT report as `PROTOCOL_PBFT`, SBFT as `PROTOCOL_SBFT`, the HotStuff variants as `PROTOCOL_HOTSTUFF`. Zyzzyva has no report message in the proto and cannot run with an agent. Start the matching agent, for example `python3 learning_agent/main.py --node-id 0 --protocol pbft --host 127.0.0.1 --port 15501 --signing false --episode-ms 20000 --model-type scheduled --schedule-file learning_agent/config/schedule_pbft.csv`.
 
 A live smoke test is available: with an agent running on port 50190, run `./build/agent_client_smoke PBFT 50190 12`.
 

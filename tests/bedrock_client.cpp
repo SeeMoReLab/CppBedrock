@@ -59,6 +59,7 @@ struct Options {
     std::string clientKeyPath;
     int initialLeader{0};
     int connectTimeoutS{15};
+    int requestSize{0};
 };
 
 std::atomic<bool> g_stop{false};
@@ -158,6 +159,23 @@ std::string formatStats(double seconds, const Snapshot& s) {
                   (long long)percentile(s, 0.50), (long long)percentile(s, 0.95),
                   (long long)percentile(s, 0.99), (long long)maximumLatency(s));
     return buf;
+}
+
+// Pads operation with 'x' so the serialized request is exactly `target`
+// bytes. Length prefixes are varints, so the padding is re-measured until it
+// settles. False if the unpadded request is already larger than `target`, or
+// if a varint boundary makes `target` unreachable.
+bool padRequest(bedrock::ClientRequest& req, const std::string& base, size_t target) {
+    long long pad = 0;
+    req.set_operation(base);
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const long long size = static_cast<long long>(req.ByteSizeLong());
+        if (size == static_cast<long long>(target)) return true;
+        pad += static_cast<long long>(target) - size;
+        if (pad < 0) return false;
+        req.set_operation(base + std::string(static_cast<size_t>(pad), 'x'));
+    }
+    return req.ByteSizeLong() == target;
 }
 
 // ---- Leader tracking from reply hints ----
@@ -302,7 +320,9 @@ void usage(const char* argv0) {
         << "  --sign <true|false>           RSA-sign every request with --client-key (default false)\n"
         << "  --client-key <path>           client private key PEM (required with --sign true)\n"
         << "  --initial-leader <id>         leader to target until replies say otherwise (default 0)\n"
-        << "  --connect-timeout <s>         give up if a replica is unreachable for this long (default 15)\n";
+        << "  --connect-timeout <s>         give up if a replica is unreachable for this long (default 15)\n"
+        << "  --request-size <bytes>        pad every request to exactly this serialized size, with a blank\n"
+        << "                                transaction (default 0 = unpadded transfer requests)\n";
 }
 
 int parseInt(const std::string& flag, const std::string& value) {
@@ -353,6 +373,7 @@ Options parseOptions(int argc, char** argv) {
         else if (arg == "--client-key") o.clientKeyPath = value(arg);
         else if (arg == "--initial-leader") o.initialLeader = parseInt(arg, value(arg));
         else if (arg == "--connect-timeout") o.connectTimeoutS = parseInt(arg, value(arg));
+        else if (arg == "--request-size") o.requestSize = parseInt(arg, value(arg));
         else if (arg == "--help" || arg == "-h") { usage(argv[0]); std::exit(0); }
         else throw std::runtime_error("unknown argument: " + arg);
     }
@@ -365,6 +386,7 @@ Options parseOptions(int argc, char** argv) {
     if (o.monitorIntervalMs <= 0) throw std::runtime_error("--monitor-interval must be positive");
     if (o.sign && o.clientKeyPath.empty()) throw std::runtime_error("--client-key is required with --sign true");
     if (o.connectTimeoutS <= 0) throw std::runtime_error("--connect-timeout must be positive");
+    if (o.requestSize < 0) throw std::runtime_error("--request-size must be >= 0");
     return o;
 }
 
@@ -499,6 +521,8 @@ int main(int argc, char** argv) {
     std::atomic<bool> sendersDone{false};
     std::atomic<uint64_t> sent{0};
     std::atomic<uint64_t> sendFailures{0};
+    std::atomic<bool> padFailed{false};
+    std::once_flag sizeReported;
 
     // Sender lanes.
     std::vector<std::thread> senders;
@@ -522,13 +546,31 @@ int main(int argc, char** argv) {
                     const std::string op = clientId + ":" + std::to_string(requestId);
                     req.set_timestamp(op);
                     req.set_operation(op);
+                    // Padded requests keep a present but blank transaction:
+                    // replicas require one, and skip the transfer when from/to
+                    // are empty.
                     auto* tx = req.mutable_transaction();
-                    tx->set_from("acct" + std::to_string(counter % 1000));
-                    tx->set_to("acct" + std::to_string((counter + 1) % 1000));
-                    tx->set_amount(1);
+                    if (opt.requestSize == 0) {
+                        tx->set_from("acct" + std::to_string(counter % 1000));
+                        tx->set_to("acct" + std::to_string((counter + 1) % 1000));
+                        tx->set_amount(1);
+                    }
                     if (signer) {
                         nlohmann::json txj = {{"from", tx->from()}, {"to", tx->to()}, {"amount", tx->amount()}};
                         req.set_signature(signer->sign(txj.dump() + req.timestamp()));
+                    }
+                    if (opt.requestSize > 0) {
+                        if (!padRequest(req, op + ":", static_cast<size_t>(opt.requestSize))) {
+                            req.set_operation(op + ":");
+                            LOG_ERROR("cannot pad request " << op << " to exactly " << opt.requestSize
+                                      << " bytes (unpadded " << req.ByteSizeLong() << " bytes)");
+                            padFailed.store(true);
+                            g_stop.store(true);
+                            break;
+                        }
+                        std::call_once(sizeReported, [&]() {
+                            LOG_INFO("request_size=" << opt.requestSize << " serialized=" << req.ByteSizeLong());
+                        });
                     }
                     tracker.add(requestId, Clock::now());
                     sent.fetch_add(1);
@@ -613,5 +655,5 @@ int main(int argc, char** argv) {
             if (sc->reader.joinable()) sc->reader.join();
         }
     }
-    return 0;
+    return padFailed.load() ? 1 : 0;
 }

@@ -237,7 +237,13 @@ void Entity::forwardPendingRequests() {
     bedrock::ProtocolEnvelope payload;
     auto* batch = payload.mutable_pre_prepare();
     size_t bytes = 0;
-    for (const auto& key : requestTimer_.oldestKeys(options_.batchMaxRequests + consensusWindow())) {
+    // Only the watched request. The client broadcasts, so the leader almost always
+    // holds the rest already; relaying a whole batch behind it (8192 requests,
+    // 8 MB as JSON, from each backup at once) landed 1.9-7.5 s later on a stream
+    // that had not yet carried bulk data, and the votes and view-change messages
+    // queued behind it (runs/2026-10-12-sbft-margins: the trigger of every
+    // 1200/150 storm in p3 and 1.7-3.9 s of late view installs at 550).
+    for (const auto& key : requestTimer_.oldestKeys(1)) {
         const auto found = pendingRequests_.find(key);
         if (found == pendingRequests_.end() || found->second.proposedInView == currentView()) continue;
         if (bytes + found->second.bytes > static_cast<size_t>(options_.batchMaxBytes) ||

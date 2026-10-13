@@ -35,12 +35,23 @@ void PendingRequestTimer::selectWatchLocked() {
     watchedKey_.reset();
     if (byTime_.empty()) return;
     watchedKey_ = byTime_.begin()->second;
+    watchedArrival_ = byTime_.begin()->first;
     // PBFT times a request from when the replica received it, not from when the
     // previous one finished. Dating the watch to now would hand each request a
     // full fresh timeout however long it had already been waiting, so a leader
     // that orders everything late - but steadily - would reset the deadline on
     // every completion and never be replaced at any timeout value.
-    watchedSince_ = byTime_.begin()->first;
+    //
+    // The exception is the backlog behind a floor (a view install or a lower
+    // timeout). Those requests share one origin, so timing them from arrival -
+    // or from the floor - gives the whole backlog a single deadline, and a
+    // correct primary that cannot drain its predecessor's backlog inside one
+    // timeout is voted out for it, and so is the next (runs/2026-10-11-recal512,
+    // R9). Timing each from when it becomes the head charges the primary one
+    // timeout per inherited request instead. The backlog is finite, so once it
+    // drains the requests that arrived after the floor are timed from arrival
+    // again and a primary that is itself steadily late is still replaced.
+    watchedSince_ = watchedArrival_ < floor_ ? std::max(floor_, Clock::now()) : watchedArrival_;
 }
 
 PendingRequestTimer::Clock::time_point PendingRequestTimer::deadlineLocked() const {
@@ -154,7 +165,7 @@ std::size_t PendingRequestTimer::size() const {
 std::optional<PendingRequestTimer::Watch> PendingRequestTimer::watch() const {
     std::lock_guard<std::mutex> lk(mtx_);
     if (!watchedKey_) return std::nullopt;
-    return Watch{*watchedKey_, watchedSince_, deadlineLocked(), generation_, floor_ > watchedSince_};
+    return Watch{*watchedKey_, watchedSince_, deadlineLocked(), generation_, floor_ > watchedArrival_};
 }
 
 bool PendingRequestTimer::expired(std::uint64_t generation, Clock::time_point now) const {

@@ -34,8 +34,8 @@ public:
         Clock::time_point since;
         Clock::time_point deadline;
         std::uint64_t generation;
-        // True when the deadline came from the view floor rather than from
-        // this request's own arrival. Such a deadline says nothing about
+        // True when the request arrived before the floor, so its deadline was
+        // set by the floor rather than by its own arrival. Such a deadline says nothing about
         // whether the timeout is adequate: it was granted to spare the
         // incoming primary its predecessor's backlog, so meeting it is not
         // evidence of health.
@@ -64,6 +64,10 @@ public:
     // backlog with the arrival times it already had, so without a floor the
     // incoming primary would inherit deadlines that had already passed and be
     // voted out for its predecessor's delay, one view per backlogged request.
+    // Each request that arrived before the floor is timed from when it becomes
+    // the watched head, not from the floor itself, so the primary owes every
+    // inherited request one timeout instead of owing the whole backlog by one
+    // deadline.
     void setFloor(Clock::time_point floor);
     // PBFT doubles the timeout each time a replica starts a view change and
     // restores it when the request it was timing executes. Without that, every
@@ -96,6 +100,7 @@ private:
     std::unordered_map<std::string, Clock::time_point> byKey_;
     std::multimap<Clock::time_point, std::string> byTime_;
     std::optional<std::string> watchedKey_;
+    Clock::time_point watchedArrival_{};
     Clock::time_point watchedSince_{};
     Clock::time_point floor_{Clock::time_point::min()};
     unsigned backoff_{0};

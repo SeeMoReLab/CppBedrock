@@ -65,12 +65,48 @@ void viewFloorGivesTheNewPrimaryAFullTimeout() {
     // The head still carries its own arrival, so ordering is untouched, and a
     // request that arrives after the floor is timed from its arrival again.
     CHECK_EQ(timer.watch()->key, std::string("a"));
+    CHECK(timer.watch()->floored);
+    // The next inherited request is timed from when it became the head, so the
+    // primary owes it one timeout of its own rather than sharing a's deadline.
+    const auto beforeComplete = Clock::now();
     timer.complete("a");
-    CHECK(timer.watch()->deadline == installed + 200ms);
+    CHECK(timer.watch()->floored);
+    CHECK(timer.watch()->since >= beforeComplete);
+    CHECK(timer.watch()->deadline == timer.watch()->since + 200ms);
+    CHECK(timer.watch()->deadline >= installed + 200ms);
     const auto fresh = installed + 10s;
     timer.complete("b");
     CHECK(timer.track("c", fresh));
     CHECK(timer.watch()->deadline == fresh + 200ms);
+    CHECK(!timer.watch()->floored);
+}
+
+void inheritedBacklogDrainsOneTimeoutPerRequest() {
+    // A primary that drains an inherited backlog steadily, one request per
+    // 150 ms against a 200 ms timeout, meets every deadline even though the
+    // whole backlog takes far longer than one timeout. Under a single shared
+    // deadline the third request would already be late.
+    std::atomic<int> timeout{200};
+    PendingRequestTimer timer(timeout, [](auto) {});
+    const auto old = Clock::now() - 10s;
+    timer.reset({{"a", old}, {"b", old + 1ms}, {"c", old + 2ms}, {"d", old + 3ms}});
+    const auto installed = Clock::now();
+    timer.setFloor(installed);
+    for (const char* key : {"a", "b", "c"}) {
+        const auto w = *timer.watch();
+        CHECK_EQ(w.key, std::string(key));
+        CHECK(!timer.expired(w.generation, Clock::now()));
+        std::this_thread::sleep_for(150ms);
+        CHECK(!timer.expired(w.generation, Clock::now()));
+        timer.complete(key);
+    }
+    // A request that arrived after the floor is timed from its arrival again,
+    // so a primary that is itself late is still caught once the backlog is gone.
+    timer.complete("d");
+    const auto late = installed + 1ms;  // after the floor, and over 400 ms ago
+    CHECK(timer.track("e", late));
+    CHECK(timer.watch()->deadline == late + 200ms);
+    CHECK(timer.expired(timer.watch()->generation, Clock::now()));
 }
 
 void backoffScalesTheDeadlineAndRearms() {
@@ -226,6 +262,7 @@ void stopWhileArmed() {
 int main() {
     watchedRequestIsTimedFromItsArrival();
     viewFloorGivesTheNewPrimaryAFullTimeout();
+    inheritedBacklogDrainsOneTimeoutPerRequest();
     backoffScalesTheDeadlineAndRearms();
     backoffSaturatesRatherThanGrowingWithoutBound();
     batchCompletesAtomically();

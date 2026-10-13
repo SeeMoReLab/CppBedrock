@@ -54,6 +54,13 @@ void Entity::onRequestTimerExpired(std::uint64_t generation) {
             return;
         }
     }
+    // Backups time the primary; the primary does not depose itself (PBFT). Its
+    // backoff can fall below its backups' (it drains to post-floor requests first
+    // and resets, while their inherited heads stay floored at the storm's backoff),
+    // and a leader that then left alone proposed nothing until their deadlines
+    // expired: 2.2-8.9 s of total stall per p3 draw at 20k
+    // (runs/2026-10-12-sbft-margins). The f+1 join still brings it along.
+    if (isCurrentLeader()) return;
     if (currentView() == std::numeric_limits<int>::max()) throw std::runtime_error("view number exhausted");
     // Doubling here is the other half of timing a request from its arrival.
     // A view change hands the incoming primary whatever the last one left

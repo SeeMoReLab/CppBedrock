@@ -527,6 +527,16 @@ void watchedRequestTimers(Fixture& fixture) {
         CHECK(Access::acceptedAt(*batch.nodes[0], after.key) == arrival);
         Access::requestExpiry(*batch.nodes[0], before.generation);
         CHECK_EQ(batch.nodes[0]->currentView(), 0);
+        // The primary never deposes itself from its own request timer, even on a
+        // live, expired watch: backups time the primary.
+        AgentTimeouts tiny; tiny.electionMs = 1;
+        batch.nodes[0]->applyAgentTimeouts(tiny);
+        std::this_thread::sleep_for(3ms);
+        const auto live = *Access::timer(*batch.nodes[0]).watch();
+        CHECK(Access::timer(*batch.nodes[0]).expired(live.generation));
+        Access::requestExpiry(*batch.nodes[0], live.generation);
+        CHECK_EQ(batch.nodes[0]->currentView(), 0);
+        CHECK(!batch.nodes[0]->inViewChange);
         batch.nodes[0]->proposalTick(); batch.flush(); batch.checkExecuted(2);
         CHECK(!Access::timer(*batch.nodes[0]).watch());
 

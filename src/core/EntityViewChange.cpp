@@ -224,6 +224,14 @@ void Entity::onViewChangeMessage(const json& msg) {
         for (const auto& [id, vc] : messages) higher.insert(id);
     }
     if (higher.size() >= static_cast<size_t>(f + 1)) {
+        // A replica that follows f+1 view changes acts as if its own timer had
+        // expired (PBFT), so it takes the same backoff step. Without it the
+        // joiner enters the new view with the base timeout while the replicas
+        // that expired carry the doubled one, and when the new view's first
+        // commit outlasts one timeout it is the joiner that elects again, alone
+        // (parked until the next election) or as f+1 (a second view for all).
+        // Measured 2026-10-14 (runs/2026-10-14-five-machine-models, dg1/dg2).
+        setViewChangeBackoff(viewChangeBackoff_ + 1);
         startViewChange(smallest, "f+1 authenticated replicas requested higher views");
         return;
     }

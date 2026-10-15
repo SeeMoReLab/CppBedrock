@@ -281,8 +281,18 @@ bool Entity::completeSequence(int seq, int path) {
             // change every completion meets it, which would reset the backoff
             // on every view change and leave a storm to run forever. Draining
             // the queue entirely is evidence either way - nothing is starving.
+            //
+            // The evidence is measured against the base timeout, not the
+            // backed-off deadline. After a view change the deadline sits at
+            // T << backoff (seconds away), so a completion that took 2 s would
+            // count as proof that T is adequate; the next watched request,
+            // already older than T, then expired at once and the new leader
+            // deposed itself, one view per leader (2026-10-15, SBFT 5+50 and
+            // 5+150 straggler phases: 66 of 87 extra views).
             const bool inTime = !watchedBefore || !watchedAfter ||
-                                (!watchedBefore->floored && Clock::now() < watchedBefore->deadline);
+                                (!watchedBefore->floored &&
+                                 Clock::now() < watchedBefore->since +
+                                                    std::chrono::milliseconds(std::max(1, viewChangeTimeoutMs.load())));
             if (watchedCompleted && inTime) setViewChangeBackoff(0);
         }
         executeUs_ += static_cast<uint64_t>(nowUs() - executeStart);

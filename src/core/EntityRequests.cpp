@@ -260,40 +260,17 @@ bool Entity::completeSequence(int seq, int path) {
         completed.push_back("seq:" + std::to_string(seq));
         const auto watchedBefore = requestTimer_.watch();
         requestTimer_.complete(completed);
-        // PBFT restores the timeout when the request it was timing executes -
-        // and only if it executed in time. Both halves matter. Resetting on any
-        // execution undoes the backoff while the incoming primary is merely
-        // draining a backlog, and resetting on a late completion is just as
-        // wrong: under a deep backlog every watched entry completes eventually,
-        // far past its deadline, so the backoff oscillates between zero and one
-        // and never grows enough to outlast the backlog. A replica then keeps
-        // electing after the fault that caused the backlog is long gone.
-        //
-        // Completing before the deadline is the only evidence that the current
-        // timeout is adequate, which is exactly what the backoff exists to
-        // find. The watch is re-selected, and its generation therefore changes,
-        // when the entry being timed completes.
+        // PBFT restores the timeout once the replica executes in the new view:
+        // the doubling only carries a replica through a view change that does
+        // not complete. Here the trigger is the execution of the request being
+        // timed, outside a view change, and it resets unconditionally. The watch
+        // is re-selected, and its generation therefore changes, when the entry
+        // being timed completes.
         if (executed && !inViewChange) {
             const auto watchedAfter = requestTimer_.watch();
             const bool watchedCompleted = !watchedBefore || !watchedAfter ||
                                           watchedAfter->generation != watchedBefore->generation;
-            // A floored deadline was granted, not earned: right after a view
-            // change every completion meets it, which would reset the backoff
-            // on every view change and leave a storm to run forever. Draining
-            // the queue entirely is evidence either way - nothing is starving.
-            //
-            // The evidence is measured against the base timeout, not the
-            // backed-off deadline. After a view change the deadline sits at
-            // T << backoff (seconds away), so a completion that took 2 s would
-            // count as proof that T is adequate; the next watched request,
-            // already older than T, then expired at once and the new leader
-            // deposed itself, one view per leader (2026-10-15, SBFT 5+50 and
-            // 5+150 straggler phases: 66 of 87 extra views).
-            const bool inTime = !watchedBefore || !watchedAfter ||
-                                (!watchedBefore->floored &&
-                                 Clock::now() < watchedBefore->since +
-                                                    std::chrono::milliseconds(std::max(1, viewChangeTimeoutMs.load())));
-            if (watchedCompleted && inTime) setViewChangeBackoff(0);
+            if (watchedCompleted) setViewChangeBackoff(0);
         }
         executeUs_ += static_cast<uint64_t>(nowUs() - executeStart);
         markOperationProcessed(seq, path, executed, batch.requests_size());

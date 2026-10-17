@@ -123,8 +123,10 @@ void floorMovesOnceWhenItsBacklogDrains() {
     CHECK(timer.track("b", queued));
     CHECK(timer.track("c", queued + 1ms));
     std::this_thread::sleep_for(250ms);
+    CHECK(timer.floor() == installed);
     const auto drained = Clock::now();
     timer.complete("a");
+    CHECK(timer.floor() >= drained);
     CHECK_EQ(timer.watch()->key, std::string("b"));
     CHECK(timer.watch()->floored);
     CHECK(timer.watch()->since >= drained);

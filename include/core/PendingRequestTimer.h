@@ -69,6 +69,7 @@ public:
     // inherited request one timeout instead of owing the whole backlog by one
     // deadline.
     void setFloor(Clock::time_point floor);
+    Clock::time_point floor() const;
     // PBFT doubles the timeout each time a replica starts a view change and
     // restores it when the request it was timing executes. Without that, every
     // view change hands the incoming primary the backlog the last one left and

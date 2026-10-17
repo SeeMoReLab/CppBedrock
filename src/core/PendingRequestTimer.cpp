@@ -153,6 +153,11 @@ void PendingRequestTimer::setFloor(Clock::time_point floor) {
     cv_.notify_all();
 }
 
+PendingRequestTimer::Clock::time_point PendingRequestTimer::floor() const {
+    std::lock_guard<std::mutex> lk(mtx_);
+    return floor_;
+}
+
 void PendingRequestTimer::timeoutChanged() {
     {
         std::lock_guard<std::mutex> lk(mtx_);

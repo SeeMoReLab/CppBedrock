@@ -227,6 +227,7 @@ bool Entity::completeSequence(int seq, int path) {
         // whole batch. Per-request replies cost a condition-variable wake each,
         // which at thousands of requests per batch dominates execution.
         std::unordered_map<std::string, std::vector<bedrock::ClientReply>> replies;
+        Clock::time_point newestArrival{};
         const int view = currentView();
         const int leader = currentLeader();
         {
@@ -241,6 +242,7 @@ bool Entity::completeSequence(int seq, int path) {
                 }
                 auto pending = pendingRequests_.find(key);
                 if (pending != pendingRequests_.end()) {
+                    newestArrival = std::max(newestArrival, pending->second.acceptedAt);
                     pendingBytes_ -= pending->second.bytes;
                     pendingRequests_.erase(pending);
                 }
@@ -258,27 +260,18 @@ bool Entity::completeSequence(int seq, int path) {
         for (auto& [clientId, queue] : replies)
             repliesSent_.fetch_add(clientStreams_.reply(clientId, queue));
         completed.push_back("seq:" + std::to_string(seq));
-        const auto watchedBefore = requestTimer_.watch();
         requestTimer_.complete(completed);
-        // PBFT restores the timeout once the replica executes in the new view:
-        // the doubling only carries a replica through a view change that does
-        // not complete. Here the trigger is the execution of the request being
-        // timed, outside a view change, and it resets unconditionally. The watch
-        // is re-selected, and its generation therefore changes, when the entry
-        // being timed completes.
-        // A request that arrived before the floor was inherited with the backlog
-        // the view change left; only one that arrived after it shows the new
-        // leader ordering its own requests.
-        if (executed && !inViewChange) {
-            const auto watchedAfter = requestTimer_.watch();
-            const bool watchedCompleted = watchedBefore && (!watchedAfter ||
-                                          watchedAfter->generation != watchedBefore->generation);
-            if (watchedCompleted && !watchedBefore->floored) {
-                // What is still pending queued behind that backlog; it gets a fresh
-                // timeout per head, as the backlog at the install did.
-                if (viewChangeBackoff_ > 0) requestTimer_.setFloor(std::chrono::steady_clock::now());
-                setViewChangeBackoff(0);
-            }
+        // PBFT restores the timeout once a request executes in the new view: the
+        // doubling only carries a replica through a view change that does not
+        // complete. A request that arrived before the floor was inherited with the
+        // backlog the view change left, so the trigger is the execution of one that
+        // arrived after it - any such request, not only the one being timed, which
+        // on a backup is often one the leader shed and that never executes.
+        if (executed && !inViewChange && newestArrival >= requestTimer_.floor()) {
+            // What is still pending queued behind that backlog; it gets a fresh
+            // timeout per head, as the backlog at the install did.
+            if (viewChangeBackoff_ > 0) requestTimer_.setFloor(Clock::now());
+            setViewChangeBackoff(0);
         }
         executeUs_ += static_cast<uint64_t>(nowUs() - executeStart);
         markOperationProcessed(seq, path, executed, batch.requests_size());

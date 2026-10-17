@@ -497,6 +497,13 @@ void Entity::learnCommitted(const json& proof, int path) {
     committedProofs_[seq] = proof;
     if (seq <= lastExecuted_) return;
     if (bedrock::carriesBody(env)) { batchIndex_[seq] = p; rememberBody(p); }
+    else if (auto stale = batchIndex_.find(seq);
+             stale != batchIndex_.end() && bedrock::requestDigest(stale->second) != env.digest()) {
+        // A body left from another view names a different batch than the one
+        // certified (a deposed leader keeps its own unprepared proposal); drop
+        // it, as acceptProposal does, so execution fetches the certified bytes.
+        batchIndex_.erase(stale);
+    }
     {
         std::lock_guard<std::mutex> lock(phaseTsMtx);
         phaseTs_commit.emplace(seq, nowUs());

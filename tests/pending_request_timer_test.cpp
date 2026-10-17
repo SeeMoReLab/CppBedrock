@@ -109,6 +109,38 @@ void inheritedBacklogDrainsOneTimeoutPerRequest() {
     CHECK(timer.expired(timer.watch()->generation, Clock::now()));
 }
 
+void floorMovesOnceWhenItsBacklogDrains() {
+    // Requests that arrive while the inherited backlog drains wait behind it, not
+    // behind the primary, so when the last floored request completes the floor
+    // moves to that moment: each of them is timed from when it becomes the head.
+    std::atomic<int> timeout{200};
+    PendingRequestTimer timer(timeout, [](auto) {});
+    const auto old = Clock::now() - 10s;
+    timer.reset({{"a", old}});
+    const auto installed = Clock::now();
+    timer.setFloor(installed);
+    const auto queued = installed + 1ms;  // arrived during the drain, over 200 ms ago once a completes
+    CHECK(timer.track("b", queued));
+    CHECK(timer.track("c", queued + 1ms));
+    std::this_thread::sleep_for(250ms);
+    const auto drained = Clock::now();
+    timer.complete("a");
+    CHECK_EQ(timer.watch()->key, std::string("b"));
+    CHECK(timer.watch()->floored);
+    CHECK(timer.watch()->since >= drained);
+    CHECK(!timer.expired(timer.watch()->generation, Clock::now()));
+    // The floor moves only once: a request arriving after the moved floor is
+    // timed from its arrival when its turn comes, so a primary that is itself
+    // late is still caught.
+    const auto afterMove = Clock::now();
+    CHECK(timer.track("d", afterMove));
+    timer.complete("b");
+    timer.complete("c");
+    CHECK_EQ(timer.watch()->key, std::string("d"));
+    CHECK(!timer.watch()->floored);
+    CHECK(timer.watch()->deadline == afterMove + 200ms);
+}
+
 void backoffScalesTheDeadlineAndRearms() {
     std::atomic<int> timeout{200};
     PendingRequestTimer timer(timeout, [](auto) {});
@@ -263,6 +295,7 @@ int main() {
     watchedRequestIsTimedFromItsArrival();
     viewFloorGivesTheNewPrimaryAFullTimeout();
     inheritedBacklogDrainsOneTimeoutPerRequest();
+    floorMovesOnceWhenItsBacklogDrains();
     backoffScalesTheDeadlineAndRearms();
     backoffSaturatesRatherThanGrowingWithoutBound();
     batchCompletesAtomically();

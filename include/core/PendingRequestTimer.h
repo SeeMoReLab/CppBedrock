@@ -103,6 +103,8 @@ private:
     Clock::time_point watchedArrival_{};
     Clock::time_point watchedSince_{};
     Clock::time_point floor_{Clock::time_point::min()};
+    // Set by setFloor; the floor then moves once, to when its backlog has drained.
+    bool extendFloor_{false};
     unsigned backoff_{0};
     std::uint64_t generation_{0};
     bool running_{false};

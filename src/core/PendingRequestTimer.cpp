@@ -32,10 +32,18 @@ void PendingRequestTimer::stop() {
 
 void PendingRequestTimer::selectWatchLocked() {
     ++generation_;
+    const bool previousFloored = watchedKey_ && watchedArrival_ < floor_;
     watchedKey_.reset();
     if (byTime_.empty()) return;
     watchedKey_ = byTime_.begin()->second;
     watchedArrival_ = byTime_.begin()->first;
+    // Requests that arrived while the floored backlog drained waited behind it,
+    // not behind the primary, so when that backlog clears the floor moves once
+    // to that moment. Later arrivals are timed from arrival again.
+    if (extendFloor_ && previousFloored && watchedArrival_ >= floor_) {
+        floor_ = Clock::now();
+        extendFloor_ = false;
+    }
     // PBFT times a request from when the replica received it, not from when the
     // previous one finished. Dating the watch to now would hand each request a
     // full fresh timeout however long it had already been waiting, so a leader
@@ -139,6 +147,7 @@ void PendingRequestTimer::setFloor(Clock::time_point floor) {
     {
         std::lock_guard<std::mutex> lk(mtx_);
         floor_ = floor;
+        extendFloor_ = true;
         ++generation_;
     }
     cv_.notify_all();

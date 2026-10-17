@@ -266,11 +266,19 @@ bool Entity::completeSequence(int seq, int path) {
         // timed, outside a view change, and it resets unconditionally. The watch
         // is re-selected, and its generation therefore changes, when the entry
         // being timed completes.
+        // A request that arrived before the floor was inherited with the backlog
+        // the view change left; only one that arrived after it shows the new
+        // leader ordering its own requests.
         if (executed && !inViewChange) {
             const auto watchedAfter = requestTimer_.watch();
-            const bool watchedCompleted = !watchedBefore || !watchedAfter ||
-                                          watchedAfter->generation != watchedBefore->generation;
-            if (watchedCompleted) setViewChangeBackoff(0);
+            const bool watchedCompleted = watchedBefore && (!watchedAfter ||
+                                          watchedAfter->generation != watchedBefore->generation);
+            if (watchedCompleted && !watchedBefore->floored) {
+                // What is still pending queued behind that backlog; it gets a fresh
+                // timeout per head, as the backlog at the install did.
+                if (viewChangeBackoff_ > 0) requestTimer_.setFloor(std::chrono::steady_clock::now());
+                setViewChangeBackoff(0);
+            }
         }
         executeUs_ += static_cast<uint64_t>(nowUs() - executeStart);
         markOperationProcessed(seq, path, executed, batch.requests_size());

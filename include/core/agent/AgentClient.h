@@ -21,6 +21,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -184,8 +185,6 @@ private:
         std::vector<long long> interCommitGapsUs;
         bool hasLastCommit{false};
         std::chrono::steady_clock::time_point lastCommitTime{};
-        uint32_t viewChanges{0};
-        uint32_t noProgressViewChanges{0};
         uint32_t newViews{0};
         uint32_t fastPath{0};
         uint32_t slowPath{0};
@@ -201,6 +200,10 @@ private:
     // Sleeps until the deadline; returns false when stop() was requested.
     bool waitUntil(std::chrono::steady_clock::time_point deadline);
     void sendReport(uint32_t episode);
+    // Sets the snapshot's view-change counts to those of the last episode period
+    // before `end` (caller holds mtx_).
+    void countRecentViewChanges(AgentMetricsSnapshot& snap,
+                                std::chrono::steady_clock::time_point end);
     void pollForTimeout(uint32_t episode);
     void startPolling(uint32_t episode);
     void stopPolling();
@@ -230,6 +233,11 @@ private:
     uint32_t episodeStartTick_{0};
     uint32_t lastSequence_{0};
     uint64_t commitsSinceViewChange_{0};
+    // Every view change with whether it came with no commit since the previous one,
+    // whatever the stage, for the counts over the last episode (2026-10-19: a hold
+    // re-pin lands on the episode grid, in the warm-up between the windows, and a
+    // window-only count missed every one of those depositions).
+    std::deque<std::pair<std::chrono::steady_clock::time_point, bool>> viewChangeTimes_;
     AgentTimeouts currentTimeouts_{};
     AgentTimeouts lastTimeouts_{};  // timeouts active during the reward window
     bool decisionReady_{false};

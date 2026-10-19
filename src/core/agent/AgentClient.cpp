@@ -228,8 +228,6 @@ void AgentClient::MetricsWindow::reset(std::chrono::steady_clock::time_point sta
     phase3Us.clear();
     interCommitGapsUs.clear();
     hasLastCommit = false;
-    viewChanges = 0;
-    noProgressViewChanges = 0;
     newViews = 0;
     fastPath = 0;
     slowPath = 0;
@@ -244,8 +242,7 @@ AgentMetricsSnapshot AgentClient::MetricsWindow::snapshot(
     s.totalTransactions = transactions;
     s.totalConsensus = static_cast<uint32_t>(batchSizes.size());
     s.batchSize = windowStats(batchSizes, 1.0);
-    s.viewChangeCount = viewChanges;
-    s.noProgressViewChangeCount = noProgressViewChanges;
+    // viewChangeCount / noProgressViewChangeCount: AgentClient::countRecentViewChanges.
     s.leaderChangeCount = newViews;
     s.regencyChangeCount = newViews;
     s.fastPathCount = fastPath;
@@ -363,10 +360,33 @@ void AgentClient::recordViewChange() {
     std::lock_guard<std::mutex> lk(mtx_);
     const bool noProgress = commitsSinceViewChange_ == 0;
     commitsSinceViewChange_ = 0;
-    if (stage_ == Stage::Feature || stage_ == Stage::Reward) {
-        ++metrics_.viewChanges;
-        if (noProgress) ++metrics_.noProgressViewChanges;
+    // Counted over the last episode at each report (countRecentViewChanges), not
+    // per window, so one landing between the windows is not lost.
+    const auto now = std::chrono::steady_clock::now();
+    viewChangeTimes_.emplace_back(now, noProgress);
+    const auto period = std::chrono::milliseconds(config_.featureDurationMs + config_.replyWaitMs +
+                                                  config_.warmupDurationMs + config_.rewardDurationMs);
+    while (!viewChangeTimes_.empty() && viewChangeTimes_.front().first < now - 2 * period) {
+        viewChangeTimes_.pop_front();
     }
+}
+
+void AgentClient::countRecentViewChanges(AgentMetricsSnapshot& snap,
+                                         std::chrono::steady_clock::time_point end) {
+    // The view changes of the episode period (feature + reply wait + warm-up + reward)
+    // ending at `end`, as the simulators count them: a window report's count covers the
+    // whole episode, the warm-up where the new timeout is applied included.
+    const auto period = std::chrono::milliseconds(config_.featureDurationMs + config_.replyWaitMs +
+                                                  config_.warmupDurationMs + config_.rewardDurationMs);
+    uint32_t all = 0, noProgress = 0;
+    for (const auto& [at, stalled] : viewChangeTimes_) {
+        if (at > end - period && at <= end) {
+            ++all;
+            if (stalled) ++noProgress;
+        }
+    }
+    snap.viewChangeCount = all;
+    snap.noProgressViewChangeCount = noProgress;
 }
 
 void AgentClient::recordNewView() {
@@ -538,7 +558,9 @@ void AgentClient::run() {
         if (!waitUntil(rewardEnd)) return;
         {
             std::lock_guard<std::mutex> lk(mtx_);
-            AgentMetricsSnapshot snap = metrics_.snapshot(std::chrono::steady_clock::now());
+            const auto snapEnd = std::chrono::steady_clock::now();
+            AgentMetricsSnapshot snap = metrics_.snapshot(snapEnd);
+            countRecentViewChanges(snap, snapEnd);
             // An overrun leaves a near-empty reward window; sending it would
             // score as a stall, so it is dropped.
             if (!overran) {
@@ -581,7 +603,9 @@ void AgentClient::sendReport(uint32_t episode) {
     ReportLocal report;
     {
         std::lock_guard<std::mutex> lk(mtx_);
-        AgentMetricsSnapshot snap = metrics_.snapshot(std::chrono::steady_clock::now());
+        const auto snapEnd = std::chrono::steady_clock::now();
+        AgentMetricsSnapshot snap = metrics_.snapshot(snapEnd);
+        countRecentViewChanges(snap, snapEnd);
         report.set_node_id((uint32_t)config_.nodeId);
         report.set_episode(episode);
         report.set_protocol(adapter_->protocol());

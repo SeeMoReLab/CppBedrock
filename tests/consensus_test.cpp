@@ -461,18 +461,23 @@ void broadcastAdmission(Fixture& fixture) {
     for (const std::string protocol : {"PBFT", "SBFT"}) {
         Network net(fixture, protocol, 4, [](auto& options) {
             options.batchMaxRequests = 1;
-            options.maxPendingRequests = 1;
-            // Long enough that the watchdog stays out of the way: relaying is
-            // timed by the maintenance interval, not by the election timeout,
-            // so this test waits out the former and must not trip the latter.
+            // The leader's pool holds one request and each backup's two: the
+            // client broadcasts, so a backup can hold a request the leader shed.
+            options.maxPendingRequests = options.nodeId == 0 ? 1 : 2;
             options.initialElectionTimeoutMs = 60000;
         });
-        net.request(1, false, false); // Fill the leader, leaving backup pools empty.
+        net.request(1, true, false);  // Fills the leader; every backup holds it too.
         net.request(2, true, false);  // Leader rejects; every backup accepts.
         CHECK_EQ(net.nodes[0]->pendingRequestCount(), 1u);
-        std::this_thread::sleep_for(std::chrono::milliseconds(bedrock::kMaintenanceIntervalMs + 1));
-        for (int id = 1; id < 4; ++id) net.nodes[id]->proposalTick();
-        net.flush();
+        for (int id = 1; id < 4; ++id) CHECK_EQ(net.nodes[id]->pendingRequestCount(), 2u);
+        // Request 1 executes and request 2 becomes each backup's head, but the
+        // leader has not ordered past it yet, so no backup relays it.
+        net.nodes[0]->proposalTick(); net.flush(); net.checkExecuted(1);
+        CHECK(Access::forwarded(*net.nodes[0]).empty());
+        // Request 3 arrives everywhere and executes: the leader has ordered a
+        // later arrival past request 2, so every backup relays it, once.
+        net.request(3, true, false);
+        net.nodes[0]->proposalTick(); net.flush(); net.checkExecuted(2);
         CHECK_EQ(Access::forwarded(*net.nodes[0]).size(), 3u);
         Packet relay;
         for (const auto& packet : net.history)
@@ -495,14 +500,13 @@ void broadcastAdmission(Fixture& fixture) {
         CHECK(Access::forwarded(*invalid.nodes[0]).empty());
         net.deliver(relay); // One reserved batch per sender, including retransmissions.
         CHECK_EQ(Access::forwarded(*net.nodes[0]).size(), 3u);
-        CHECK_EQ(net.nodes[0]->pendingRequestCount(), 1u); // Does not enlarge normal admission.
-        net.nodes[0]->proposalTick(); net.flush(); net.checkExecuted(1);
-        net.request(3, false, false); // Keep normal ingress busy.
-        net.nodes[0]->proposalTick(); net.flush(); net.checkExecuted(2);
-        for (int id = 1; id < 4; ++id) CHECK(!Access::timer(*net.nodes[id]).watch());
+        CHECK_EQ(net.nodes[0]->pendingRequestCount(), 0u); // Does not enlarge normal admission.
+        net.request(4, false, false); // Keep normal ingress busy.
         net.nodes[0]->proposalTick(); net.flush(); net.checkExecuted(3);
-        for (const auto& node : net.nodes) CHECK_EQ(node->balances.at("a"), 97);
-        net.nodes[0]->proposalTick(); net.flush(); net.checkExecuted(3); // Relay copies cannot duplicate execution.
+        net.nodes[0]->proposalTick(); net.flush(); net.checkExecuted(4);
+        for (int id = 1; id < 4; ++id) CHECK(!Access::timer(*net.nodes[id]).watch());
+        for (const auto& node : net.nodes) CHECK_EQ(node->balances.at("a"), 96);
+        net.nodes[0]->proposalTick(); net.flush(); net.checkExecuted(4); // Relay copies cannot duplicate execution.
         net.changeView(1);
         auto old = json::parse(relay.control);
         // Replay the old-view relay to the new leader with a valid signature.
@@ -542,32 +546,53 @@ void watchedRequestTimers(Fixture& fixture) {
 
         // Only replica 3 knows this request, so the leader never proposes it.
         // That is what a request lost to admission shedding looks like from a
-        // follower, and electing cannot serve it, so execution elsewhere
-        // re-dates the watch to the last executed sequence. Only a window with
-        // no execution in it at all is a stalled leader, and elects.
-        Network skipped(fixture, protocol);
+        // follower, and electing cannot serve it. Once a batch of later arrivals
+        // has executed, the follower relays it to the leader and times it from
+        // the relay, as PBFT's backup relays what it received from the client;
+        // the leader orders it in its next batch, and the watch moves on when
+        // it executes.
         const json request{{"type", "Request"}, {"client_id", "ignored"}, {"request_id", 1},
             {"operation", "transfer"}, {"timestamp", "1"},
             {"transaction", {{"from", "a"}, {"to", "b"}, {"amount", 1}}}};
+        Network served(fixture, protocol);
+        auto& backup = *served.nodes[3];
+        backup.processJsonFromGrpc(request.dump());
+        served.request(1); served.flush(); served.checkExecuted(1);
+        size_t forwarded = 0;
+        for (const auto& packet : served.history) if (packet.from == 3 && packet.type() == "ForwardRequests") ++forwarded;
+        CHECK_EQ(forwarded, 1u);
+        CHECK_EQ(Access::timer(backup).watch()->key, std::string("ignored/1"));
+        served.nodes[0]->proposalTick(); served.flush(); served.checkExecuted(2);
+        CHECK(!Access::timer(backup).watch());
+
+        // The relay is sent once per view and the relayed request's deadline
+        // then stands: further executions past it neither relay it again nor
+        // move its deadline, so a leader that does not order it within one
+        // timeout of the relay is suspected, whether it is late or never got it.
+        Network skipped(fixture, protocol);
         auto& follower = *skipped.nodes[3];
         follower.processJsonFromGrpc(request.dump());
         auto watched = *Access::timer(follower).watch();
-        skipped.request(1, false); skipped.flush(); skipped.checkExecuted(1);
-        CHECK(Access::timer(follower).watch()->deadline == watched.deadline);
-        CHECK_EQ(Access::timer(follower).watch()->generation, watched.generation);
+        size_t relays = 0;
+        skipped.drop = [&](const Packet& packet) {
+            if (packet.from != 3 || packet.type() != "ForwardRequests") return false;
+            ++relays; return true;
+        };
+        skipped.request(1); skipped.flush(); skipped.checkExecuted(1);
+        CHECK_EQ(relays, 1u);
+        CHECK_EQ(Access::timer(follower).watch()->key, std::string("ignored/1"));
+        CHECK(Access::timer(follower).watch()->generation != watched.generation);
+        const auto relayed = *Access::timer(follower).watch();
+        skipped.request(2); skipped.flush(); skipped.checkExecuted(2);
+        CHECK_EQ(relays, 1u);
+        CHECK_EQ(Access::timer(follower).watch()->key, std::string("ignored/1"));
+        CHECK(Access::timer(follower).watch()->deadline == relayed.deadline);
+        CHECK_EQ(Access::timer(follower).watch()->generation, relayed.generation);
         AgentTimeouts shorter; shorter.electionMs = 1;
         follower.applyAgentTimeouts(shorter);
         std::this_thread::sleep_for(3ms);
-        // Sequence 1 executed inside this window, so the watch keeps its key
-        // and is re-dated to that execution rather than calling a view change.
-        Access::requestExpiry(follower, Access::timer(follower).watch()->generation);
-        CHECK_EQ(follower.currentView(), 0);
-        CHECK_EQ(Access::timer(follower).watch()->key, std::string("ignored/1"));
-        CHECK(Access::timer(follower).watch()->generation != watched.generation);
-        // Nothing has executed since, so this window is a real stall. Alone,
-        // the replica only suspects the leader: it stays in the view with its
-        // watch re-armed and tells the others, and one suspicion moves no one.
-        std::this_thread::sleep_for(3ms);
+        // Alone, the replica only suspects the leader: it stays in the view with
+        // its watch re-armed and tells the others, and one suspicion moves no one.
         Access::requestExpiry(follower, Access::timer(follower).watch()->generation);
         CHECK_EQ(follower.currentView(), 0);
         CHECK(!follower.inViewChange);

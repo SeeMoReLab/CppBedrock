@@ -20,40 +20,20 @@ int proofView(const json& proof) { return decodeEnvelope(proof.at("proposal")).p
 void Entity::onRequestTimerExpired(std::uint64_t generation) {
     std::lock_guard<std::recursive_mutex> engine(eventMtx);
     if (!running || !pbftCore_ || inViewChange || !requestTimer_.expired(generation)) return;
-    // PBFT stops this timer when the request it is timing executes and restarts
-    // it while others are still pending. That rests on the primary being obliged
-    // to order every request a backup holds. This engine admits into a bounded
-    // pool and each replica sheds on its own occupancy, so the leader can drop a
-    // request a backup accepted: it is never proposed, never executes, and never
-    // leaves this replica's queue, sitting at the head of the watch order and
-    // being handed a fresh timeout forever until one elapses and a replica
-    // executing in lockstep with the quorum calls a view change nobody joins.
-    //
-    // Restarting on any execution would answer that, but it asks a different
-    // question than PBFT does - whether the replica is executing at all, rather
-    // than whether this request is starving - and a leader that orders every
-    // request late is then never replaced at any timeout, which is precisely
-    // the fault the election timeout exists to escape.
-    //
-    // Arrival order separates the two. A shed request is one execution has
-    // overtaken: batches made entirely of later arrivals keep executing while it
-    // waits, and no view change can help because the next leader sheds it too.
-    // A leader merely slow starves the oldest request while everything executing
-    // arrived earlier still, and electing does help. So restart the timer only
-    // on execution that has passed this request by; otherwise let the deadline
-    // stand. A leader that has stopped executes nothing and is caught either way.
-    // Both conditions must hold to suppress the view change. Execution that has
-    // stopped is a stalled leader whatever sits at the head of the watch, and a
-    // replica that declined to elect there would wait out a dead leader forever.
-    if (const auto watch = requestTimer_.watch(); watch && lastConsensusProgress_ > watch->since) {
-        const auto watched = pendingRequests_.find(watch->key);
-        const bool overtaken = watched == pendingRequests_.end() ||
-                               lastExecutedArrivalUs_.load() > watched->second.arrivalUs;
-        if (overtaken) {
-            requestTimer_.rearm(lastConsensusProgress_);
-            return;
-        }
-    }
+    // PBFT's timer: the oldest request this replica still holds is watched from
+    // its arrival and the watch moves only when it executes (completeSequence),
+    // so the primary owes one timeout per request. The client broadcasts and
+    // each replica sheds on its own occupancy, so a backup can hold a request
+    // the primary never admitted; once execution has passed such a request by
+    // the backup relays it and times it from the relay (relaySkippedHead), as
+    // PBFT's backup relays what it received from the client. Nothing else moves
+    // the deadline: re-arming on any execution past the watched request
+    // (03708eb, 8157c1a, until 2026-10-20) excused it for as long as anything
+    // executed, which after an overflow left every follower blind to a leader
+    // that ordered everything late (PBFT T 800 under a 750 ms hold, restart S1:
+    // the phase fell from +0.89 to +0.14). An expiry therefore means the primary
+    // has had the request for a timeout without ordering it, whether it is slow,
+    // censoring, or gone.
     suspectLeader();
 }
 
@@ -192,8 +172,6 @@ void Entity::startViewChange(int newView, const std::string& reason) {
     if (agentClient_) agentClient_->recordViewChange();
     cancelViewChangeWait();
     forwardedRequests_.clear();
-    lastRequestForward_ = Clock::time_point{};
-    lastForwardedKey_.clear();
     cancelDelayedProposals();
     json prepared = json::array(), fastVotes = json::array(), committed = json::array();
     for (const auto& [seq, proof] : preparedProofs_) if (seq > stableCheckpoint_ && !committedProofs_.count(seq)) prepared.push_back(proof);
@@ -446,8 +424,6 @@ void Entity::finishNewView(const json& msg) {
     suspects_.clear();
     cancelViewChangeWait();
     forwardedRequests_.clear();
-    lastRequestForward_ = Clock::time_point{};
-    lastForwardedKey_.clear();
     lastNewView_ = msg;
     pendingNewView_ = json();
     cancelDelayedProposals();

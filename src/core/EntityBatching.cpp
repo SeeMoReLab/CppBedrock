@@ -100,7 +100,6 @@ void Entity::proposalTick() {
     // Followers do not need an ordering queue. Rebuild it upon leadership.
     if (!isCurrentLeader()) {
         proposalQueue_.clear();
-        if (!inViewChange) forwardPendingRequests();
         return;
     }
     if (!inViewChange) proposeBatch();
@@ -201,65 +200,39 @@ void Entity::rebuildProposalQueue() {
     for (const auto& [time, key] : order) proposalQueue_.push_back(key);
 }
 
-void Entity::forwardPendingRequests() {
+void Entity::relaySkippedHead(Clock::time_point executedOldest) {
+    // PBFT has a backup relay a request it received from the client to the
+    // primary, which must then order it, and the backup's timer holds it to
+    // that. Relaying on receipt would send the primary every request three more
+    // times: the client broadcasts, so it almost always holds them already, and
+    // a relay of a whole batch from each backup queued votes and view changes
+    // behind 8 MB of JSON (runs/2026-10-12-sbft-margins). So a backup relays
+    // only the request its timer is on, and only once it has evidence the
+    // primary does not have it: a batch executed whose oldest request arrived
+    // later, which a primary proposing in arrival order never does for a request
+    // it holds (each replica sheds on its own occupancy, so the primary can drop
+    // one a backup accepted). The request is relayed once per view, since a later
+    // primary may lack it too, and its clock restarts at the relay, because the
+    // primary cannot be blamed before it had the request. Nothing else moves the
+    // clock, so a primary that orders everything late is still replaced. One
+    // that has stopped executes nothing, gives no such evidence, and is caught by
+    // the deadline alone; one that is idle but shed a backup's request is not
+    // told of it until it orders something newer.
+    if (isCurrentLeader() || inViewChange) return;
     const auto watch = requestTimer_.watch();
     if (!watch) return;
     const auto watched = pendingRequests_.find(watch->key);
-    if (watched == pendingRequests_.end()) return;
-    // Relaying is a liveness measure against a leader that never received a
-    // request, not a data path: the client broadcasts, so the leader almost
-    // always holds it already. A proposal that carries the watched request
-    // settles the question outright - it is waiting its turn, and phase
-    // retransmission and certified recovery cover it from here.
-    if (watched->second.proposedInView == currentView()) return;
-    const auto now = Clock::now();
-    // Otherwise wait for execution to have stalled, and relay a given watched
-    // entry once, retrying only if it stays stuck. Relaying on every tick
-    // sends a batch several times a second to a leader that is already
-    // behind, which is how a slow leader becomes a stopped one.
-    //
-    // These deadlines are deliberately not derived from the election timeout.
-    // That timeout is the quantity the learning agent varies, and keying relay
-    // aggressiveness to it makes one action change two things at once, so the
-    // effect of the timeout alone stops being identifiable. The maintenance
-    // interval is the engine's existing answer to "how long may execution
-    // stall before a replica acts", and the retransmission gate already uses
-    // it for the same judgement.
-    const auto grace = std::chrono::milliseconds(bedrock::kMaintenanceIntervalMs);
-    if (now - watch->since < grace) return;
-    // Relay only once execution has stalled, as the comment above intends: a slowed leader that keeps
-    // committing has every request already (the client broadcasts), and relaying the whole backlog after
-    // each commit is what stops it (runs/2026-10-11-recal512, R4).
-    if (now - lastConsensusProgress_ < grace) return;
-    const auto retry = std::chrono::milliseconds(2 * bedrock::kMaintenanceIntervalMs);
-    if (watch->key == lastForwardedKey_ && lastRequestForward_ != Clock::time_point{} &&
-        now - lastRequestForward_ < retry) return;
+    if (watched == pendingRequests_.end()) return;  // a sequence key: nothing to relay
+    auto& request = watched->second;
+    if (request.acceptedAt >= executedOldest) return;  // not passed by: it waits its turn
+    if (request.proposedInView == currentView() || request.relayedInView == currentView()) return;
+    request.relayedInView = currentView();
     bedrock::ProtocolEnvelope payload;
-    auto* batch = payload.mutable_pre_prepare();
-    size_t bytes = 0;
-    // Only the watched request. The client broadcasts, so the leader almost always
-    // holds the rest already; relaying a whole batch behind it (8192 requests,
-    // 8 MB as JSON, from each backup at once) landed 1.9-7.5 s later on a stream
-    // that had not yet carried bulk data, and the votes and view-change messages
-    // queued behind it (runs/2026-10-12-sbft-margins: the trigger of every
-    // 1200/150 storm in p3 and 1.7-3.9 s of late view installs at 550).
-    for (const auto& key : requestTimer_.oldestKeys(1)) {
-        const auto found = pendingRequests_.find(key);
-        if (found == pendingRequests_.end() || found->second.proposedInView == currentView()) continue;
-        if (bytes + found->second.bytes > static_cast<size_t>(options_.batchMaxBytes) ||
-            batch->requests_size() >= options_.batchMaxRequests) break;
-        *batch->add_requests() = found->second.wire;
-        bytes += found->second.bytes;
-    }
-    if (batch->requests().empty()) return;
-    lastRequestForward_ = now;
-    lastForwardedKey_ = watch->key;
+    *payload.mutable_pre_prepare()->add_requests() = request.wire;
     ++relaysSent_;
-    LOG_DEBUG("relaying " << batch->requests_size() << " pending requests to leader " << currentLeader()
-              << " (watched " << watch->key << " for "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(now - watch->since).count() << " ms)");
     sendTo(currentLeader(), Message(signControl(nlohmann::json{{"type", "ForwardRequests"},
         {"view", currentView()}, {"requests", bedrock::encodeEnvelope(payload)}}).dump()));
+    requestTimer_.rearm(Clock::now());
 }
 
 void Entity::acceptForwardedRequests(const nlohmann::json& message) {

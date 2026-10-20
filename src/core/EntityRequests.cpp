@@ -228,6 +228,7 @@ bool Entity::completeSequence(int seq, int path) {
         // which at thousands of requests per batch dominates execution.
         std::unordered_map<std::string, std::vector<bedrock::ClientReply>> replies;
         Clock::time_point newestArrival{};
+        Clock::time_point oldestHeld = Clock::time_point::max();
         const int view = currentView();
         const int leader = currentLeader();
         {
@@ -243,6 +244,7 @@ bool Entity::completeSequence(int seq, int path) {
                 auto pending = pendingRequests_.find(key);
                 if (pending != pendingRequests_.end()) {
                     newestArrival = std::max(newestArrival, pending->second.acceptedAt);
+                    oldestHeld = std::min(oldestHeld, pending->second.acceptedAt);
                     pendingBytes_ -= pending->second.bytes;
                     pendingRequests_.erase(pending);
                 }
@@ -273,6 +275,10 @@ bool Entity::completeSequence(int seq, int path) {
             if (viewChangeBackoff_ > 0) requestTimer_.setFloor(Clock::now());
             setViewChangeBackoff(0);
         }
+        // Of this batch, the oldest request this replica itself admitted: the
+        // evidence that the primary has passed the watched head by. A batch this
+        // replica holds nothing of says nothing about the order it was admitted in.
+        if (oldestHeld != Clock::time_point::max()) relaySkippedHead(oldestHeld);
         executeUs_ += static_cast<uint64_t>(nowUs() - executeStart);
         markOperationProcessed(seq, path, executed, batch.requests_size());
         return true;

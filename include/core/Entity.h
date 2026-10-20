@@ -403,6 +403,7 @@ private:
         long long arrivalUs{0};
         Clock::time_point acceptedAt{};
         int proposedInView{-1};   // -1: not proposed by this replica yet
+        int relayedInView{-1};    // -1: not relayed to a leader yet (relaySkippedHead)
         bedrock::ClientRequest wire;
         size_t bytes{0};
     };
@@ -518,9 +519,7 @@ private:
     // One bounded relay batch per peer, separate from saturated client ingress.
     std::map<int, std::deque<bedrock::ClientRequest>> forwardedRequests_;
     int nextProposalSource_{0};
-    Clock::time_point lastRequestForward_{};
-    std::string lastForwardedKey_;
-    void forwardPendingRequests();
+    void relaySkippedHead(Clock::time_point executedOldest);
     void acceptForwardedRequests(const nlohmann::json& message);
     std::mutex ingressMtx_;
     std::deque<std::pair<bedrock::ClientRequest, long long>> ingress_;

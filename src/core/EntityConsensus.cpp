@@ -300,6 +300,11 @@ void Entity::acceptProposal(const ProtocolEnvelope& env) {
         auto pending = pendingRequests_.find(requestKey(r.client_id(), r.request_id()));
         if (pending == pendingRequests_.end()) continue;
         pending->second.proposedInView = p.view();
+        // A request the primary passed by (shed at its cap, relayed later) is not
+        // the primary's wait, and the leader dates no batch from a relay either;
+        // dating from it would carry the request's whole age on the backups for as
+        // long as a shed backlog drains (relaySkippedHead).
+        if (pending->second.acceptedAt < passedByUpTo_) continue;
         oldestArrival = std::min(oldestArrival, pending->second.arrivalUs);
     }
     {

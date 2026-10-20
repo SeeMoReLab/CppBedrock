@@ -275,10 +275,14 @@ bool Entity::completeSequence(int seq, int path) {
             if (viewChangeBackoff_ > 0) requestTimer_.setFloor(Clock::now());
             setViewChangeBackoff(0);
         }
-        // Of this batch, the oldest request this replica itself admitted: the
-        // evidence that the primary has passed the watched head by. A batch this
-        // replica holds nothing of says nothing about the order it was admitted in.
-        if (oldestHeld != Clock::time_point::max()) relaySkippedHead(oldestHeld);
+        // Of this batch, the oldest request this replica itself admitted is the
+        // evidence that the primary has passed every older held request by. A batch
+        // this replica holds nothing of says nothing about the order it was admitted
+        // in. The evidence is kept over the view's batches, so a head that becomes
+        // the watch once a passed-by one executes is relayed at once rather than
+        // one batch later with its old deadline, already passed, expiring first.
+        if (oldestHeld != Clock::time_point::max()) passedByUpTo_ = std::max(passedByUpTo_, oldestHeld);
+        if (passedByUpTo_ != Clock::time_point::min()) relaySkippedHead(passedByUpTo_);
         executeUs_ += static_cast<uint64_t>(nowUs() - executeStart);
         markOperationProcessed(seq, path, executed, batch.requests_size());
         return true;

@@ -436,6 +436,8 @@ void batching(Fixture& fixture) {
 struct EntityTimerTestAccess {
     static auto& timer(Entity& node) { return node.requestTimer_; }
     static auto& forwarded(Entity& node) { return node.forwardedRequests_; }
+    static auto arrival(Entity& node, const std::string& key) { return node.pendingRequests_.at(key).arrivalUs; }
+    static auto firstSeen(Entity& node, int seq) { std::lock_guard<std::mutex> lk(node.phaseTsMtx); return node.firstSeenUs.at(seq); }
     static auto waitSince(Entity& node) { return node.viewChangeWaitSince_; }
     static auto waitGeneration(Entity& node) { return node.viewChangeWaitGeneration_; }
     static auto waitDuration(Entity& node) { return node.viewChangeWaitDuration(); }
@@ -564,6 +566,32 @@ void watchedRequestTimers(Fixture& fixture) {
         CHECK_EQ(Access::timer(backup).watch()->key, std::string("ignored/1"));
         served.nodes[0]->proposalTick(); served.flush(); served.checkExecuted(2);
         CHECK(!Access::timer(backup).watch());
+
+        // Two requests only replica 3 holds. The second becomes the head when the
+        // first executes and is relayed at that same execution, not one batch
+        // later with its old deadline already passed; and the batch that served
+        // the first is not dated from it on the backup (the primary had not had
+        // it for all that time, and the leader dates no batch from a relay), so
+        // the backup's latency sample for it agrees with the leader's.
+        Network stranded(fixture, protocol);
+        auto& holder = *stranded.nodes[3];
+        for (int id = 1; id <= 2; ++id) { auto r = request; r["request_id"] = id; holder.processJsonFromGrpc(r.dump()); }
+        const auto firstArrival = Access::arrival(holder, "ignored/1");
+        stranded.request(1); stranded.flush(); stranded.checkExecuted(1);
+        CHECK_EQ(Access::timer(holder).watch()->key, std::string("ignored/1"));
+        stranded.nodes[0]->proposalTick();
+        for (const auto& packet : stranded.queue)
+            if (packet.to == 3 && packet.envelope.has_pre_prepare()) { stranded.deliver(packet); break; }
+        CHECK(Access::firstSeen(holder, 2) > firstArrival);
+        CHECK(std::llabs(Access::firstSeen(holder, 2) - Access::firstSeen(*stranded.nodes[0], 2)) < 1000000);
+        stranded.flush(); stranded.checkExecuted(2);
+        size_t stranding = 0;
+        for (const auto& packet : stranded.history) if (packet.from == 3 && packet.type() == "ForwardRequests") ++stranding;
+        CHECK_EQ(stranding, 2u);
+        CHECK_EQ(Access::timer(holder).watch()->key, std::string("ignored/2"));
+        CHECK(Access::timer(holder).watch()->since > Access::acceptedAt(holder, "ignored/2"));
+        stranded.nodes[0]->proposalTick(); stranded.flush(); stranded.checkExecuted(3);
+        CHECK(!Access::timer(holder).watch());
 
         // The relay is sent once per view and the relayed request's deadline
         // then stands: further executions past it neither relay it again nor

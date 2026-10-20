@@ -200,7 +200,7 @@ void Entity::rebuildProposalQueue() {
     for (const auto& [time, key] : order) proposalQueue_.push_back(key);
 }
 
-void Entity::relaySkippedHead(Clock::time_point executedOldest) {
+void Entity::relaySkippedHead(Clock::time_point passedByUpTo) {
     // PBFT has a backup relay a request it received from the client to the
     // primary, which must then order it, and the backup's timer holds it to
     // that. Relaying on receipt would send the primary every request three more
@@ -208,10 +208,10 @@ void Entity::relaySkippedHead(Clock::time_point executedOldest) {
     // a relay of a whole batch from each backup queued votes and view changes
     // behind 8 MB of JSON (runs/2026-10-12-sbft-margins). So a backup relays
     // only the request its timer is on, and only once it has evidence the
-    // primary does not have it: a batch executed whose oldest request arrived
-    // later, which a primary proposing in arrival order never does for a request
-    // it holds (each replica sheds on its own occupancy, so the primary can drop
-    // one a backup accepted). The request is relayed once per view, since a later
+    // primary does not have it: a batch executed in this view whose oldest
+    // request this backup admitted arrived later, which a primary proposing in
+    // arrival order never does for a request it holds (each replica sheds on
+    // its own occupancy, so the primary can drop one a backup accepted). The request is relayed once per view, since a later
     // primary may lack it too, and its clock restarts at the relay, because the
     // primary cannot be blamed before it had the request. Nothing else moves the
     // clock, so a primary that orders everything late is still replaced. One
@@ -224,7 +224,7 @@ void Entity::relaySkippedHead(Clock::time_point executedOldest) {
     const auto watched = pendingRequests_.find(watch->key);
     if (watched == pendingRequests_.end()) return;  // a sequence key: nothing to relay
     auto& request = watched->second;
-    if (request.acceptedAt >= executedOldest) return;  // not passed by: it waits its turn
+    if (request.acceptedAt >= passedByUpTo) return;  // not passed by: it waits its turn
     if (request.proposedInView == currentView() || request.relayedInView == currentView()) return;
     request.relayedInView = currentView();
     bedrock::ProtocolEnvelope payload;

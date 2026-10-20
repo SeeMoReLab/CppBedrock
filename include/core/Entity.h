@@ -519,7 +519,12 @@ private:
     // One bounded relay batch per peer, separate from saturated client ingress.
     std::map<int, std::deque<bedrock::ClientRequest>> forwardedRequests_;
     int nextProposalSource_{0};
-    void relaySkippedHead(Clock::time_point executedOldest);
+    void relaySkippedHead(Clock::time_point passedByUpTo);
+    // Newest evidence this view of the primary passing a held request by: the
+    // latest acceptedAt among the oldest requests this replica admitted of the
+    // view's executed batches. A held request admitted before it is one the
+    // primary has ordered past.
+    Clock::time_point passedByUpTo_{Clock::time_point::min()};
     void acceptForwardedRequests(const nlohmann::json& message);
     std::mutex ingressMtx_;
     std::deque<std::pair<bedrock::ClientRequest, long long>> ingress_;

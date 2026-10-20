@@ -172,6 +172,7 @@ void Entity::startViewChange(int newView, const std::string& reason) {
     if (agentClient_) agentClient_->recordViewChange();
     cancelViewChangeWait();
     forwardedRequests_.clear();
+    passedByUpTo_ = Clock::time_point::min();
     cancelDelayedProposals();
     json prepared = json::array(), fastVotes = json::array(), committed = json::array();
     for (const auto& [seq, proof] : preparedProofs_) if (seq > stableCheckpoint_ && !committedProofs_.count(seq)) prepared.push_back(proof);
@@ -424,6 +425,7 @@ void Entity::finishNewView(const json& msg) {
     suspects_.clear();
     cancelViewChangeWait();
     forwardedRequests_.clear();
+    passedByUpTo_ = Clock::time_point::min();
     lastNewView_ = msg;
     pendingNewView_ = json();
     cancelDelayedProposals();

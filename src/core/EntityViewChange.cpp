@@ -455,6 +455,7 @@ void Entity::finishNewView(const json& msg) {
     for (const auto& encoded : msg["pre_prepares"])
         next = std::max(next, decodeEnvelope(encoded).pre_prepare().sequence());
     nextSequenceNumber.store(next);
+    reproposedThrough_ = next;
     entityInfo["sequence"] = next;
     for (const auto& encoded : msg["pre_prepares"]) installReProposal(encoded, view);
     viewChangeMsgs_.erase(viewChangeMsgs_.begin(), viewChangeMsgs_.upper_bound(view));

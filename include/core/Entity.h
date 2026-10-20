@@ -525,6 +525,10 @@ private:
     // view's executed batches. A held request admitted before it is one the
     // primary has ordered past.
     Clock::time_point passedByUpTo_{Clock::time_point::min()};
+    // Highest sequence this view's NewView re-proposed. Those batches are the
+    // old primary's order, so they say nothing about what the new one holds:
+    // passed-by evidence comes from the new primary's own batches only.
+    int reproposedThrough_{0};
     void acceptForwardedRequests(const nlohmann::json& message);
     std::mutex ingressMtx_;
     std::deque<std::pair<bedrock::ClientRequest, long long>> ingress_;

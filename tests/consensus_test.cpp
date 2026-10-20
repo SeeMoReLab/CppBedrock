@@ -593,6 +593,33 @@ void watchedRequestTimers(Fixture& fixture) {
         stranded.nodes[0]->proposalTick(); stranded.flush(); stranded.checkExecuted(3);
         CHECK(!Access::timer(holder).watch());
 
+        // A batch the NewView carried over is the old primary's order, not the
+        // new one's: executing it gives no evidence that the new primary has
+        // passed its inherited backlog by, so the backups neither relay those
+        // requests to a primary that holds them nor date its first batch from
+        // anything but their arrival, as the leader does.
+        Network carried(fixture, protocol);
+        for (int id = 1; id <= 2; ++id) {
+            auto r = request; r["request_id"] = id;
+            for (int n : {1, 2, 3}) carried.nodes[n]->processJsonFromGrpc(r.dump());
+        }
+        std::this_thread::sleep_for(5ms);
+        carried.drop = [](const Packet& p) { return p.type() == "commit" || (p.from == 3 && p.type() == "prepare"); };
+        carried.request(1); carried.flush(); carried.checkExecuted(0);
+        carried.drop = {};
+        carried.changeView(1);
+        if (protocol == "SBFT") carried.slowPath();
+        carried.checkExecuted(1);
+        carried.nodes[1]->proposalTick();
+        for (const auto& packet : carried.queue)
+            if (packet.to == 2 && packet.envelope.has_pre_prepare()) { carried.deliver(packet); break; }
+        CHECK(std::llabs(Access::firstSeen(*carried.nodes[2], 2) - Access::firstSeen(*carried.nodes[1], 2)) < 1000);
+        size_t carriedRelays = 0;
+        for (const auto& packet : carried.history) if (packet.type() == "ForwardRequests") ++carriedRelays;
+        for (const auto& packet : carried.queue) if (packet.type() == "ForwardRequests") ++carriedRelays;
+        CHECK_EQ(carriedRelays, 0u);
+        carried.flush(); carried.checkExecuted(2);
+
         // The relay is sent once per view and the relayed request's deadline
         // then stands: further executions past it neither relay it again nor
         // move its deadline, so a leader that does not order it within one

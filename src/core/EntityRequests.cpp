@@ -281,7 +281,8 @@ bool Entity::completeSequence(int seq, int path) {
         // in. The evidence is kept over the view's batches, so a head that becomes
         // the watch once a passed-by one executes is relayed at once rather than
         // one batch later with its old deadline, already passed, expiring first.
-        if (oldestHeld != Clock::time_point::max()) passedByUpTo_ = std::max(passedByUpTo_, oldestHeld);
+        if (seq > reproposedThrough_ && oldestHeld != Clock::time_point::max())
+            passedByUpTo_ = std::max(passedByUpTo_, oldestHeld);
         if (passedByUpTo_ != Clock::time_point::min()) relaySkippedHead(passedByUpTo_);
         executeUs_ += static_cast<uint64_t>(nowUs() - executeStart);
         markOperationProcessed(seq, path, executed, batch.requests_size());

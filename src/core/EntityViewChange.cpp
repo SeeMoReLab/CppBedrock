@@ -54,6 +54,65 @@ void Entity::onRequestTimerExpired(std::uint64_t generation) {
             return;
         }
     }
+    suspectLeader();
+}
+
+void Entity::suspectLeader() {
+    // PBFT has the expiring replica leave the view at once, and it cannot come
+    // back: it waits for 2f+1 ViewChanges, so while the others are healthy it
+    // sits out every round until they elect on their own. A replica lagging
+    // the quorum (a straggler, whose acknowledgements are delayed too) expires
+    // alone, and one slow minute became a crash for the rest of the run, which
+    // on SBFT also ends the fast path, since that needs all n prepares (a
+    // parked replica in every T 1600 cell, restart S1/S2, 2026-10-19). So an
+    // expiry first suspects the leader, as SmartBFT's complaint and Zyzzyva's
+    // I-hate-the-primary do: the replica keeps taking part, broadcasts a
+    // Suspect that carries no evidence, and leaves the view only once f+1
+    // replicas suspect it, at least one of them correct. Its ViewChange is
+    // built when it actually stops voting, so the evidence in it is current.
+    // A lone suspicion re-arms the timer and is repeated at each expiry, which
+    // also stands in for the retransmission the transport does not do.
+    // A suspicion lapses unless repeated, so f+1 live ones mean f+1 replicas
+    // starving at about the same time, and a straggler's old complaint cannot
+    // later pair with one fresh expiry elsewhere. It lives two of its sender's
+    // repeat intervals (the request timeout with backoff), which the Suspect
+    // carries: replicas apply a new timeout at slightly different moments and
+    // a lagging one keeps its backoff, so the receiver's own would not do.
+    // (A Suspect has no nonce: a faulty peer could replay one; it still counts
+    // as one replica, and the experiments have no faulty replicas.)
+    const auto interval = viewChangeWaitDuration();
+    suspects_[nodeId] = Clock::now() + 2 * interval;
+    requestTimer_.rearm(Clock::now());
+    sendToAll(Message(signControl(json{{"type", "Suspect"}, {"view", currentView()},
+        {"interval_ms", interval.count()}}).dump()));
+    startViewChangeOnSuspects("watched request deadline expired");
+}
+
+void Entity::onSuspectMessage(const json& msg) {
+    // A suspicion is about one view's leader. A replica behind drops one for
+    // a view it has not reached; the sender repeats it while it still starves.
+    if (!pbftCore_ || inViewChange || msg.value("view", -1) != currentView()) return;
+    const int sender = msg.at("message_sender_id");
+    if (sender == nodeId || !msg.contains("interval_ms") || !msg["interval_ms"].is_number_integer()) return;
+    const auto interval = std::chrono::milliseconds(
+        std::clamp<int64_t>(msg["interval_ms"].get<int64_t>(), 1, bedrock::kMaxElectionBackoffMs));
+    suspects_[sender] = Clock::now() + 2 * interval;
+    startViewChangeOnSuspects("f+1 replicas suspect the leader");
+}
+
+void Entity::startViewChangeOnSuspects(const std::string& reason) {
+    // A replica that has sent a ViewChange for a later view has left this one
+    // for good, so it counts as suspecting it for as long as that ViewChange
+    // stands. Otherwise a replica carried out by f+1 suspicions stops
+    // repeating its own, the others' count of it lapses, and a second
+    // starving replica could never reach f+1: the first would be parked again.
+    const auto now = Clock::now();
+    std::set<int> live;
+    for (const auto& [sender, until] : suspects_) if (now <= until) live.insert(sender);
+    for (const auto& [view, messages] : viewChangeMsgs_)
+        if (view > currentView()) for (const auto& [sender, vc] : messages) live.insert(sender);
+    LOG_INFO("suspects of view " << currentView() << ": " << live.size() << "/" << (f + 1) << " (" << reason << ")");
+    if (live.size() < static_cast<size_t>(f + 1)) return;
     if (currentView() == std::numeric_limits<int>::max()) throw std::runtime_error("view number exhausted");
     // Doubling here is the other half of timing a request from its arrival.
     // A view change hands the incoming primary whatever the last one left
@@ -62,9 +121,12 @@ void Entity::onRequestTimerExpired(std::uint64_t generation) {
     // at once. Doubling gives each successive primary more room than the last,
     // so a burst converges instead of running until the backlog happens to
     // drain, and a replica that has fallen far behind can still catch up.
+    // A replica that follows f+1 suspicions without expiring itself takes the
+    // same step, as one following f+1 ViewChanges does.
     setViewChangeBackoff(viewChangeBackoff_ + 1);
-    startViewChange(currentView() + 1, "watched request deadline expired");
+    startViewChange(currentView() + 1, reason);
 }
+
 
 std::chrono::milliseconds Entity::viewChangeWaitDuration() const {
     // Saturate safely at the maximum supported millisecond timeout.
@@ -124,6 +186,7 @@ void Entity::startViewChange(int newView, const std::string& reason) {
     if (!pbftCore_ || newView <= currentView()) return;
     entityInfo["view"] = newView;
     inViewChange = true;
+    suspects_.clear();
     pendingNewView_ = json();
     viewChangesStarted_.fetch_add(1);
     if (agentClient_) agentClient_->recordViewChange();
@@ -234,6 +297,10 @@ void Entity::onViewChangeMessage(const json& msg) {
         setViewChangeBackoff(viewChangeBackoff_ + 1);
         startViewChange(smallest, "f+1 authenticated replicas requested higher views");
         return;
+    }
+    if (!inViewChange && view > currentView()) {
+        startViewChangeOnSuspects("f+1 replicas suspect the leader or have left the view");
+        if (inViewChange) return;
     }
     tryBuildNewView(view);
 }
@@ -376,6 +443,7 @@ void Entity::finishNewView(const json& msg) {
     const int view = msg.at("new_view");
     entityInfo["view"] = view;
     inViewChange = false;
+    suspects_.clear();
     cancelViewChangeWait();
     forwardedRequests_.clear();
     lastRequestForward_ = Clock::time_point{};

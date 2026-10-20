@@ -196,6 +196,7 @@ void Entity::handleConsensusControl(const json& msg) {
     if (type == "NewView") { onNewViewMessage(msg); return; }
     if (!verifyControl(msg)) return;
     if (type == "ForwardRequests") acceptForwardedRequests(msg);
+    else if (type == "Suspect") onSuspectMessage(msg);
     else if (type == "Checkpoint") acceptCheckpoint(msg);
     else if (type == "StableCheckpoint") {
         if (validateCheckpoint(msg.at("checkpoint"))) stabilizeCheckpoint(msg.at("checkpoint"));

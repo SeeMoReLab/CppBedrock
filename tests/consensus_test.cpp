@@ -440,6 +440,7 @@ struct EntityTimerTestAccess {
     static auto waitGeneration(Entity& node) { return node.viewChangeWaitGeneration_; }
     static auto waitDuration(Entity& node) { return node.viewChangeWaitDuration(); }
     static auto acceptedAt(Entity& node, const std::string& key) { return node.pendingRequests_.at(key).acceptedAt; }
+    static auto& suspects(Entity& node) { return node.suspects_; }
     static void requestExpiry(Entity& node, uint64_t generation) {
         node.running = true;
         node.onRequestTimerExpired(generation);
@@ -563,15 +564,71 @@ void watchedRequestTimers(Fixture& fixture) {
         CHECK_EQ(follower.currentView(), 0);
         CHECK_EQ(Access::timer(follower).watch()->key, std::string("ignored/1"));
         CHECK(Access::timer(follower).watch()->generation != watched.generation);
-        // Nothing has executed since, so this window is a real stall.
+        // Nothing has executed since, so this window is a real stall. Alone,
+        // the replica only suspects the leader: it stays in the view with its
+        // watch re-armed and tells the others, and one suspicion moves no one.
         std::this_thread::sleep_for(3ms);
         Access::requestExpiry(follower, Access::timer(follower).watch()->generation);
+        CHECK_EQ(follower.currentView(), 0);
+        CHECK(!follower.inViewChange);
+        CHECK(Access::timer(follower).watch());
+        size_t suspicions = 0;
+        for (const auto& packet : skipped.queue) if (packet.from == 3 && packet.type() == "Suspect") ++suspicions;
+        CHECK_EQ(suspicions, 3u);
+        skipped.flush();
+        for (const auto& node : skipped.nodes) { CHECK_EQ(node->currentView(), 0); CHECK(!node->inViewChange); }
+        // A suspicion of another view's leader, or one that has lapsed, does not count.
+        AgentTimeouts steady; steady.electionMs = 5000;
+        follower.applyAgentTimeouts(steady);
+        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 1}, {"interval_ms", 5000}}, 1).dump());
+        CHECK(!follower.inViewChange);
+        Access::suspects(follower)[3] = std::chrono::steady_clock::now() - 1ms;
+        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, 1).dump());
+        CHECK(!follower.inViewChange);
+        // Neither a Suspect without its sender's interval nor one bearing this
+        // replica's own id counts.
+        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}}, 2).dump());
+        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, 3).dump());
+        CHECK(!follower.inViewChange);
+        // f+1 live suspicions take a replica out of the view even if its own
+        // timer has not expired, with the backoff step an expiry takes.
+        const auto unbacked = Access::waitDuration(follower);
+        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, 2).dump());
         CHECK_EQ(follower.currentView(), 1);
         CHECK(follower.inViewChange);
+        CHECK(Access::waitDuration(follower) == unbacked * 2);
+        CHECK(Access::suspects(follower).empty());
         CHECK(!Access::timer(follower).watch());
         CHECK(Access::waitSince(follower)); // the wait resends a lost ViewChange
         skipped.request(2, true, false);
         CHECK(!Access::timer(follower).watch()); // arrivals cannot arm a request watch during view change
+
+        // f+1 replicas suspecting the leader carry every replica into the next
+        // view, which installs and executes.
+        Network suspected(fixture, protocol);
+        for (int id = 0; id < 4; ++id)
+            for (int sender : {2, 3})
+                suspected.nodes[id]->processJsonFromGrpc(suspected.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, sender).dump());
+        suspected.flush();
+        for (const auto& node : suspected.nodes) { CHECK_EQ(node->currentView(), 1); CHECK(!node->inViewChange); }
+        suspected.request(1); suspected.flush();
+        if (protocol == "SBFT") suspected.slowPath();
+        suspected.checkExecuted(1);
+
+        // A replica that already left the view (its ViewChange for the next
+        // one stands) counts as suspecting it: one fresh suspicion elsewhere
+        // then makes f+1, so it is never left parked alone in the higher view.
+        Network departed(fixture, protocol);
+        departed.nodes[2]->startViewChange(1, "test");
+        departed.flush();
+        for (int id : {0, 1, 3}) { CHECK_EQ(departed.nodes[id]->currentView(), 0); CHECK(!departed.nodes[id]->inViewChange); }
+        for (int id = 0; id < 4; ++id)
+            departed.nodes[id]->processJsonFromGrpc(departed.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, 3).dump());
+        departed.flush();
+        for (const auto& node : departed.nodes) { CHECK_EQ(node->currentView(), 1); CHECK(!node->inViewChange); }
+        departed.request(1); departed.flush();
+        if (protocol == "SBFT") departed.slowPath();
+        departed.checkExecuted(1);
 
         // Hold NewView so quorum-gated waiting and its independent deadline
         // can be checked before installation.

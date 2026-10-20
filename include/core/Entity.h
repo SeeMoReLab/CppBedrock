@@ -216,6 +216,7 @@ public:
     void onRequestTimerExpired(std::uint64_t generation);
     void startViewChange(int newView, const std::string& reason);
     void onViewChangeMessage(const nlohmann::json& msg);
+    void onSuspectMessage(const nlohmann::json& msg);
     void onNewViewMessage(const nlohmann::json& msg);
     // Applies a recommendation from the learning agent (learning thread).
     void applyAgentTimeouts(const AgentTimeouts& timeouts);
@@ -547,6 +548,12 @@ private:
     std::map<int, std::string> executedRequestBySeq_;            // for pruning executedRequests_
     std::map<int, std::map<int, nlohmann::json>> viewChangeMsgs_; // view -> sender -> ViewChange
     int lastNewViewSent_{-1};
+    // Replicas whose request timer expired in the current view, this one
+    // included, with when each suspicion lapses (EntityViewChange.cpp). A view
+    // change starts once f+1 are live; cleared whenever the view moves.
+    std::map<int, Clock::time_point> suspects_;
+    void suspectLeader();
+    void startViewChangeOnSuspects(const std::string& reason);
 
     // Drops queued delayed proposals (view moved on) and keeps the periodic
     // leader observation of the failure spec alive.

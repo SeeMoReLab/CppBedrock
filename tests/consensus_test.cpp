@@ -569,7 +569,7 @@ void watchedRequestTimers(Fixture& fixture) {
         CHECK_EQ(follower.currentView(), 1);
         CHECK(follower.inViewChange);
         CHECK(!Access::timer(follower).watch());
-        CHECK(!Access::waitSince(follower)); // no NewView countdown until a quorum joins
+        CHECK(Access::waitSince(follower)); // the wait resends a lost ViewChange
         skipped.request(2, true, false);
         CHECK(!Access::timer(follower).watch()); // arrivals cannot arm a request watch during view change
 
@@ -614,7 +614,7 @@ void watchedRequestTimers(Fixture& fixture) {
         Access::waitExpiry(waiting, Access::waitGeneration(waiting));
         CHECK_EQ(waiting.currentView(), 2);
         CHECK(Access::waitDuration(waiting) == duration * 2);
-        CHECK(!Access::waitSince(waiting));
+        CHECK(Access::waitSince(waiting)); // armed at once, to resend a lost ViewChange
         change.drop = {}; change.changeView(2);
         change.request(77); change.flush();
         CHECK(Access::waitDuration(waiting) == duration); // normal execution resets backoff

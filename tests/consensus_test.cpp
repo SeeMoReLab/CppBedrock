@@ -657,23 +657,20 @@ void watchedRequestTimers(Fixture& fixture) {
         CHECK_EQ(suspicions, 3u);
         skipped.flush();
         for (const auto& node : skipped.nodes) { CHECK_EQ(node->currentView(), 0); CHECK(!node->inViewChange); }
-        // A suspicion of another view's leader, or one that has lapsed, does not count.
+        // A suspicion of another view's leader, or one bearing this replica's
+        // own id, does not count.
         AgentTimeouts steady; steady.electionMs = 5000;
         follower.applyAgentTimeouts(steady);
-        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 1}, {"interval_ms", 5000}}, 1).dump());
+        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 1}}, 1).dump());
+        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}}, 3).dump());
         CHECK(!follower.inViewChange);
-        Access::suspects(follower)[3] = std::chrono::steady_clock::now() - 1ms;
-        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, 1).dump());
-        CHECK(!follower.inViewChange);
-        // Neither a Suspect without its sender's interval nor one bearing this
-        // replica's own id counts.
-        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}}, 2).dump());
-        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, 3).dump());
-        CHECK(!follower.inViewChange);
-        // f+1 live suspicions take a replica out of the view even if its own
-        // timer has not expired, with the backoff step an expiry takes.
+        CHECK_EQ(Access::suspects(follower).size(), 1u);
+        // A suspicion stands until the view moves: the follower's own, sent
+        // many of its 1 ms intervals ago, still makes f+1 with one more, which
+        // takes it out of the view with the backoff step an expiry takes.
+        std::this_thread::sleep_for(20ms);
         const auto unbacked = Access::waitDuration(follower);
-        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, 2).dump());
+        follower.processJsonFromGrpc(skipped.sign(json{{"type", "Suspect"}, {"view", 0}}, 2).dump());
         CHECK_EQ(follower.currentView(), 1);
         CHECK(follower.inViewChange);
         CHECK(Access::waitDuration(follower) == unbacked * 2);
@@ -688,7 +685,7 @@ void watchedRequestTimers(Fixture& fixture) {
         Network suspected(fixture, protocol);
         for (int id = 0; id < 4; ++id)
             for (int sender : {2, 3})
-                suspected.nodes[id]->processJsonFromGrpc(suspected.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, sender).dump());
+                suspected.nodes[id]->processJsonFromGrpc(suspected.sign(json{{"type", "Suspect"}, {"view", 0}}, sender).dump());
         suspected.flush();
         for (const auto& node : suspected.nodes) { CHECK_EQ(node->currentView(), 1); CHECK(!node->inViewChange); }
         suspected.request(1); suspected.flush();
@@ -703,7 +700,7 @@ void watchedRequestTimers(Fixture& fixture) {
         departed.flush();
         for (int id : {0, 1, 3}) { CHECK_EQ(departed.nodes[id]->currentView(), 0); CHECK(!departed.nodes[id]->inViewChange); }
         for (int id = 0; id < 4; ++id)
-            departed.nodes[id]->processJsonFromGrpc(departed.sign(json{{"type", "Suspect"}, {"view", 0}, {"interval_ms", 5000}}, 3).dump());
+            departed.nodes[id]->processJsonFromGrpc(departed.sign(json{{"type", "Suspect"}, {"view", 0}}, 3).dump());
         departed.flush();
         for (const auto& node : departed.nodes) { CHECK_EQ(node->currentView(), 1); CHECK(!node->inViewChange); }
         departed.request(1); departed.flush();

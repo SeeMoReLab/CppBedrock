@@ -557,9 +557,9 @@ private:
     std::map<int, std::map<int, nlohmann::json>> viewChangeMsgs_; // view -> sender -> ViewChange
     int lastNewViewSent_{-1};
     // Replicas whose request timer expired in the current view, this one
-    // included, with when each suspicion lapses (EntityViewChange.cpp). A view
-    // change starts once f+1 are live; cleared whenever the view moves.
-    std::map<int, Clock::time_point> suspects_;
+    // included (EntityViewChange.cpp). A suspicion stands until the view moves:
+    // a view change starts once f+1 replicas hold one; cleared with the view.
+    std::set<int> suspects_;
     void suspectLeader();
     void startViewChangeOnSuspects(const std::string& reason);
 

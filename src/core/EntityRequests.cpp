@@ -69,7 +69,7 @@ void Entity::onClientRequest(const json& request) {
         pr.clientId = clientId;
         pr.requestId = requestId;
         pr.arrivalUs = request.value("arrival_us", nowUs());
-        pr.acceptedAt = Clock::now();
+        pr.acceptedAt = Clock::time_point(std::chrono::microseconds(pr.arrivalUs));  // receipt, as in acceptClientRequest
         pendingRequests_[key] = std::move(pr);
         proposeRequest(key);
         return;

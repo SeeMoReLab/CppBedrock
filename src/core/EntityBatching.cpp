@@ -56,7 +56,15 @@ void Entity::acceptClientRequest(const bedrock::ClientRequest& request, long lon
     PendingRequest pending;
     pending.clientId = request.client_id(); pending.requestId = request.request_id();
     pending.wire = request; pending.bytes = bytes; pending.arrivalUs = arrival;
-    pending.acceptedAt = Clock::now();
+    // Dated from this replica's receipt of the request (the ingress stamp), not
+    // from this admission: a request waits in the ingress queue for the next
+    // proposal tick, up to one interval, and the election timeout counts that
+    // wait, as PBFT's backup timer starts on receipt. Dated from the tick, the
+    // timer never saw the interval and the floor it enforced was 3h plus
+    // processing instead of 100 + 3h: T 250 never expired at 5+50 (restart-cal7
+    // S2, 0 expirations in p3 on every replica), so 250 and 550 could not be
+    // told apart there.
+    pending.acceptedAt = Clock::time_point(std::chrono::microseconds(arrival));
     if (!inViewChange) requestTimer_.track(key, pending.acceptedAt);
     pendingRequests_.emplace(key, std::move(pending));
     pendingBytes_ += bytes;

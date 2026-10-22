@@ -522,6 +522,25 @@ void watchedRequestTimers(Fixture& fixture) {
     using Access = EntityTimerTestAccess;
     using namespace std::chrono_literals;
     for (const std::string protocol : {"PBFT", "SBFT"}) {
+        // The watch is dated from the request's receipt, not from the proposal
+        // tick that admits it out of the ingress queue.
+        Network late(fixture, protocol);
+        bedrock::ClientRequest r;
+        r.set_client_id("late"); r.set_request_id(1); r.set_operation("transfer");
+        r.mutable_transaction()->set_from("a"); r.mutable_transaction()->set_to("b");
+        r.mutable_transaction()->set_amount(1);
+        // The ingress stamp is in whole microseconds.
+        const auto received = std::chrono::floor<std::chrono::microseconds>(Entity::Clock::now());
+        late.nodes[1]->submitClientRequest(r);
+        std::this_thread::sleep_for(20ms);
+        const auto tick = Entity::Clock::now();
+        late.nodes[1]->proposalTick();
+        const auto lateWatch = *Access::timer(*late.nodes[1]).watch();
+        CHECK_EQ(lateWatch.key, std::string("late/1"));
+        CHECK(lateWatch.since >= received);
+        CHECK(lateWatch.since <= tick - 20ms);
+        CHECK(Access::acceptedAt(*late.nodes[1], "late/1") == lateWatch.since);
+
         Network batch(fixture, protocol, 4, [](auto& o) { o.batchMaxRequests = 2; });
         batch.request(30, true, false); batch.request(10, true, false); batch.request(20, true, false);
         const auto before = *Access::timer(*batch.nodes[0]).watch();

@@ -653,6 +653,8 @@ private:
     void acceptCheckpoint(const nlohmann::json& msg);
     void stabilizeCheckpoint(const nlohmann::json& proof);
     void pruneCertifiedPrefix();
+    // Diagnostic: the quorum-progress evidence held when the request timer expires.
+    std::string progressAtExpiry(const bedrock::PendingRequestTimer::Watch& watch) const;
     void requestRecovery();
     void installRecovery(const nlohmann::json& msg);
     void scheduleConsensusMaintenance();

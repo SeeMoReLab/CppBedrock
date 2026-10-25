@@ -34,6 +34,10 @@ void Entity::onRequestTimerExpired(std::uint64_t generation) {
     // the phase fell from +0.89 to +0.14). An expiry therefore means the primary
     // has had the request for a timeout without ordering it, whether it is slow,
     // censoring, or gone.
+    // Diagnostic (2026-10-14, runs/2026-10-14-five-machine-models): what this
+    // replica holds about the quorum's progress at the moment it decides.
+    const auto watch = requestTimer_.watch();
+    LOG_INFO("request timer expired, suspecting: " << (watch ? progressAtExpiry(*watch) : std::string("watched=none")));
     suspectLeader();
 }
 
@@ -100,6 +104,50 @@ void Entity::startViewChangeOnSuspects(const std::string& reason) {
     startViewChange(currentView() + 1, reason);
 }
 
+std::string Entity::progressAtExpiry(const bedrock::PendingRequestTimer::Watch& watch) const {
+    // Votes on one sequence may name different digests; a quorum is 2f+1 on one digest.
+    const auto quorumVotes = [](const std::map<int, ProtocolEnvelope>& votes) {
+        std::map<std::string, size_t> byDigest;
+        size_t best = 0;
+        for (const auto& [sender, env] : votes) best = std::max(best, ++byDigest[env.digest()]);
+        return best;
+    };
+    const size_t quorum = static_cast<size_t>(2 * f + 1);
+    int highest = lastExecuted_;
+    size_t proposals = 0, bodies = 0, prepareQuorums = 0, commitQuorums = 0;
+    for (const auto& [seq, i] : consensusInstances_) {
+        if (seq <= lastExecuted_) continue;
+        highest = std::max(highest, seq);
+        if (i.proposal.has_pre_prepare()) ++proposals;
+        if (batchIndex_.count(seq)) ++bodies;
+        if (quorumVotes(i.prepares) >= quorum || i.certificate.has_commit()) ++prepareQuorums;
+        if (quorumVotes(i.commits) >= quorum || i.execution.has_commit()) ++commitQuorums;
+    }
+    size_t preparedProofs = 0, committedProofs = 0;
+    for (const auto& [seq, proof] : preparedProofs_) if (seq > lastExecuted_) ++preparedProofs;
+    for (const auto& [seq, proof] : committedProofs_) if (seq > lastExecuted_) ++committedProofs;
+    int inBody = -1;
+    for (const auto& [seq, batch] : batchIndex_) {
+        if (seq <= lastExecuted_) continue;
+        for (const auto& r : batch.requests())
+            if (requestKey(r.client_id(), r.request_id()) == watch.key) { inBody = seq; break; }
+        if (inBody >= 0) break;
+    }
+    const auto now = Clock::now();
+    const auto pending = pendingRequests_.find(watch.key);
+    std::ostringstream line;
+    line << "watched=" << watch.key
+         << " age_ms=" << std::chrono::duration_cast<std::chrono::milliseconds>(now - watch.since).count()
+         << " floored=" << (watch.floored ? 1 : 0)
+         << " proposed_in_view=" << (pending == pendingRequests_.end() ? -2 : pending->second.proposedInView)
+         << " in_body_seq=" << inBody << " view=" << currentView() << " executed=" << lastExecuted_
+         << " stable=" << stableCheckpoint_ << " highest_seq_seen=" << highest
+         << " unexecuted: proposals=" << proposals << " bodies=" << bodies
+         << " prepare_quorums=" << prepareQuorums << " commit_quorums=" << commitQuorums
+         << " prepared_proofs=" << preparedProofs << " committed_proofs=" << committedProofs
+         << " progress_ms_ago=" << std::chrono::duration_cast<std::chrono::milliseconds>(now - lastConsensusProgress_).count();
+    return line.str();
+}
 
 std::chrono::milliseconds Entity::viewChangeWaitDuration() const {
     // Saturate safely at the maximum supported millisecond timeout.

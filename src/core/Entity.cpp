@@ -977,9 +977,20 @@ int Entity::allocateNextSequence() {
 
 bool Entity::processJsonFromGrpc(const std::string& jsonPayload) {
     try {
+        // Diagnostic (2026-10-11, not committed): who holds the engine lock while a slowed leader stalls.
+        const long long t0 = nowUs();
         std::lock_guard<std::recursive_mutex> lk(eventMtx);
+        const long long t1 = nowUs();
         Message msg(jsonPayload);
         handleEvent(&msg, &_entityState);
+        const long long t2 = nowUs();
+        if (t2 - t1 > 20000 || t1 - t0 > 50000) {
+            const auto at = jsonPayload.find("\"type\":\"");
+            const std::string type = at == std::string::npos ? "?" :
+                jsonPayload.substr(at + 8, jsonPayload.find('"', at + 8) - (at + 8));
+            LOG_INFO("slow inbound message: bytes=" << jsonPayload.size() << " type=" << type
+                     << " lock_wait_ms=" << (t1 - t0) / 1000 << " handle_ms=" << (t2 - t1) / 1000);
+        }
         return true;
     } catch (const std::exception& e) {
         static std::atomic<uint64_t> failures{0};

@@ -74,12 +74,18 @@ void Entity::acceptClientRequest(const bedrock::ClientRequest& request, long lon
 void Entity::scheduleProposalTick() {
     if (!pbftCore_ || !running) return;
     const auto generation = proposalGeneration_;
-    scheduler_.schedule(nextProposalTick_, [this, generation] {
+    const auto due = nextProposalTick_;
+    scheduler_.schedule(nextProposalTick_, [this, generation, due] {
         // The engine lock is recursive, so this is the only place the tick can
         // observe how long it waited for it.
         const auto waitStart = nowUs();
+        const auto schedLateMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - due).count();
         std::lock_guard<std::recursive_mutex> lock(eventMtx);
         tickWaitUs_ += static_cast<uint64_t>(nowUs() - waitStart);
+        // Diagnostic (2026-10-11, not committed).
+        if (schedLateMs + (nowUs() - waitStart) / 1000 > 50)
+            LOG_INFO("proposal tick late: leader=" << isCurrentLeader() << " sched_late_ms=" << schedLateMs
+                     << " lock_wait_ms=" << (nowUs() - waitStart) / 1000);
         if (!running || generation != proposalGeneration_) return;
         proposalTick();
         const auto period = std::chrono::milliseconds(options_.proposalIntervalMs);
@@ -190,8 +196,15 @@ void Entity::proposeBatch() {
     } else {
         ++delayedProposals_;
         const auto generation = proposalGeneration_;
-        scheduler_.scheduleAfter(delay, [this, generation, env = std::move(env)] {
+        const auto due = Clock::now() + delay;
+        scheduler_.scheduleAfter(delay, [this, generation, due, seq, delay, env = std::move(env)] {
+            const long long t0 = nowUs();
+            const auto schedLateMs = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - due).count();
             std::lock_guard<std::recursive_mutex> lock(eventMtx);
+            // Diagnostic (2026-10-11, not committed).
+            if (schedLateMs + (nowUs() - t0) / 1000 > 50)
+                LOG_INFO("delayed proposal late: seq=" << seq << " delay_ms=" << delay.count() << " sched_late_ms="
+                         << schedLateMs << " lock_wait_ms=" << (nowUs() - t0) / 1000);
             if (!running || generation != proposalGeneration_ || inViewChange || !isCurrentLeader()) return;
             handleConsensusEnvelope(env, /*selfBuilt=*/true);
             sendProtocolToAll(env);
@@ -240,6 +253,8 @@ void Entity::relaySkippedHead(Clock::time_point passedByUpTo) {
     ++relaysSent_;
     sendTo(currentLeader(), Message(signControl(nlohmann::json{{"type", "ForwardRequests"},
         {"view", currentView()}, {"requests", bedrock::encodeEnvelope(payload)}}).dump()));
+    LOG_INFO("relaying skipped head " << watch->key << " to leader " << currentLeader() << " (watched for "
+             << std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - watch->since).count() << " ms)");
     requestTimer_.rearm(Clock::now());
 }
 
